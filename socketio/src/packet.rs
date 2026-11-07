@@ -41,12 +41,10 @@ impl Packet {
         id: Option<i32>,
     ) -> Result<Packet> {
         match payload {
+            // An event with binary data is BINARY_EVENT whether or not it expects an ack (`id`).
+            // BINARY_ACK is the reply to an ack request, which this constructor never builds.
             Payload::Binary(bin_data) => Ok(Packet::new(
-                if id.is_some() {
-                    PacketId::BinaryAck
-                } else {
-                    PacketId::BinaryEvent
-                },
+                PacketId::BinaryEvent,
                 nsp.to_owned(),
                 Some(serde_json::Value::String(event.into()).to_string()),
                 id,
@@ -625,6 +623,18 @@ mod test {
                 attachments: Some(vec![Bytes::from_static(&[0, 4, 9])])
             }
         )
+    }
+
+    #[test]
+    fn new_from_payload_binary_with_ack_id_is_an_event() {
+        let payload = Payload::Binary(Bytes::from_static(&[0, 4, 9]));
+        let packet = Packet::new_from_payload(payload, "upload".into(), "/", Some(3)).unwrap();
+        assert_eq!(packet.packet_type, PacketId::BinaryEvent);
+        assert_eq!(packet.id, Some(3));
+        assert_eq!(
+            Bytes::from(&packet),
+            Bytes::from_static(b"51-3[\"upload\",{\"_placeholder\":true,\"num\":0}]")
+        );
     }
 
     #[test]

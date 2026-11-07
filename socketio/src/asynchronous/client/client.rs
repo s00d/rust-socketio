@@ -1273,6 +1273,48 @@ mod test {
         assert_ne!(ids[0], 1000);
     }
 
+    /// emit_with_ack with binary data must reach the server as an event and get its ack.
+    #[tokio::test]
+    async fn socket_io_binary_emit_with_ack() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let connected_tx = tx.clone();
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .on(Event::Connect, move |_, _| {
+                let tx = connected_tx.clone();
+                async move {
+                    let _ = tx.send(None).await;
+                }
+                .boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+        let wait = Duration::from_secs(5);
+        assert_eq!(timeout(wait, rx.recv()).await.ok().flatten(), Some(None));
+
+        socket
+            .emit_with_ack(
+                "binary",
+                Bytes::from_static(&[7, 8]),
+                wait,
+                move |payload, _| {
+                    let tx = tx.clone();
+                    async move {
+                        let _ = tx.send(Some(payload)).await;
+                    }
+                    .boxed()
+                },
+            )
+            .await
+            .unwrap();
+        // ci/socket-io.js acks `binary` with Buffer [1, 2, 3]
+        assert_eq!(
+            timeout(wait, rx.recv()).await.ok().flatten().flatten(),
+            Some(Payload::Binary(Bytes::from_static(&[1, 2, 3])))
+        );
+        socket.disconnect().await.unwrap();
+    }
+
     /// A websocket frame is one packet: binary data containing 0x1e must not be split.
     #[tokio::test]
     async fn socket_io_websocket_binary_with_separator_byte() {
