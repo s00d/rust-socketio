@@ -209,6 +209,10 @@ impl Client {
                         .build();
 
                     loop {
+                        // A disconnect() during the outage ends the reconnect loop.
+                        if client_clone.disconnected_manually().await {
+                            break;
+                        }
                         if let Some(max_reconnect_attempts) = max_reconnect_attempts {
                             reconnect_attempts += 1;
                             if reconnect_attempts > max_reconnect_attempts {
@@ -219,6 +223,11 @@ impl Client {
                         match client_clone.reconnect().await {
                             Ok(_) => {
                                 trace!("Reconnected after {reconnect_attempts} attempts");
+                                // disconnect() raced with this attempt and closed the old socket:
+                                // close the new one too.
+                                if client_clone.disconnected_manually().await {
+                                    let _ = client_clone.disconnect().await;
+                                }
                                 break;
                             }
                             Err(e) => {
@@ -238,6 +247,13 @@ impl Client {
         });
 
         Ok(())
+    }
+
+    async fn disconnected_manually(&self) -> bool {
+        matches!(
+            *self.disconnect_reason.read().await,
+            DisconnectReason::Manual
+        )
     }
 
     /// Sends a message to the server using the underlying `engine.io` protocol.
@@ -546,11 +562,20 @@ impl Client {
                     }
                 }
                 PacketId::Connect => {
-                    *(self.disconnect_reason.write().await) = DisconnectReason::default();
+                    // A manual disconnect is final: a CONNECT that raced with it must not undo it.
+                    let mut reason = self.disconnect_reason.write().await;
+                    if !matches!(*reason, DisconnectReason::Manual) {
+                        *reason = DisconnectReason::default();
+                    }
+                    drop(reason);
                     self.callback(&Event::Connect, "").await?;
                 }
                 PacketId::Disconnect => {
-                    *(self.disconnect_reason.write().await) = DisconnectReason::Server;
+                    let mut reason = self.disconnect_reason.write().await;
+                    if !matches!(*reason, DisconnectReason::Manual) {
+                        *reason = DisconnectReason::Server;
+                    }
+                    drop(reason);
                     self.callback(&Event::Close, CloseReason::IOServerDisconnect.as_str())
                         .await?;
                     // A namespace-only server disconnect leaves the engine.io connection open, so
@@ -1083,6 +1108,59 @@ mod test {
         );
 
         socket.disconnect().await.unwrap();
+    }
+
+    /// disconnect() while the client is retrying after an outage stops the reconnect loop.
+    #[tokio::test]
+    #[serial(reconnect)]
+    async fn socket_io_disconnect_stops_reconnect_loop() {
+        let connects = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (on_connect, on_attempt) = (connects.clone(), attempts.clone());
+        let socket = ClientBuilder::new(crate::test::socket_io_restart_server())
+            .reconnect(true)
+            .reconnect_delay(100, 100)
+            .on(Event::Connect, move |_, _| {
+                on_connect.fetch_add(1, Ordering::SeqCst);
+                async {}.boxed()
+            })
+            .on_reconnect(move || {
+                on_attempt.fetch_add(1, Ordering::SeqCst);
+                async { ReconnectSettings::new() }.boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+        let until = |counter: Arc<AtomicUsize>| async move {
+            for _ in 0..50 {
+                if counter.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            panic!("timed out waiting for the counter");
+        };
+        until(connects.clone()).await;
+
+        // The server goes away for 2 s; the client starts retrying.
+        socket.emit("restart_server", json!("")).await.unwrap();
+        until(attempts.clone()).await;
+        let _ = socket.disconnect().await;
+
+        // The server is back after 2 s: a live reconnect loop would have connected by now.
+        sleep(Duration::from_secs(4)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            1,
+            "reconnected after disconnect()"
+        );
+        let stopped_at = attempts.load(Ordering::SeqCst);
+        sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            stopped_at,
+            "still retrying"
+        );
     }
 
     #[tokio::test]
