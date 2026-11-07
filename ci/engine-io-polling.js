@@ -21,6 +21,12 @@ server.on('connection', socket => {
             } else if (message == "respond_large") {
                 // larger than one HTTP body chunk, so the polling response arrives in several frames
                 socket.send("x".repeat(64 * 1024));
+            } else if (message == "utf8") {
+                socket.send("cash money €€€ てすと");
+            } else if (message == "emoji") {
+                socket.send("\uD83D\uDE00\uD83C\uDF89");
+            } else if (message == "binary") {
+                socket.send(Buffer.from([1, 2, 3]));
             } else if (message == "close") {
                 socket.close();
             }
