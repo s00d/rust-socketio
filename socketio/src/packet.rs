@@ -246,6 +246,9 @@ impl TryFrom<&Bytes> for Packet {
             let (prefix, rest) = payload.split_once('-').ok_or(Error::IncompletePacket())?;
             payload = rest;
             packet.attachment_count = prefix.parse().map_err(|_| Error::InvalidPacket())?;
+            if packet.attachment_count == 0 {
+                return Err(Error::InvalidPacket());
+            }
         }
 
         // namespace
@@ -268,8 +271,13 @@ impl TryFrom<&Bytes> for Packet {
             packet.id = Some(prefix.parse().map_err(|_| Error::InvalidPacket())?);
         }
 
-        // validate json
-        serde_json::from_str::<IgnoredAny>(payload).map_err(Error::InvalidJson)?;
+        // validate json, then the payload shape for the packet type (socket.io-parser's
+        // isPayloadValid): a server event must not pose as a reserved client event like `connect`
+        let json =
+            serde_json::from_str::<serde_json::Value>(payload).map_err(Error::InvalidJson)?;
+        if !is_payload_valid(packet.packet_type, &json) {
+            return Err(Error::InvalidPacket());
+        }
 
         match packet.packet_type {
             PacketId::BinaryAck | PacketId::BinaryEvent => {
@@ -291,6 +299,37 @@ impl TryFrom<&Bytes> for Packet {
         }
 
         Ok(packet)
+    }
+}
+
+/// Event names the socket.io client and server reserve (socket.io-parser `RESERVED_EVENTS`).
+const RESERVED_EVENTS: [&str; 6] = [
+    "connect",
+    "connect_error",
+    "disconnect",
+    "disconnecting",
+    "newListener",
+    "removeListener",
+];
+
+fn is_payload_valid(packet_type: PacketId, payload: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match packet_type {
+        PacketId::Connect => payload.is_object(),
+        PacketId::Disconnect => false,
+        PacketId::ConnectError => payload.is_string() || payload.is_object(),
+        PacketId::Event | PacketId::BinaryEvent => match payload.as_array().and_then(|a| a.first())
+        {
+            Some(Value::Number(_)) => true,
+            Some(Value::String(name)) => !RESERVED_EVENTS.contains(&name.as_str()),
+            // Deliberate difference from socket.io-client: a binary event without a name
+            // (`emit(buffer)` on the server) is delivered as `message`, as in 0.6.0.
+            Some(first) => {
+                packet_type == PacketId::BinaryEvent && first.get("_placeholder").is_some()
+            }
+            None => false,
+        },
+        PacketId::Ack | PacketId::BinaryAck => payload.is_array(),
     }
 }
 

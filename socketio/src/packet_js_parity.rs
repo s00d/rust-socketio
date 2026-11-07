@@ -108,6 +108,53 @@ fn decodes_a_bad_binary_packet() {
 }
 
 #[test]
+fn throws_an_error_upon_parsing_error() {
+    // invalid payload
+    for raw in [
+        r#"442["some","data""#,
+        r#"0/admin,"invalid""#,
+        "0[]",
+        "1/admin,{}",
+        r#"2/admin,"invalid"#,
+        "2/admin,{}",
+        r#"2[{"toString":"foo"}]"#,
+        r#"2[true,"foo"]"#,
+        r#"2[null,"bar"]"#,
+        r#"2["connect"]"#,
+        r#"2["disconnect","123"]"#,
+    ] {
+        assert!(decode(raw).is_err(), "accepted invalid payload {raw}");
+    }
+    // illegal attachments
+    for raw in ["5", "51", "50-", "5a-", "51.23-"] {
+        assert!(
+            decode(raw).is_err(),
+            "accepted illegal attachment count {raw}"
+        );
+    }
+    // unknown packet type
+    assert!(decode("999").is_err());
+}
+
+#[test]
+fn reserved_event_names_are_rejected() {
+    for name in [
+        "connect",
+        "connect_error",
+        "disconnect",
+        "disconnecting",
+        "newListener",
+        "removeListener",
+    ] {
+        assert!(decode(&format!(r#"2["{name}"]"#)).is_err(), "{name}");
+        assert!(
+            decode(&format!(r#"51-["{name}",{{"_placeholder":true,"num":0}}]"#)).is_err(),
+            "binary {name}"
+        );
+    }
+}
+
+#[test]
 fn encodes_a_buffer() {
     // buffer.js "encodes a Buffer": an event with one attachment
     let raw = r#"51-["a",{"_placeholder":true,"num":0}]"#;
