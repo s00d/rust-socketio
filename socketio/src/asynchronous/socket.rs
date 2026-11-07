@@ -18,40 +18,50 @@ use std::{
         Arc,
     },
 };
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub(crate) struct Socket {
     engine_client: Arc<EngineClient>,
     connected: Arc<AtomicBool>,
+    /// Packets emitted before the server answered CONNECT (socket.io-client `sendBuffer`).
+    send_buffer: Arc<Mutex<SendBuffer>>,
     generator: StreamGenerator<Packet>,
+}
+
+#[derive(Default)]
+struct SendBuffer {
+    packets: Vec<Packet>,
+    /// CONNECT_ERROR, server DISCONNECT or disconnect(): nothing is buffered any more.
+    closed: bool,
 }
 
 impl Socket {
     /// Creates an instance of `Socket`.
     pub(super) fn new(engine_client: EngineClient) -> Result<Self> {
         let connected = Arc::new(AtomicBool::default());
+        let send_buffer = Arc::new(Mutex::new(SendBuffer::default()));
         Ok(Socket {
             engine_client: Arc::new(engine_client.clone()),
             connected: connected.clone(),
-            generator: StreamGenerator::new(Self::stream(engine_client, connected)),
+            send_buffer: send_buffer.clone(),
+            generator: StreamGenerator::new(Self::stream(engine_client, connected, send_buffer)),
         })
     }
 
     /// Connects to the server. This includes a connection of the underlying
     /// engine.io client and afterwards an opening socket.io request.
     pub async fn connect(&self) -> Result<()> {
+        // The namespace counts as connected only once the server answers CONNECT; until then
+        // send() buffers.
         self.engine_client.connect().await?;
-
-        // store the connected value as true, if the connection process fails
-        // later, the value will be updated
-        self.connected.store(true, Ordering::Release);
-
         Ok(())
     }
 
     /// Disconnects from the server by sending a socket.io `Disconnect` packet. This results
     /// in the underlying engine.io transport to get closed as well.
     pub async fn disconnect(&self) -> Result<()> {
+        self.send_buffer.lock().await.closed = true;
         if self.is_engineio_connected() {
             self.engine_client.disconnect().await?;
         }
@@ -62,23 +72,48 @@ impl Socket {
     }
 
     /// Sends a `socket.io` packet to the server using the `engine.io` client.
+    ///
+    /// Before the server has answered CONNECT the packet is buffered and sent, in order, right
+    /// after it (upstream #502: an event that arrives before the namespace is joined makes the
+    /// server close the connection). After CONNECT_ERROR, a server DISCONNECT or disconnect()
+    /// nothing is buffered: the send fails as before.
     pub async fn send(&self, packet: Packet) -> Result<()> {
-        if !self.is_engineio_connected() || !self.connected.load(Ordering::Acquire) {
+        if !self.is_engineio_connected() {
             return Err(Error::IllegalActionBeforeOpen());
         }
+        if packet.packet_type != PacketId::Connect {
+            let mut buffer = self.send_buffer.lock().await;
+            if !self.connected.load(Ordering::Acquire) {
+                if buffer.closed {
+                    return Err(Error::IllegalActionBeforeOpen());
+                }
+                buffer.packets.push(packet);
+                return Ok(());
+            }
+        }
+        Self::send_packet(&self.engine_client, packet).await
+    }
 
+    // same Error type as every other fn here; the baseline lint is not worth a new type
+    #[allow(clippy::result_large_err)]
+    async fn send_packet(engine_client: &EngineClient, packet: Packet) -> Result<()> {
         // the packet, encoded as an engine.io message packet
         let engine_packet = EnginePacket::new(EnginePacketId::Message, Bytes::from(&packet));
-        self.engine_client.emit(engine_packet).await?;
+        engine_client.emit(engine_packet).await?;
 
         if let Some(attachments) = packet.attachments {
             for attachment in attachments {
                 let engine_packet = EnginePacket::new(EnginePacketId::MessageBinary, attachment);
-                self.engine_client.emit(engine_packet).await?;
+                engine_client.emit(engine_packet).await?;
             }
         }
 
         Ok(())
+    }
+
+    /// Takes the packets still waiting for CONNECT (dropped on CONNECT_ERROR / disconnect()).
+    pub(crate) async fn take_buffered(&self) -> Vec<Packet> {
+        std::mem::take(&mut self.send_buffer.lock().await.packets)
     }
 
     /// Emits to certain event with given data. The data needs to be JSON,
@@ -92,6 +127,7 @@ impl Socket {
     fn stream(
         client: EngineClient,
         is_connected: Arc<AtomicBool>,
+        send_buffer: Arc<Mutex<SendBuffer>>,
     ) -> Pin<Box<impl Stream<Item = Result<Packet>> + Send>> {
         Box::pin(try_stream! {
                 for await received_data in client.clone() {
@@ -101,29 +137,28 @@ impl Socket {
                         || packet.packet_id == EnginePacketId::MessageBinary
                     {
                         let packet = Self::handle_engineio_packet(packet, client.clone()).await?;
-                        Self::handle_socketio_packet(&packet, is_connected.clone());
+                        match packet.packet_type {
+                            PacketId::Connect => {
+                                // Flush under the buffer lock: a concurrent send() either got
+                                // buffered before this or sends after the flush, so order holds.
+                                let mut buffer = send_buffer.lock().await;
+                                is_connected.store(true, Ordering::Release);
+                                for buffered in std::mem::take(&mut buffer.packets) {
+                                    Self::send_packet(&client, buffered).await?;
+                                }
+                            }
+                            PacketId::ConnectError | PacketId::Disconnect => {
+                                let mut buffer = send_buffer.lock().await;
+                                buffer.closed = true;
+                                is_connected.store(false, Ordering::Release);
+                            }
+                            _ => (),
+                        }
 
                         yield packet;
                     }
                 }
         })
-    }
-
-    /// Handles the connection/disconnection.
-    #[inline]
-    fn handle_socketio_packet(socket_packet: &Packet, is_connected: Arc<AtomicBool>) {
-        match socket_packet.packet_type {
-            PacketId::Connect => {
-                is_connected.store(true, Ordering::Release);
-            }
-            PacketId::ConnectError => {
-                is_connected.store(false, Ordering::Release);
-            }
-            PacketId::Disconnect => {
-                is_connected.store(false, Ordering::Release);
-            }
-            _ => (),
-        }
     }
 
     /// Handles new incoming engineio packets

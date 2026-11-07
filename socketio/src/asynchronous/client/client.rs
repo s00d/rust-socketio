@@ -282,6 +282,18 @@ impl Client {
         Ok(())
     }
 
+    /// Drops the emits still waiting for CONNECT and the acks they registered.
+    async fn drop_buffered(&self, socket: &InnerSocket) {
+        let dropped = socket.take_buffered().await;
+        let ids: Vec<i32> = dropped.iter().filter_map(|packet| packet.id).collect();
+        if !ids.is_empty() {
+            self.outstanding_acks
+                .write()
+                .await
+                .retain(|ack| !ids.contains(&ack.id));
+        }
+    }
+
     async fn disconnected_manually(&self) -> bool {
         matches!(
             *self.disconnect_reason.read().await,
@@ -374,6 +386,7 @@ impl Client {
             Packet::new(PacketId::Disconnect, self.nsp.clone(), None, None, 0, None);
 
         let socket = self.socket.read().await;
+        self.drop_buffered(&socket).await;
         // The namespace may already be gone (server disconnect, CONNECT_ERROR, a reconnect in
         // progress): there is nothing to leave then, but the engine.io connection must still close.
         let leave = if socket.is_connected() {
@@ -632,6 +645,7 @@ impl Client {
                                 .unwrap_or(&String::from("\"No error message provided\"")),
                     )
                     .await?;
+                    self.drop_buffered(&*self.socket.read().await).await;
                     // The namespace was refused: close the engine.io connection too (it would
                     // otherwise stay open, answering pings, forever) and do not reconnect.
                     if let Err(err) = self.socket.read().await.disconnect().await {
@@ -1481,6 +1495,142 @@ mod test {
         assert!(
             !socket.socket.read().await.is_engineio_connected(),
             "engine left open after a packet that cannot be decoded"
+        );
+    }
+
+    /// Collects the payloads of `event` (upstream #502 tests below).
+    fn collect(
+        builder: ClientBuilder,
+        event: &str,
+    ) -> (ClientBuilder, mpsc::Receiver<Option<Payload>>) {
+        let (tx, rx) = mpsc::channel(16);
+        let close_tx = tx.clone();
+        let builder = builder
+            .on(event, move |payload, _| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(Some(payload)).await;
+                }
+                .boxed()
+            })
+            .on(Event::Close, move |_, _| {
+                let tx = close_tx.clone();
+                async move {
+                    let _ = tx.send(None).await;
+                }
+                .boxed()
+            });
+        (builder, rx)
+    }
+
+    /// #502: an emit sent before the server answered CONNECT is delivered (socket.io-client
+    /// buffers it) and the connection stays open.
+    #[tokio::test]
+    async fn socket_io_emit_right_after_connect_is_delivered() {
+        let builder = ClientBuilder::new(crate::test::socket_io_server()).namespace("/slow");
+        let (builder, mut rx) = collect(builder, "test-received");
+        let socket = builder.connect().await.unwrap();
+        socket.emit("test", json!(1)).await.unwrap();
+
+        let wait = Duration::from_secs(3);
+        assert_eq!(
+            timeout(wait, rx.recv()).await.ok().flatten(),
+            Some(Some(Payload::Text(vec![json!(1)]))),
+            "early emit lost or connection closed"
+        );
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "connection closed after the early emit"
+        );
+        socket.disconnect().await.unwrap();
+    }
+
+    /// #502: several buffered emits keep their order.
+    #[tokio::test]
+    async fn socket_io_buffered_emits_keep_their_order() {
+        let builder = ClientBuilder::new(crate::test::socket_io_server()).namespace("/slow");
+        let (builder, mut rx) = collect(builder, "echo-back");
+        let socket = builder.connect().await.unwrap();
+        for i in 0..5 {
+            socket.emit("echo", json!(i)).await.unwrap();
+        }
+        for i in 0..5 {
+            assert_eq!(
+                timeout(Duration::from_secs(3), rx.recv())
+                    .await
+                    .ok()
+                    .flatten(),
+                Some(Some(Payload::Text(vec![json!(i)]))),
+                "emit {i}"
+            );
+        }
+        socket.disconnect().await.unwrap();
+    }
+
+    /// #502: the ack of a buffered emit resolves.
+    #[tokio::test]
+    async fn socket_io_ack_on_buffered_emit_resolves() {
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .namespace("/slow")
+            .connect()
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        socket
+            .emit_with_ack(
+                "test",
+                json!(1),
+                Duration::from_secs(5),
+                move |payload, _| {
+                    let tx = tx.clone();
+                    async move {
+                        let _ = tx.send(payload).await;
+                    }
+                    .boxed()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .ok()
+                .flatten(),
+            Some(Payload::Text(vec![json!(["woot"])]))
+        );
+        socket.disconnect().await.unwrap();
+    }
+
+    /// #502: a buffered emit (and its pending ack) is dropped on CONNECT_ERROR.
+    #[tokio::test]
+    async fn socket_io_buffered_emit_dropped_on_connect_error() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .namespace("/reject")
+            .on(Event::Error, move |_, _| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(()).await;
+                }
+                .boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+        socket
+            .emit_with_ack("test", json!(1), Duration::from_secs(60), |_, _| {
+                async {}.boxed()
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("no CONNECT_ERROR (connection closed by the early emit?)");
+        sleep(Duration::from_millis(200)).await;
+        assert!(
+            socket.outstanding_acks.read().await.is_empty(),
+            "ack of the dropped emit leaked"
         );
     }
 
