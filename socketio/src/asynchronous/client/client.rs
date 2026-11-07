@@ -38,6 +38,8 @@ enum DisconnectReason {
     Manual,
     /// The server disconnected
     Server,
+    /// The server refused the namespace (CONNECT_ERROR): socket.io-client does not reconnect
+    Rejected,
 }
 
 /// Settings that can be updated before reconnecting to a server
@@ -206,7 +208,7 @@ impl Client {
 
                         reconnect
                     }
-                    DisconnectReason::Manual => false,
+                    DisconnectReason::Manual | DisconnectReason::Rejected => false,
                     DisconnectReason::Server => reconnect_on_disconnect,
                 };
 
@@ -602,6 +604,11 @@ impl Client {
                     }
                 }
                 PacketId::ConnectError => {
+                    let mut reason = self.disconnect_reason.write().await;
+                    if !matches!(*reason, DisconnectReason::Manual) {
+                        *reason = DisconnectReason::Rejected;
+                    }
+                    drop(reason);
                     self.callback(
                         &Event::Error,
                         String::from("Received an ConnectError frame: ")
@@ -611,6 +618,11 @@ impl Client {
                                 .unwrap_or(&String::from("\"No error message provided\"")),
                     )
                     .await?;
+                    // The namespace was refused: close the engine.io connection too (it would
+                    // otherwise stay open, answering pings, forever) and do not reconnect.
+                    if let Err(err) = self.socket.read().await.disconnect().await {
+                        trace!("Closing the engine after CONNECT_ERROR failed: {err}");
+                    }
                 }
                 PacketId::Event => {
                     if let Err(err) = self.handle_event(packet).await {
@@ -1388,6 +1400,48 @@ mod test {
             Some(Payload::Binary(Bytes::from_static(&[0x1e, 1, 0x1e])))
         );
         socket.disconnect().await.unwrap();
+    }
+
+    /// socket.ts "should not try to reconnect after a middleware failure": after CONNECT_ERROR
+    /// socket.io-client closes the engine and does not reconnect.
+    #[tokio::test]
+    async fn socket_io_connect_error_closes_engine_without_reconnect() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .namespace("/reject")
+            .reconnect(true)
+            .reconnect_delay(100, 100)
+            .on(Event::Error, move |_, _| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(()).await;
+                }
+                .boxed()
+            })
+            .on_reconnect(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { ReconnectSettings::new() }.boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no connect_error");
+
+        sleep(Duration::from_secs(1)).await;
+        assert!(
+            !socket.socket.read().await.is_engineio_connected(),
+            "engine left open after CONNECT_ERROR"
+        );
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "reconnected after CONNECT_ERROR"
+        );
     }
 
     #[tokio::test]
