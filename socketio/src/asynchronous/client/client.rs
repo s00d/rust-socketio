@@ -1,9 +1,15 @@
-use std::{ops::DerefMut, pin::Pin, sync::Arc};
+use std::{
+    ops::DerefMut,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc,
+    },
+};
 
 use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use futures_util::{future::BoxFuture, stream, Stream, StreamExt};
 use log::{error, trace};
-use rand::{thread_rng, Rng};
 use rust_engineio::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use tokio::{
@@ -83,6 +89,8 @@ pub struct Client {
     /// The inner socket client to delegate the methods to.
     socket: Arc<RwLock<InnerSocket>>,
     outstanding_acks: Arc<RwLock<Vec<Ack>>>,
+    // next ack id; unique per client like socket.io-client's counter
+    ack_id: Arc<AtomicI32>,
     // namespace, for multiplexing messages
     nsp: String,
     // Data send in the opening packet (commonly used as for auth)
@@ -101,6 +109,7 @@ impl Client {
             socket: Arc::new(RwLock::new(socket)),
             nsp: builder.namespace.to_owned(),
             outstanding_acks: Arc::new(RwLock::new(Vec::new())),
+            ack_id: Arc::new(AtomicI32::new(0)),
             auth: builder.auth.clone(),
             builder: Arc::new(RwLock::new(builder)),
             disconnect_reason: Arc::new(RwLock::new(DisconnectReason::default())),
@@ -416,7 +425,9 @@ impl Client {
         E: Into<Event>,
         D: Into<Payload>,
     {
-        let id = thread_rng().gen_range(0..999);
+        // A random id from 0..999 collided with pending acks: a reply went to the wrong
+        // callback, and duplicate ids broke the removal in handle_ack.
+        let id = self.ack_id.fetch_add(1, Ordering::Relaxed) & i32::MAX;
         let socket_packet =
             Packet::new_from_payload(data.into(), event.into(), &self.nsp, Some(id))?;
 
@@ -427,8 +438,11 @@ impl Client {
             callback: Callback::<DynAsyncCallback>::new(callback),
         };
 
-        // add the ack to the tuple of outstanding acks
-        self.outstanding_acks.write().await.push(ack);
+        let mut outstanding_acks = self.outstanding_acks.write().await;
+        // Acks the server never answered would otherwise stay here forever.
+        outstanding_acks.retain(|ack| ack.time_started.elapsed() < ack.timeout);
+        outstanding_acks.push(ack);
+        drop(outstanding_acks);
 
         self.socket.read().await.send(socket_packet).await
     }
@@ -457,37 +471,34 @@ impl Client {
     /// Handles the incoming acks and classifies what callbacks to call and how.
     #[inline]
     async fn handle_ack(&self, socket_packet: &Packet) -> Result<()> {
-        let mut to_be_removed = Vec::new();
-        if let Some(id) = socket_packet.id {
-            for (index, ack) in self.outstanding_acks.write().await.iter_mut().enumerate() {
-                if ack.id == id {
-                    to_be_removed.push(index);
+        let Some(id) = socket_packet.id else {
+            return Ok(());
+        };
+        // Take the ack out first: its callback may emit (with an ack) and must not run under the
+        // registry lock.
+        let ack = {
+            let mut outstanding_acks = self.outstanding_acks.write().await;
+            outstanding_acks
+                .iter()
+                .position(|ack| ack.id == id)
+                .map(|index| outstanding_acks.remove(index))
+        };
+        let Some(mut ack) = ack else {
+            return Ok(());
+        };
 
-                    if ack.time_started.elapsed() < ack.timeout {
-                        if let Some(ref payload) = socket_packet.data {
-                            ack.callback.deref_mut()(
-                                Payload::from(payload.to_owned()),
-                                self.clone(),
-                            )
-                            .await;
-                        }
-                        if let Some(ref attachments) = socket_packet.attachments {
-                            if let Some(payload) = attachments.get(0) {
-                                ack.callback.deref_mut()(
-                                    Payload::Binary(payload.to_owned()),
-                                    self.clone(),
-                                )
-                                .await;
-                            }
-                        }
-                    } else {
-                        trace!("Received an Ack that is now timed out (elapsed time was longer than specified duration)");
-                    }
+        if ack.time_started.elapsed() < ack.timeout {
+            if let Some(ref payload) = socket_packet.data {
+                ack.callback.deref_mut()(Payload::from(payload.to_owned()), self.clone()).await;
+            }
+            if let Some(ref attachments) = socket_packet.attachments {
+                if let Some(payload) = attachments.get(0) {
+                    ack.callback.deref_mut()(Payload::Binary(payload.to_owned()), self.clone())
+                        .await;
                 }
             }
-            for index in to_be_removed {
-                self.outstanding_acks.write().await.remove(index);
-            }
+        } else {
+            trace!("Received an Ack that is now timed out (elapsed time was longer than specified duration)");
         }
         Ok(())
     }
@@ -1161,6 +1172,105 @@ mod test {
             stopped_at,
             "still retrying"
         );
+    }
+
+    /// An ack callback that emits with an ack again must not deadlock the receive task.
+    #[tokio::test]
+    async fn socket_io_ack_callback_can_emit_with_ack() {
+        let (connected_tx, mut connected_rx) = mpsc::channel(1);
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .on(Event::Connect, move |_, _| {
+                let tx = connected_tx.clone();
+                async move {
+                    let _ = tx.send(()).await;
+                }
+                .boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+        let wait = Duration::from_secs(5);
+        timeout(wait, connected_rx.recv()).await.unwrap();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        socket
+            .emit_with_ack("test", json!("outer"), wait, move |_, socket: Client| {
+                let tx = tx.clone();
+                async move {
+                    let inner_tx = tx.clone();
+                    socket
+                        .emit_with_ack("test", json!("inner"), wait, move |_, _| {
+                            let tx = inner_tx.clone();
+                            async move {
+                                let _ = tx.send("inner").await;
+                            }
+                            .boxed()
+                        })
+                        .await
+                        .unwrap();
+                    let _ = tx.send("outer").await;
+                }
+                .boxed()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(timeout(wait, rx.recv()).await.ok().flatten(), Some("outer"));
+        assert_eq!(timeout(wait, rx.recv()).await.ok().flatten(), Some("inner"));
+        socket.disconnect().await.unwrap();
+    }
+
+    /// Duplicate ids must not panic the receive task; expired acks are dropped on the next emit.
+    #[tokio::test]
+    async fn socket_io_ack_registry_duplicates_and_expiry() {
+        use super::{Ack, Callback, DynAsyncCallback, Instant};
+        let ack = |id, timeout| Ack {
+            id,
+            timeout,
+            time_started: Instant::now(),
+            callback: Callback::<DynAsyncCallback>::new(|_, _| async {}.boxed()),
+        };
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .connect_manual()
+            .await
+            .unwrap();
+        let long = Duration::from_secs(60);
+
+        socket
+            .outstanding_acks
+            .write()
+            .await
+            .extend([ack(7, long), ack(8, long), ack(7, long)]);
+        let reply = Packet::new(PacketId::Ack, "/".into(), None, Some(7), 0, None);
+        socket.handle_ack(&reply).await.unwrap();
+        let ids: Vec<i32> = socket
+            .outstanding_acks
+            .read()
+            .await
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, vec![8, 7]);
+
+        socket.outstanding_acks.write().await.clear();
+        socket
+            .outstanding_acks
+            .write()
+            .await
+            .push(ack(1000, Duration::ZERO));
+        socket
+            .emit_with_ack("test", json!(1), long, |_, _| async {}.boxed())
+            .await
+            .unwrap();
+        let ids: Vec<i32> = socket
+            .outstanding_acks
+            .read()
+            .await
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids.len(), 1);
+        assert_ne!(ids[0], 1000);
     }
 
     #[tokio::test]

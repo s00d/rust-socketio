@@ -2,13 +2,13 @@ use super::callback::Callback;
 use crate::packet::{Packet, PacketId};
 use crate::Error;
 pub(crate) use crate::{event::CloseReason, event::Event, payload::Payload};
-use rand::{thread_rng, Rng};
 use serde_json::Value;
 
 use crate::client::callback::{SocketAnyCallback, SocketCallback};
 use crate::error::Result;
 use std::collections::HashMap;
 use std::ops::DerefMut;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
@@ -37,6 +37,8 @@ pub struct RawClient {
     on: Arc<Mutex<HashMap<Event, Callback<SocketCallback>>>>,
     on_any: Arc<Mutex<Option<Callback<SocketAnyCallback>>>>,
     outstanding_acks: Arc<Mutex<Vec<Ack>>>,
+    // next ack id; unique per client like socket.io-client's counter
+    ack_id: Arc<AtomicI32>,
     // namespace, for multiplexing messages
     nsp: String,
     // Data send in the opening packet (commonly used as for auth)
@@ -61,6 +63,7 @@ impl RawClient {
             on,
             on_any,
             outstanding_acks: Arc::new(Mutex::new(Vec::new())),
+            ack_id: Arc::new(AtomicI32::new(0)),
             auth,
         })
     }
@@ -203,7 +206,8 @@ impl RawClient {
         E: Into<Event>,
         D: Into<Payload>,
     {
-        let id = thread_rng().gen_range(0..999);
+        // A random id from 0..999 could collide with a pending ack and steal its reply.
+        let id = self.ack_id.fetch_add(1, Ordering::Relaxed) & i32::MAX;
         let socket_packet =
             Packet::new_from_payload(data.into(), event.into(), &self.nsp, Some(id))?;
 
@@ -214,8 +218,11 @@ impl RawClient {
             callback: Callback::<SocketCallback>::new(callback),
         };
 
-        // add the ack to the tuple of outstanding acks
-        self.outstanding_acks.lock()?.push(ack);
+        let mut outstanding_acks = self.outstanding_acks.lock()?;
+        // Acks the server never answered would otherwise stay here forever.
+        outstanding_acks.retain(|ack| ack.time_started.elapsed() < ack.timeout);
+        outstanding_acks.push(ack);
+        drop(outstanding_acks);
 
         self.socket.send(socket_packet)?;
         Ok(())
@@ -425,6 +432,35 @@ mod test {
     use native_tls::TlsConnector;
     use serde_json::json;
     use std::time::Duration;
+
+    /// Expired acks are dropped on the next emit and ids are not reused.
+    #[test]
+    fn socket_io_ack_registry_expiry_and_unique_ids() {
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .connect_raw()
+            .unwrap();
+        socket.outstanding_acks.lock().unwrap().push(Ack {
+            id: 1000,
+            timeout: Duration::ZERO,
+            time_started: Instant::now(),
+            callback: Callback::<SocketCallback>::new(|_, _| {}),
+        });
+        for _ in 0..3 {
+            socket
+                .emit_with_ack("test", json!(1), Duration::from_secs(60), |_, _| {})
+                .unwrap();
+        }
+        let mut ids: Vec<i32> = socket
+            .outstanding_acks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert!(!ids.contains(&1000), "expired ack kept: {ids:?}");
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "ack ids reused: {ids:?}");
+    }
 
     #[test]
     fn socket_io_integration() -> Result<()> {
