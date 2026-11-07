@@ -3,7 +3,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicI32, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -14,6 +14,7 @@ use rust_engineio::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use tokio::{
     sync::RwLock,
+    task::JoinHandle,
     time::{sleep, Duration, Instant},
 };
 
@@ -83,9 +84,34 @@ impl ReconnectSettings {
     }
 }
 
+/// The background task that drives the packet stream and the reconnect loop.
+type PollTask = Arc<Mutex<Option<JoinHandle<()>>>>;
+
+tokio::task_local! {
+    /// Set inside a poll task to its client's [`PollTask`] address.
+    static POLL_TASK: usize;
+}
+
+/// Held only by the handles returned to the user (and their clones), never by the poll task or
+/// the clones it passes to callbacks: when the last of them is dropped, the poll task is aborted
+/// and drops the engine with it, so a dropped client neither reconnects nor keeps a socket open.
+struct PollTaskOwner(PollTask);
+
+impl Drop for PollTaskOwner {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            task.abort();
+        }
+    }
+}
+
 /// A socket which handles communication with the server. It's initialized with
 /// a specific address as well as an optional namespace to connect to. If `None`
 /// is given the client will connect to the default namespace `"/"`.
+///
+/// The client owns its background poll task (packet stream and reconnect loop): `disconnect()`
+/// aborts and joins it, and dropping the last handle returned by `connect()` (or a clone of it)
+/// aborts it, which closes the connection. Clones passed to callbacks do not keep it alive.
 #[derive(Clone)]
 pub struct Client {
     /// The inner socket client to delegate the methods to.
@@ -99,6 +125,8 @@ pub struct Client {
     auth: Option<serde_json::Value>,
     builder: Arc<RwLock<ClientBuilder>>,
     disconnect_reason: Arc<RwLock<DisconnectReason>>,
+    poll_task: PollTask,
+    _owner: Option<Arc<PollTaskOwner>>,
 }
 
 impl Client {
@@ -115,6 +143,8 @@ impl Client {
             auth: builder.auth.clone(),
             builder: Arc::new(RwLock::new(builder)),
             disconnect_reason: Arc::new(RwLock::new(DisconnectReason::default())),
+            poll_task: Arc::default(),
+            _owner: None,
         })
     }
 
@@ -177,9 +207,14 @@ impl Client {
         let reconnect_on_disconnect = builder.reconnect_on_disconnect;
         drop(builder);
 
-        let mut client_clone = self.clone();
+        // The task's own handle must not own the task, or it would keep itself alive.
+        let mut client_clone = Client {
+            _owner: None,
+            ..self.clone()
+        };
 
-        tokio::runtime::Handle::current().spawn(async move {
+        let task_key = Arc::as_ptr(&self.poll_task) as usize;
+        let task = tokio::runtime::Handle::current().spawn(POLL_TASK.scope(task_key, async move {
             loop {
                 let mut stream = client_clone.as_stream().await;
                 // Consume the stream until it returns None and the stream is closed.
@@ -277,9 +312,32 @@ impl Client {
                     break;
                 }
             }
-        });
+        }));
+        *self.poll_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+        self._owner = Some(Arc::new(PollTaskOwner(Arc::clone(&self.poll_task))));
 
         Ok(())
+    }
+
+    /// Aborts the poll task and waits until it is gone (with the reconnect attempt and the engine
+    /// it may hold). Called from inside the task (a callback), it only lets the loop end on its own.
+    async fn stop_poll_task(&self) {
+        let key = Arc::as_ptr(&self.poll_task) as usize;
+        if POLL_TASK
+            .try_with(|current| *current == key)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let task = self
+            .poll_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     /// Drops the emits still waiting for CONNECT and the acks they registered.
@@ -381,6 +439,8 @@ impl Client {
     /// ```
     pub async fn disconnect(&self) -> Result<()> {
         *(self.disconnect_reason.write().await) = DisconnectReason::Manual;
+        // A reconnect attempt in flight holds a new engine of its own: stop it before closing.
+        self.stop_poll_task().await;
 
         let disconnect_packet =
             Packet::new(PacketId::Disconnect, self.nsp.clone(), None, None, 0, None);
@@ -1217,6 +1277,218 @@ mod test {
             stopped_at,
             "still retrying"
         );
+    }
+
+    /// A TCP proxy to the ci server that counts open connections and accepts. In stall mode it
+    /// holds new connections without forwarding (a hung handshake); `cut` closes every connection.
+    struct CountingProxy {
+        url: String,
+        open: Arc<AtomicUsize>,
+        accepted: Arc<AtomicUsize>,
+        stall: Arc<std::sync::atomic::AtomicBool>,
+        cut: tokio::sync::watch::Sender<u32>,
+    }
+
+    impl CountingProxy {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/socket.io/", listener.local_addr().unwrap());
+            let upstream = crate::test::socket_io_server();
+            let target = format!(
+                "{}:{}",
+                upstream.host_str().unwrap(),
+                upstream.port().unwrap()
+            );
+            let open = Arc::new(AtomicUsize::new(0));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (cut, cut_rx) = tokio::sync::watch::channel(0u32);
+            let (o, a, st) = (open.clone(), accepted.clone(), stall.clone());
+            tokio::spawn(async move {
+                while let Ok((mut inbound, _)) = listener.accept().await {
+                    a.fetch_add(1, Ordering::SeqCst);
+                    o.fetch_add(1, Ordering::SeqCst);
+                    let (o, target, stalled) =
+                        (o.clone(), target.clone(), st.load(Ordering::SeqCst));
+                    let mut cut_rx = cut_rx.clone();
+                    cut_rx.mark_unchanged();
+                    tokio::spawn(async move {
+                        let pipe = async {
+                            if stalled {
+                                // Until the client closes its end.
+                                use tokio::io::AsyncReadExt;
+                                let mut buf = [0u8; 1024];
+                                while matches!(inbound.read(&mut buf).await, Ok(n) if n > 0) {}
+                            } else if let Ok(mut outbound) =
+                                tokio::net::TcpStream::connect(target).await
+                            {
+                                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
+                                    .await;
+                            }
+                        };
+                        tokio::select! {
+                            _ = pipe => {}
+                            _ = cut_rx.changed() => {}
+                        }
+                        o.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+            Self {
+                url,
+                open,
+                accepted,
+                stall,
+                cut,
+            }
+        }
+
+        fn cut(&self) {
+            self.cut.send_modify(|n| *n += 1);
+        }
+
+        async fn wait_open(&self, want: usize) -> bool {
+            for _ in 0..30 {
+                if self.open.load(Ordering::SeqCst) == want {
+                    return true;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            false
+        }
+    }
+
+    fn counting_builder(url: &str, attempts: Arc<AtomicUsize>) -> ClientBuilder {
+        ClientBuilder::new(url)
+            .transport_type(TransportType::Websocket)
+            .reconnect(true)
+            .reconnect_delay(50, 100)
+            .on_reconnect(move || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { ReconnectSettings::new() }.boxed()
+            })
+    }
+
+    fn on_connect(builder: ClientBuilder) -> (ClientBuilder, mpsc::Receiver<()>) {
+        let (tx, rx) = mpsc::channel(4);
+        let builder = builder.on(Event::Connect, move |_, _| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(()).await;
+            }
+            .boxed()
+        });
+        (builder, rx)
+    }
+
+    async fn wait_connected(rx: &mut mpsc::Receiver<()>) {
+        timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Dropping the last handle aborts the poll task: the socket closes and a later outage
+    /// starts no reconnect attempts.
+    #[tokio::test]
+    async fn socket_io_drop_stops_poll_task_and_closes_socket() {
+        let proxy = CountingProxy::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (builder, mut rx) = on_connect(counting_builder(&proxy.url, attempts.clone()));
+        let socket = builder.connect().await.unwrap();
+        wait_connected(&mut rx).await;
+        let clone = socket.clone();
+        drop(socket);
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            proxy.open.load(Ordering::SeqCst),
+            1,
+            "closed while a clone is alive"
+        );
+        drop(clone);
+        assert!(proxy.wait_open(0).await, "socket still open after drop");
+
+        proxy.cut();
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 0, "reconnected after drop");
+        assert_eq!(proxy.accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// disconnect() during a hung reconnect attempt stops it: its socket closes at once instead of
+    /// at the handshake timeout, and no further attempt follows.
+    #[tokio::test]
+    async fn socket_io_disconnect_stops_hung_reconnect_attempt() {
+        let proxy = CountingProxy::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (builder, mut rx) = on_connect(counting_builder(&proxy.url, attempts.clone()));
+        let socket = builder.connect().await.unwrap();
+        wait_connected(&mut rx).await;
+
+        proxy.stall.store(true, Ordering::SeqCst);
+        proxy.cut();
+        for _ in 0..50 {
+            if proxy.accepted.load(Ordering::SeqCst) == 2 && proxy.open.load(Ordering::SeqCst) == 1
+            {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            proxy.accepted.load(Ordering::SeqCst),
+            2,
+            "no reconnect attempt"
+        );
+
+        let _ = timeout(Duration::from_secs(1), socket.disconnect()).await;
+        assert!(
+            proxy.wait_open(0).await,
+            "hung attempt still holds its socket"
+        );
+        let (tried, accepted) = (
+            attempts.load(Ordering::SeqCst),
+            proxy.accepted.load(Ordering::SeqCst),
+        );
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), tried, "still retrying");
+        assert_eq!(proxy.accepted.load(Ordering::SeqCst), accepted);
+    }
+
+    /// disconnect() from a callback (inside the poll task) must not wait for itself, and the task
+    /// still ends once the callback returns.
+    #[tokio::test]
+    async fn socket_io_disconnect_from_callback_does_not_deadlock() {
+        let proxy = CountingProxy::start().await;
+        let (tx, mut rx) = mpsc::channel(4);
+        let socket = ClientBuilder::new(proxy.url.as_str())
+            .transport_type(TransportType::Websocket)
+            .on(Event::Connect, move |_, socket: Client| {
+                let tx = tx.clone();
+                async move {
+                    let _ = socket.disconnect().await;
+                    let _ = tx.send(()).await;
+                }
+                .boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+        wait_connected(&mut rx).await;
+        let mut finished = false;
+        for _ in 0..30 {
+            finished = socket
+                .poll_task
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|task| task.is_finished());
+            if finished {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(finished, "poll task still running after disconnect()");
+        drop(socket);
+        assert!(proxy.wait_open(0).await, "socket still open after drop");
     }
 
     /// An ack callback that emits with an ack again must not deadlock the receive task.
