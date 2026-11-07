@@ -192,6 +192,20 @@ impl Client {
                 // Drop the stream so we can once again use `socket_clone` as mutable
                 drop(stream);
 
+                // The stream also ends on an error (a packet that cannot be decoded, a transport
+                // error) with the engine still open: close it, as socket.io-client does, so the
+                // old connection does not linger until the server's ping timeout. Best effort and
+                // bounded: on a dead link the Close packet would wait for the request timeout and
+                // delay the reconnect.
+                let close = async { client_clone.socket.read().await.disconnect().await };
+                match tokio::time::timeout(Duration::from_secs(1), close).await {
+                    Ok(Err(err)) => {
+                        trace!("Closing the engine after the stream ended failed: {err}")
+                    }
+                    Err(_) => trace!("Closing the engine after the stream ended timed out"),
+                    Ok(Ok(())) => {}
+                }
+
                 let should_reconnect = match *(client_clone.disconnect_reason.read().await) {
                     DisconnectReason::Unknown => {
                         // If we disconnected for an unknown reason, the client might not have noticed
@@ -1441,6 +1455,32 @@ mod test {
             attempts.load(Ordering::SeqCst),
             0,
             "reconnected after CONNECT_ERROR"
+        );
+    }
+
+    /// connection.ts "should close the engine upon decoding exception"
+    #[tokio::test]
+    async fn socket_io_decoding_exception_closes_engine() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .reconnect(false)
+            .on(Event::Connect, move |_, _| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(()).await;
+                }
+                .boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), rx.recv()).await.unwrap();
+
+        socket.emit("invalid_packet", json!(null)).await.unwrap();
+        sleep(Duration::from_secs(1)).await;
+        assert!(
+            !socket.socket.read().await.is_engineio_connected(),
+            "engine left open after a packet that cannot be decoded"
         );
     }
 
