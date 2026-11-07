@@ -49,6 +49,11 @@ var callback = client => {
         client.emit('binary-delimiter', Buffer.from([0x1e, 1, 0x1e]));
     })
 
+    // Binary event with an extra (non-binary) argument before the attachment.
+    client.on('binary_with_args', () => {
+        client.emit('binary-args', 'extra', Buffer.from([9]));
+    })
+
     // Server-side namespace disconnect: leaves the underlying engine.io connection open.
     client.on('server_disconnect', () => {
         console.log(['server_disconnect', 'Request to disconnect the namespace received'])

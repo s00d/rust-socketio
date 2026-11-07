@@ -315,11 +315,8 @@ impl RawClient {
     /// Handles a binary event.
     #[inline]
     fn handle_binary_event(&self, packet: &Packet) -> Result<()> {
-        let event = if let Some(string_data) = &packet.data {
-            string_data.replace('\"', "").into()
-        } else {
-            Event::Message
-        };
+        // Stripping every quote from `"name","extra"` gave the event `name,extra`.
+        let event = packet.binary_event_name();
 
         if let Some(attachments) = &packet.attachments {
             if let Some(binary_payload) = attachments.first() {

@@ -88,6 +88,25 @@ impl Packet {
     }
 }
 
+impl Packet {
+    /// Event name of a BINARY_EVENT, whose `data` is the argument list without brackets and
+    /// attachment placeholders (`"name",{"extra":1}`): the first value when it is a string.
+    pub(crate) fn binary_event_name(&self) -> Event {
+        self.data
+            .as_deref()
+            .and_then(|data| {
+                serde_json::Deserializer::from_str(data)
+                    .into_iter::<serde_json::Value>()
+                    .next()
+            })
+            .and_then(|first| match first {
+                Ok(serde_json::Value::String(name)) => Some(Event::from(name.as_str())),
+                _ => None,
+            })
+            .unwrap_or(Event::Message)
+    }
+}
+
 impl Default for Packet {
     fn default() -> Self {
         Self {
@@ -623,6 +642,31 @@ mod test {
                 attachments: Some(vec![Bytes::from_static(&[0, 4, 9])])
             }
         )
+    }
+
+    #[test]
+    fn binary_event_name_ignores_extra_arguments() {
+        let name = |raw: &'static [u8]| {
+            Packet::try_from(&Bytes::from_static(raw))
+                .unwrap()
+                .binary_event_name()
+        };
+        assert_eq!(
+            name(b"51-[\"my_binary_event\",\"extra data\",{\"_placeholder\":true,\"num\":0}]"),
+            Event::from("my_binary_event")
+        );
+        assert_eq!(
+            name(b"51-[\"ev\",{\"_placeholder\":true,\"num\":0},{\"a\":\"b\"}]"),
+            Event::from("ev")
+        );
+        assert_eq!(
+            name(b"51-[\"tts:audio\",{\"_placeholder\":true,\"num\":0}]"),
+            Event::from("tts:audio")
+        );
+        assert_eq!(
+            name(b"51-[{\"_placeholder\":true,\"num\":0}]"),
+            Event::Message
+        );
     }
 
     #[test]

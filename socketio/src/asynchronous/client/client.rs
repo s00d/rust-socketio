@@ -506,11 +506,8 @@ impl Client {
     /// Handles a binary event.
     #[inline]
     async fn handle_binary_event(&self, packet: &Packet) -> Result<()> {
-        let event = if let Some(string_data) = &packet.data {
-            string_data.replace('\"', "").into()
-        } else {
-            Event::Message
-        };
+        // Stripping every quote from `"name","extra"` gave the event `name,extra`.
+        let event = packet.binary_event_name();
 
         if let Some(attachments) = &packet.attachments {
             if let Some(binary_payload) = attachments.get(0) {
@@ -1311,6 +1308,40 @@ mod test {
         assert_eq!(
             timeout(wait, rx.recv()).await.ok().flatten().flatten(),
             Some(Payload::Binary(Bytes::from_static(&[1, 2, 3])))
+        );
+        socket.disconnect().await.unwrap();
+    }
+
+    /// A binary event with extra arguments reaches the handler registered for its name.
+    #[tokio::test]
+    async fn socket_io_binary_event_with_extra_arguments() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let connected_tx = tx.clone();
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .on(Event::Connect, move |_, _| {
+                let tx = connected_tx.clone();
+                async move {
+                    let _ = tx.send(None).await;
+                }
+                .boxed()
+            })
+            .on("binary-args", move |payload, _| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(Some(payload)).await;
+                }
+                .boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+        let wait = Duration::from_secs(5);
+        assert_eq!(timeout(wait, rx.recv()).await.ok().flatten(), Some(None));
+
+        socket.emit("binary_with_args", json!(null)).await.unwrap();
+        assert_eq!(
+            timeout(wait, rx.recv()).await.ok().flatten().flatten(),
+            Some(Payload::Binary(Bytes::from_static(&[9])))
         );
         socket.disconnect().await.unwrap();
     }
