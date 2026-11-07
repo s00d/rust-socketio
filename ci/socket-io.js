@@ -44,6 +44,12 @@ var callback = client => {
         client.client.conn.close();
     })
 
+    // Server-side namespace disconnect: leaves the underlying engine.io connection open.
+    client.on('server_disconnect', () => {
+        console.log(['server_disconnect', 'Request to disconnect the namespace received'])
+        client.disconnect();
+    })
+
     client.emit('Hello from the message event!');
     client.emit('test', 'Hello from the test event!');
     client.emit(Buffer.from([4, 5, 6]));

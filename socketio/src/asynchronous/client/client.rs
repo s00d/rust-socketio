@@ -324,10 +324,17 @@ impl Client {
         let disconnect_packet =
             Packet::new(PacketId::Disconnect, self.nsp.clone(), None, None, 0, None);
 
-        self.socket.read().await.send(disconnect_packet).await?;
-        self.socket.read().await.disconnect().await?;
+        let socket = self.socket.read().await;
+        // The namespace may already be gone (server disconnect, CONNECT_ERROR, a reconnect in
+        // progress): there is nothing to leave then, but the engine.io connection must still close.
+        let leave = if socket.is_connected() {
+            socket.send(disconnect_packet).await
+        } else {
+            Ok(())
+        };
+        let close = socket.disconnect().await;
 
-        Ok(())
+        leave.and(close)
     }
 
     /// Sends a message to the server but `alloc`s an `ack` to check whether the
@@ -985,6 +992,46 @@ mod test {
         );
 
         Ok(())
+    }
+
+    /// disconnect() after the server left the namespace must still close the engine.io
+    /// connection, which the server keeps open after a namespace-only disconnect.
+    #[tokio::test]
+    async fn socket_io_disconnect_after_server_namespace_disconnect() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let close_tx = tx.clone();
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .on(Event::Connect, move |_, _| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(Event::Connect).await;
+                }
+                .boxed()
+            })
+            .on(Event::Close, move |_, _| {
+                let tx = close_tx.clone();
+                async move {
+                    let _ = tx.send(Event::Close).await;
+                }
+                .boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+        let wait = Duration::from_secs(5);
+        assert_eq!(
+            timeout(wait, rx.recv()).await.ok().flatten(),
+            Some(Event::Connect)
+        );
+
+        socket.emit("server_disconnect", json!(null)).await.unwrap();
+        assert_eq!(
+            timeout(wait, rx.recv()).await.ok().flatten(),
+            Some(Event::Close)
+        );
+
+        socket.disconnect().await.unwrap();
+        assert!(!socket.socket.read().await.is_engineio_connected());
     }
 
     #[tokio::test]

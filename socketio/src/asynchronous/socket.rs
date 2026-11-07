@@ -161,8 +161,13 @@ impl Socket {
         Ok(socket_packet)
     }
 
-    fn is_engineio_connected(&self) -> bool {
+    pub(crate) fn is_engineio_connected(&self) -> bool {
         self.engine_client.is_connected()
+    }
+
+    /// Whether the namespace is connected (CONNECT seen, no DISCONNECT / CONNECT_ERROR since).
+    pub(crate) fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
     }
 }
 
