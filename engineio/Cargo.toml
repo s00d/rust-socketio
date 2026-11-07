@@ -37,8 +37,8 @@ lazy_static = "1.4.0"
 
 [dev-dependencies.tokio]
 version = "1.40.0"
-# we need the `#[tokio::test]` macro
-features = ["macros"]
+# we need the `#[tokio::test]` macro; `test-util` for paused-clock timeout tests
+features = ["macros", "test-util"]
 
 [[bench]]
 name = "engineio"

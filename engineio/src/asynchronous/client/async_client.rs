@@ -92,7 +92,12 @@ impl Debug for Client {
 mod test {
 
     use super::*;
-    use crate::{asynchronous::ClientBuilder, header::HeaderMap, packet::PacketId, Error};
+    use crate::{
+        asynchronous::{client::builder::HANDSHAKE_TIMEOUT, ClientBuilder},
+        header::HeaderMap,
+        packet::PacketId,
+        Error,
+    };
     use bytes::Bytes;
     use futures_util::StreamExt;
     use native_tls::TlsConnector;
@@ -161,6 +166,22 @@ mod test {
         );
 
         socket.disconnect().await
+    }
+
+    /// A peer that accepts TCP but never answers (blackholed proxy, half-open link) must not hang
+    /// the polling handshake forever.
+    #[tokio::test(start_paused = true)]
+    async fn test_polling_handshake_times_out() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/", silent.local_addr().unwrap())).unwrap();
+
+        let result = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT * 2,
+            ClientBuilder::new(url).build_polling(),
+        )
+        .await
+        .expect("polling handshake hung past its timeout");
+        assert!(result.is_err());
     }
 
     #[tokio::test]

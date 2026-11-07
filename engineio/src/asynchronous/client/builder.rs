@@ -13,9 +13,14 @@ use crate::{
 use bytes::Bytes;
 use futures_util::{future::BoxFuture, StreamExt};
 use native_tls::TlsConnector;
+use std::time::Duration;
 use url::Url;
 
 use super::Client;
+
+/// Budget for opening a connection (handshake request, websocket connect and upgrade probe),
+/// the same as the `timeout` default of socket.io-client's Manager.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 pub struct ClientBuilder {
@@ -153,8 +158,12 @@ impl ClientBuilder {
         };
 
         // Start with polling transport
-        let mut transport =
-            PollingTransport::new(self.url.clone(), self.tls_config.clone(), headers);
+        let mut transport = PollingTransport::with_timeout(
+            self.url.clone(),
+            self.tls_config.clone(),
+            headers,
+            Some(HANDSHAKE_TIMEOUT),
+        );
 
         self.handshake_with_transport(&mut transport).await
     }
@@ -174,17 +183,25 @@ impl ClientBuilder {
     pub async fn build_polling(mut self) -> Result<Client> {
         self.handshake().await?;
 
+        // SAFETY: handshake function called previously.
+        let handshake = self.handshake.unwrap();
+
+        // A long-poll GET is answered at least once per ping interval; a request still open after
+        // the ping deadline belongs to a dead connection.
+        let request_timeout =
+            Duration::from_millis(handshake.ping_interval + handshake.ping_timeout);
+
         // Make a polling transport with new sid
-        let transport = PollingTransport::new(
+        let transport = PollingTransport::with_timeout(
             self.url,
             self.tls_config,
             self.headers.map(|v| v.try_into().unwrap()),
+            Some(request_timeout),
         );
 
-        // SAFETY: handshake function called previously.
         Ok(Client::new(InnerSocket::new(
             transport.into(),
-            self.handshake.unwrap(),
+            handshake,
             self.on_close,
             self.on_data,
             self.on_error,

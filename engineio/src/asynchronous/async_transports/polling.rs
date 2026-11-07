@@ -8,7 +8,7 @@ use http::HeaderMap;
 use native_tls::TlsConnector;
 use reqwest::{Client, ClientBuilder, Response};
 use std::fmt::Debug;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::{pin::Pin, sync::Arc};
 use tokio::sync::RwLock;
 use url::Url;
@@ -31,19 +31,28 @@ impl PollingTransport {
         tls_config: Option<TlsConnector>,
         opening_headers: Option<HeaderMap>,
     ) -> Self {
-        let client = match (tls_config, opening_headers) {
-            (Some(config), Some(map)) => ClientBuilder::new()
-                .use_preconfigured_tls(config)
-                .default_headers(map)
-                .build()
-                .unwrap(),
-            (Some(config), None) => ClientBuilder::new()
-                .use_preconfigured_tls(config)
-                .build()
-                .unwrap(),
-            (None, Some(map)) => ClientBuilder::new().default_headers(map).build().unwrap(),
-            (None, None) => Client::new(),
-        };
+        Self::with_timeout(base_url, tls_config, opening_headers, None)
+    }
+
+    /// Like [`PollingTransport::new`], but every request (connect, send, body) fails after
+    /// `timeout`, so a silent peer or a half-open connection cannot hang a request forever.
+    pub(crate) fn with_timeout(
+        base_url: Url,
+        tls_config: Option<TlsConnector>,
+        opening_headers: Option<HeaderMap>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        let mut builder = ClientBuilder::new();
+        if let Some(config) = tls_config {
+            builder = builder.use_preconfigured_tls(config);
+        }
+        if let Some(map) = opening_headers {
+            builder = builder.default_headers(map);
+        }
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder.build().unwrap();
 
         let mut url = base_url;
         url.query_pairs_mut().append_pair("transport", "polling");
