@@ -148,7 +148,8 @@ impl Socket {
                     continue;
                 }
 
-                let payload = Payload::try_from(data)?;
+                let is_polling = matches!(*self.transport, TransportType::Polling(_));
+                let payload = Payload::decode(data, is_polling)?;
                 let mut iter = payload.into_iter();
 
                 if let Some(packet) = iter.next() {

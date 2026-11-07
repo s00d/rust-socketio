@@ -117,9 +117,9 @@ impl Socket {
     }
 
     /// Helper method that parses bytes and returns an iterator over the elements.
-    fn parse_payload(bytes: Bytes) -> impl Stream<Item = Result<Packet>> {
+    fn parse_payload(bytes: Bytes, is_polling: bool) -> impl Stream<Item = Result<Packet>> {
         try_stream! {
-            let payload = Payload::try_from(bytes);
+            let payload = Payload::decode(bytes, is_polling);
 
             for elem in payload?.into_iter() {
                 yield elem;
@@ -134,9 +134,10 @@ impl Socket {
     ) -> Pin<Box<impl Stream<Item = Result<Packet>> + 'static + Send>> {
         // map the byte stream of the underlying transport
         // to a packet stream
+        let is_polling = matches!(transport, AsyncTransportType::Polling(_));
         Box::pin(try_stream! {
             for await payload in transport.as_pin_box() {
-                for await packet in Self::parse_payload(payload?) {
+                for await packet in Self::parse_payload(payload?, is_polling) {
                     yield packet?;
                 }
             }

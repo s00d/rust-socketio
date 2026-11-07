@@ -433,6 +433,29 @@ mod test {
     use serde_json::json;
     use std::time::Duration;
 
+    /// A websocket frame is one packet: binary data containing 0x1e must not be split.
+    #[test]
+    fn socket_io_websocket_binary_with_separator_byte() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .transport_type(TransportType::Websocket)
+            .on("binary-delimiter", move |payload, _| {
+                let _ = tx.send(payload);
+            })
+            .connect()
+            .unwrap();
+        // the namespace CONNECT must be processed before the server accepts events
+        sleep(Duration::from_millis(500));
+
+        socket.emit("binary_delimiter", json!(null)).unwrap();
+        let payload = rx.recv_timeout(Duration::from_secs(5)).ok();
+        assert_eq!(
+            payload,
+            Some(Payload::Binary(Bytes::from_static(&[0x1e, 1, 0x1e])))
+        );
+        socket.disconnect().unwrap();
+    }
+
     /// Expired acks are dropped on the next emit and ids are not reused.
     #[test]
     fn socket_io_ack_registry_expiry_and_unique_ids() {

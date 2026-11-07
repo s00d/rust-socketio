@@ -162,6 +162,16 @@ impl Payload {
     // see https://en.wikipedia.org/wiki/Delimiter#ASCII_delimited_text
     const SEPARATOR: char = '\x1e';
 
+    /// Decodes what a transport delivered: a polling body is a payload of packets joined by the
+    /// separator, a websocket frame is exactly one packet (whose binary data may contain 0x1e).
+    pub(crate) fn decode(data: Bytes, is_polling: bool) -> Result<Self> {
+        if is_polling {
+            Self::try_from(data)
+        } else {
+            Ok(Self(vec![Packet::try_from(data)?]))
+        }
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.0.len()

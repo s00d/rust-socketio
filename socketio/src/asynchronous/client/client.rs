@@ -1273,6 +1273,42 @@ mod test {
         assert_ne!(ids[0], 1000);
     }
 
+    /// A websocket frame is one packet: binary data containing 0x1e must not be split.
+    #[tokio::test]
+    async fn socket_io_websocket_binary_with_separator_byte() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let connected_tx = tx.clone();
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .transport_type(TransportType::Websocket)
+            .on(Event::Connect, move |_, _| {
+                let tx = connected_tx.clone();
+                async move {
+                    let _ = tx.send(None).await;
+                }
+                .boxed()
+            })
+            .on("binary-delimiter", move |payload, _| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(Some(payload)).await;
+                }
+                .boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+        let wait = Duration::from_secs(5);
+        assert_eq!(timeout(wait, rx.recv()).await.ok().flatten(), Some(None));
+
+        socket.emit("binary_delimiter", json!(null)).await.unwrap();
+        let payload = timeout(wait, rx.recv()).await.ok().flatten().flatten();
+        assert_eq!(
+            payload,
+            Some(Payload::Binary(Bytes::from_static(&[0x1e, 1, 0x1e])))
+        );
+        socket.disconnect().await.unwrap();
+    }
+
     #[tokio::test]
     async fn socket_io_transport_close() -> Result<()> {
         let url = crate::test::socket_io_server();

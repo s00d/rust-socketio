@@ -44,6 +44,11 @@ var callback = client => {
         client.client.conn.close();
     })
 
+    // Binary attachment that contains the polling payload separator (0x1e).
+    client.on('binary_delimiter', () => {
+        client.emit('binary-delimiter', Buffer.from([0x1e, 1, 0x1e]));
+    })
+
     // Server-side namespace disconnect: leaves the underlying engine.io connection open.
     client.on('server_disconnect', () => {
         console.log(['server_disconnect', 'Request to disconnect the namespace received'])
