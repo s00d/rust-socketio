@@ -54,6 +54,30 @@ var callback = client => {
         client.emit('binary-args', 'extra', Buffer.from([9]));
     })
 
+    // JS-parity helpers: echo the arguments back through the ack (or as `echo-back`).
+    client.on('echo', (...args) => {
+        const ack = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+        if (ack) {
+            ack(...args);
+        } else {
+            client.emit('echo-back', ...args);
+        }
+    })
+
+    // Acknowledges after 500 ms.
+    client.on('ack_late', (arg, ack) => {
+        setTimeout(() => ack('late'), 500);
+    })
+
+    client.on('handshake_query', (ack) => {
+        ack(client.handshake.query);
+    })
+
+    // Makes the server send a packet that socket.io-parser rejects.
+    client.on('invalid_packet', () => {
+        client.conn.send('2[true,"foo"]');
+    })
+
     // Server-side namespace disconnect: leaves the underlying engine.io connection open.
     client.on('server_disconnect', () => {
         console.log(['server_disconnect', 'Request to disconnect the namespace received'])
@@ -74,5 +98,15 @@ var callback = client => {
 };
 io.on('connection', callback);
 io.of('/admin').on('connection', callback);
+// Namespace whose middleware answers CONNECT late (an emit sent before the ack must be buffered).
+io.of('/slow').use((socket, next) => setTimeout(next, 200)).on('connection', callback);
+// Namespace whose middleware rejects every connection with CONNECT_ERROR.
+io.of('/reject').use((socket, next) => {
+    setTimeout(() => {
+        const err = new Error('not authorized');
+        err.data = { reason: 'test' };
+        next(err);
+    }, 200);
+});
 // the socket.io client runs on port 4201
 server.listen(4200);
