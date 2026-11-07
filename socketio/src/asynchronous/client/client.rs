@@ -1217,10 +1217,19 @@ mod test {
             .await
             .is_ok());
 
-        let packet: Option<Packet> = Some(socket_stream.next().await.unwrap()?);
-
-        assert!(packet.is_some());
-        let packet = packet.unwrap();
+        // Replies to the emits the caller sent before reading the stream (`message-received`,
+        // `binary-received` and its binary ack) may arrive before or after the ones above,
+        // depending on server timing: skip them.
+        let packet = loop {
+            let packet = socket_stream.next().await.unwrap()?;
+            let early_reply = packet.packet_type == PacketId::BinaryAck
+                || packet.data.as_deref().is_some_and(|data| {
+                    data.contains("\"message-received\"") || data.contains("\"binary-received\"")
+                });
+            if !early_reply {
+                break packet;
+            }
+        };
         assert_eq!(
             packet,
             Packet::new(
