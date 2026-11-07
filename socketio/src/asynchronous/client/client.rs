@@ -553,6 +553,12 @@ impl Client {
                     *(self.disconnect_reason.write().await) = DisconnectReason::Server;
                     self.callback(&Event::Close, CloseReason::IOServerDisconnect.as_str())
                         .await?;
+                    // A namespace-only server disconnect leaves the engine.io connection open, so
+                    // the stream would never end and reconnect_on_disconnect would never apply.
+                    // Each Client owns its engine: close it (socket.io-client does the same).
+                    if let Err(err) = self.socket.read().await.disconnect().await {
+                        trace!("Closing the engine after a server disconnect failed: {err}");
+                    }
                 }
                 PacketId::ConnectError => {
                     self.callback(
@@ -1032,6 +1038,51 @@ mod test {
 
         socket.disconnect().await.unwrap();
         assert!(!socket.socket.read().await.is_engineio_connected());
+    }
+
+    /// A namespace-only server disconnect must end the session so reconnect_on_disconnect applies.
+    #[tokio::test]
+    async fn socket_io_reconnect_after_server_namespace_disconnect() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let close_tx = tx.clone();
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .reconnect_on_disconnect(true)
+            .reconnect_delay(100, 100)
+            .on(Event::Connect, move |_, _| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(Event::Connect).await;
+                }
+                .boxed()
+            })
+            .on(Event::Close, move |_, _| {
+                let tx = close_tx.clone();
+                async move {
+                    let _ = tx.send(Event::Close).await;
+                }
+                .boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+        let wait = Duration::from_secs(5);
+        assert_eq!(
+            timeout(wait, rx.recv()).await.ok().flatten(),
+            Some(Event::Connect)
+        );
+
+        socket.emit("server_disconnect", json!(null)).await.unwrap();
+        assert_eq!(
+            timeout(wait, rx.recv()).await.ok().flatten(),
+            Some(Event::Close)
+        );
+        assert_eq!(
+            timeout(wait, rx.recv()).await.ok().flatten(),
+            Some(Event::Connect),
+            "no reconnect after the server disconnect"
+        );
+
+        socket.disconnect().await.unwrap();
     }
 
     #[tokio::test]
