@@ -149,7 +149,12 @@ impl Socket {
                 }
 
                 let is_polling = matches!(*self.transport, TransportType::Polling(_));
-                let payload = Payload::decode(data, is_polling)?;
+                // A polling body joins packets with 0x1e; a websocket frame is a single packet.
+                let payload = if is_polling {
+                    Payload::try_from(data)?
+                } else {
+                    Payload::from(Packet::try_from(data)?)
+                };
                 let mut iter = payload.into_iter();
 
                 if let Some(packet) = iter.next() {

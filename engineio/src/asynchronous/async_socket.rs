@@ -119,9 +119,14 @@ impl Socket {
     /// Helper method that parses bytes and returns an iterator over the elements.
     fn parse_payload(bytes: Bytes, is_polling: bool) -> impl Stream<Item = Result<Packet>> {
         try_stream! {
-            let payload = Payload::decode(bytes, is_polling);
+            // A polling body joins packets with 0x1e; a websocket frame is a single packet.
+            let payload = if is_polling {
+                Payload::try_from(bytes)?
+            } else {
+                Payload::from(Packet::try_from(bytes)?)
+            };
 
-            for elem in payload?.into_iter() {
+            for elem in payload.into_iter() {
                 yield elem;
             }
         }
