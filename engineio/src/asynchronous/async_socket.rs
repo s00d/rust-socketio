@@ -149,12 +149,13 @@ impl Socket {
             self.handle.spawn(async move { on_close(()).await });
         }
 
-        self.emit(Packet::new(PacketId::Close, Bytes::new()))
-            .await?;
+        // On a dead link the Close packet cannot be sent; the socket is closed all the same, or
+        // emits would keep going to the dead transport and the packet stream would never end.
+        let result = self.emit(Packet::new(PacketId::Close, Bytes::new())).await;
 
         self.connected.store(false, Ordering::Release);
 
-        Ok(())
+        result
     }
 
     /// Sends a packet to the server.
@@ -251,6 +252,10 @@ impl Socket {
         stream::unfold(
             Self::stream(self.transport_raw.clone()),
             |mut stream| async {
+                // A closed socket (disconnect() or a server Close packet) yields nothing more.
+                if !self.is_connected() {
+                    return None;
+                }
                 // Wait for the next payload or until we should have received the next ping.
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(self.time_to_next_ping().await),

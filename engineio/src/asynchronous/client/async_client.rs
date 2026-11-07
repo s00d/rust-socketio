@@ -184,6 +184,25 @@ mod test {
         assert!(result.is_err());
     }
 
+    /// After disconnect() the packet stream ends instead of polling a closed session.
+    #[tokio::test]
+    async fn test_stream_ends_after_disconnect() {
+        for url in [
+            crate::test::engine_io_polling_server().unwrap(),
+            crate::test::engine_io_server().unwrap(),
+        ] {
+            let mut socket = builder(url).build().await.unwrap();
+            socket.connect().await.unwrap();
+            socket.disconnect().await.unwrap();
+            assert!(!socket.is_connected());
+
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                .await
+                .expect("stream still waiting after disconnect");
+            assert!(next.is_none(), "stream yielded {next:?} after disconnect");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_websocket_connect_times_out() {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
