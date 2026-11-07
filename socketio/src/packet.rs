@@ -726,3 +726,7 @@ mod test {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "packet_js_parity.rs"]
+mod js_parity;
