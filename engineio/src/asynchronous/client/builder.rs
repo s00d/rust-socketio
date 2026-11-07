@@ -222,7 +222,15 @@ impl ClientBuilder {
     }
 
     /// Build socket with only a websocket transport
-    pub async fn build_websocket(mut self) -> Result<Client> {
+    pub async fn build_websocket(self) -> Result<Client> {
+        // A blackholed websocket (proxy that accepts TCP and drops the upgrade) would otherwise
+        // hang here forever, and `build_with_fallback` would never fall back to polling.
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, self.build_websocket_unbounded())
+            .await
+            .map_err(|_| Error::IncompleteIo(std::io::ErrorKind::TimedOut.into()))?
+    }
+
+    async fn build_websocket_unbounded(mut self) -> Result<Client> {
         let headers = if let Some(map) = self.headers.clone() {
             Some(map.try_into()?)
         } else {

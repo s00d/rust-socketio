@@ -184,6 +184,20 @@ mod test {
         assert!(result.is_err());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_websocket_connect_times_out() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/", silent.local_addr().unwrap())).unwrap();
+
+        let result = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT * 2,
+            ClientBuilder::new(url).build_websocket(),
+        )
+        .await
+        .expect("websocket connect hung past its timeout");
+        assert!(result.is_err());
+    }
+
     #[tokio::test]
     async fn test_illegal_actions() -> Result<()> {
         let url = crate::test::engine_io_server()?;
