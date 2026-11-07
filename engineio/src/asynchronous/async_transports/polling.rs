@@ -79,9 +79,16 @@ impl PollingTransport {
         Box::pin(try_stream! {
             loop {
                 for await elem in Self::send_request(url.clone(), client.clone()) {
+                    let response = elem?;
+                    // A non-200 reply (e.g. 400 "Session ID unknown") carries an error body, not a
+                    // payload: report it instead of handing it to the decoder.
+                    let status = response.status().as_u16();
+                    if status != 200 {
+                        Err(Error::IncompleteHttp(status))?;
+                    }
                     // One polling response is one engine.io payload. Read the whole body: yielding
                     // the chunks of `bytes_stream()` one by one hands partial payloads to the decoder.
-                    yield elem?.bytes().await?;
+                    yield response.bytes().await?;
                 }
             }
         })
@@ -191,5 +198,21 @@ mod test {
         );
         assert_ne!(transport.base_url().await?.to_string(), url);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn polling_transport_reports_http_error_status() {
+        let mut url = crate::test::engine_io_polling_server().unwrap();
+        url.set_path("/engine.io/");
+        url.query_pairs_mut()
+            .append_pair("EIO", "4")
+            .append_pair("sid", "unknown-session");
+        let mut transport = PollingTransport::new(url, None, None);
+
+        // engine.io answers an unknown sid with 400 and a JSON error body.
+        match transport.next().await {
+            Some(Err(Error::IncompleteHttp(400))) => {}
+            other => panic!("expected IncompleteHttp(400), got {other:?}"),
+        }
     }
 }
