@@ -366,3 +366,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "packet_js_parity.rs"]
+mod js_parity;
