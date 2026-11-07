@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
     time::Duration,
 };
 
@@ -18,6 +21,8 @@ pub struct Client {
     builder: Arc<Mutex<ClientBuilder>>,
     client: Arc<RwLock<RawClient>>,
     backoff: ExponentialBackoff,
+    // set by disconnect(); outlives the RawClient, which a reconnect replaces
+    disconnected: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -33,6 +38,7 @@ impl Client {
             builder: Arc::new(Mutex::new(builder)),
             client: Arc::new(RwLock::new(client)),
             backoff,
+            disconnected: Arc::new(AtomicBool::new(false)),
         };
         s.poll_callback();
 
@@ -161,11 +167,18 @@ impl Client {
     ///
     /// ```
     pub fn disconnect(&self) -> Result<()> {
+        // A manual disconnect is final: the poll thread must neither reconnect nor keep polling.
+        self.disconnected.store(true, Ordering::Release);
         let client = self.client.read()?;
         client.disconnect()
     }
 
-    fn reconnect(&mut self) -> Result<()> {
+    fn disconnected_manually(&self) -> bool {
+        self.disconnected.load(Ordering::Acquire)
+    }
+
+    /// Returns whether a new connection was established.
+    fn reconnect(&mut self) -> Result<bool> {
         let mut reconnect_attempts = 0;
         let (reconnect, max_reconnect_attempts) = {
             let builder = self.builder.lock()?;
@@ -185,13 +198,22 @@ impl Client {
                     std::thread::sleep(backoff);
                 }
 
-                if self.do_reconnect().is_ok() {
+                if self.disconnected_manually() {
                     break;
+                }
+
+                if self.do_reconnect().is_ok() {
+                    // disconnect() raced with this attempt: close the new connection too.
+                    if self.disconnected_manually() {
+                        let _ = self.client.read()?.disconnect();
+                        break;
+                    }
+                    return Ok(true);
                 }
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     fn do_reconnect(&self) -> Result<()> {
@@ -218,12 +240,21 @@ impl Client {
             // `Result::Ok`, the server receives a close frame so it's safe to
             // terminate
             for packet in self_clone.iter() {
+                if self_clone.disconnected_manually() {
+                    break;
+                }
                 let should_reconnect = match packet {
                     Err(Error::IncompleteResponseFromEngineIo(_)) => {
                         //TODO: 0.3.X handle errors
                         //TODO: logging error
                         true
                     }
+                    // The engine.io socket stopped (server Close packet, failed reconnect): every
+                    // further poll returns this error at once, so either reconnect or stop.
+                    Err(Error::StoppedEngineIoSocket) => match self_clone.builder.lock() {
+                        Ok(builder) if builder.reconnect => true,
+                        _ => break,
+                    },
                     Ok(Packet {
                         packet_type: PacketId::Disconnect,
                         ..
@@ -234,8 +265,13 @@ impl Client {
                     _ => false,
                 };
                 if should_reconnect {
-                    let _ = self_clone.disconnect();
-                    let _ = self_clone.reconnect();
+                    // Close the old connection without marking a manual disconnect.
+                    if let Ok(client) = self_clone.client.read() {
+                        let _ = client.disconnect();
+                    }
+                    if !matches!(self_clone.reconnect(), Ok(true)) {
+                        break;
+                    }
                 }
             }
         });
@@ -281,6 +317,54 @@ mod test {
     use serial_test::serial;
     use std::time::{Duration, SystemTime};
     use url::Url;
+
+    /// After disconnect() the poll thread ends instead of spinning on the stopped socket.
+    #[test]
+    fn socket_io_poll_thread_stops_after_disconnect() {
+        let socket = ClientBuilder::new(crate::test::socket_io_server())
+            .connect()
+            .unwrap();
+        socket.disconnect().unwrap();
+
+        for _ in 0..50 {
+            // the poll thread and its iterator hold the other references
+            if Arc::strong_count(&socket.client) == 1 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("poll thread still running after disconnect");
+    }
+
+    /// disconnect() while the client is retrying after an outage stops the reconnect loop.
+    #[test]
+    #[serial(reconnect)]
+    fn socket_io_disconnect_stops_reconnect_loop() {
+        let connects = Arc::new(AtomicUsize::new(0));
+        let on_connect = connects.clone();
+        let socket = ClientBuilder::new(crate::test::socket_io_restart_server())
+            .reconnect(true)
+            .reconnect_delay(100, 100)
+            .on(Event::Connect, move |_, _| {
+                on_connect.fetch_add(1, Ordering::SeqCst);
+            })
+            .connect()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+
+        // The server goes away for 2 s; the client starts retrying.
+        socket.emit("restart_server", json!("")).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = socket.disconnect();
+
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            1,
+            "reconnected after disconnect()"
+        );
+    }
 
     #[test]
     #[serial(reconnect)]
@@ -429,6 +513,7 @@ mod test {
             builder: Arc::new(Mutex::new(builder)),
             client,
             backoff: Default::default(),
+            disconnected: Default::default(),
         };
         let socket_clone = socket.clone();
 
@@ -452,7 +537,8 @@ mod test {
         let pre_num = lock.len();
         drop(lock);
 
-        let _ = socket.disconnect();
+        // Drop the connection without a manual disconnect(), which is final.
+        let _ = socket.client.read().unwrap().disconnect();
         socket.reconnect()?;
 
         // waiting for client to emit messages
