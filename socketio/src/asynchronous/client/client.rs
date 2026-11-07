@@ -217,6 +217,7 @@ impl Client {
                         .with_max_interval(Duration::from_millis(reconnect_delay_max))
                         .build();
 
+                    let mut reconnected = false;
                     loop {
                         // A disconnect() during the outage ends the reconnect loop.
                         if client_clone.disconnected_manually().await {
@@ -237,6 +238,7 @@ impl Client {
                                 if client_clone.disconnected_manually().await {
                                     let _ = client_clone.disconnect().await;
                                 }
+                                reconnected = true;
                                 break;
                             }
                             Err(e) => {
@@ -248,6 +250,12 @@ impl Client {
                                 }
                             }
                         }
+                    }
+                    // Out of attempts (or disconnected manually): give up for good, like
+                    // socket.io-client's reconnect_failed. Looping again would poll the dead
+                    // socket, fire Close and start a fresh round of max_reconnect_attempts.
+                    if !reconnected {
+                        break;
                     }
                 } else {
                     break;

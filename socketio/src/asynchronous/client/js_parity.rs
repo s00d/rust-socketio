@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use tokio::{sync::mpsc, time::timeout};
 
 use crate::{
-    asynchronous::{client::client::Client, ClientBuilder},
+    asynchronous::{client::client::Client, ClientBuilder, ReconnectSettings},
     Event, Payload, TransportType,
 };
 
@@ -306,4 +306,54 @@ async fn connect_error_with_error_data_on_middleware_failure() {
     let message = values[0].as_str().unwrap_or_default().to_owned();
     assert!(message.contains("not authorized"), "{message}");
     assert!(message.contains(r#""reason":"test""#), "{message}");
+}
+
+/// A local TCP proxy to the ci server that can be shut down (server gone, port closed).
+async fn proxy() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let upstream = crate::test::socket_io_server();
+    let target = format!(
+        "{}:{}",
+        upstream.host_str().unwrap(),
+        upstream.port().unwrap()
+    );
+    let task = tokio::spawn(async move {
+        let mut conns = tokio::task::JoinSet::new();
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            let target = target.clone();
+            conns.spawn(async move {
+                if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    (addr, task)
+}
+
+/// connection.ts "should try to reconnect twice and fail when requested two attempts": after
+/// max_reconnect_attempts the client gives up for good.
+#[tokio::test]
+async fn should_try_to_reconnect_twice_and_fail() {
+    let (addr, proxy_task) = proxy().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let client = connected(
+        ClientBuilder::new(url_with_path(&addr))
+            .reconnect(true)
+            .max_reconnect_attempts(2)
+            .reconnect_delay(50, 100)
+            .on_reconnect(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { ReconnectSettings::new() }.boxed()
+            }),
+    )
+    .await;
+
+    // The server disappears for good: connections cut, port closed.
+    proxy_task.abort();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "reconnect attempts");
+    drop(client);
 }
