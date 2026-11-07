@@ -139,7 +139,8 @@ impl Socket {
             let mut attachments = Vec::new();
             while attachments_left > 0 {
                 // TODO: This is not nice! Find a different way to peek the next element while mapping the stream
-                let next = client.next().await.unwrap();
+                // The connection can end between the event and its attachments.
+                let next = client.next().await.ok_or(Error::IncompletePacket())?;
                 match next {
                     Err(err) => return Err(err.into()),
                     Ok(packet) => match packet.packet_id {
@@ -188,5 +189,31 @@ impl Debug for Socket {
             .field("engine_client", &self.engine_client)
             .field("connected", &self.connected)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rust_engineio::asynchronous::ClientBuilder as EngineClientBuilder;
+
+    /// A stream that ends while attachments are still expected is an error, not a panic.
+    #[tokio::test]
+    async fn attachments_after_end_of_stream() {
+        let mut url = crate::test::socket_io_server();
+        url.set_path("/socket.io/");
+        let client = EngineClientBuilder::new(url).build_polling().await.unwrap();
+        client.connect().await.unwrap();
+        client.disconnect().await.unwrap();
+
+        let event = EnginePacket::new(
+            EnginePacketId::Message,
+            Bytes::from_static(b"51-[\"ev\",{\"_placeholder\":true,\"num\":0}]"),
+        );
+        let result = Socket::handle_engineio_packet(event, client).await;
+        assert!(
+            matches!(result, Err(Error::IncompletePacket())),
+            "{result:?}"
+        );
     }
 }
