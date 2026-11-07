@@ -222,69 +222,68 @@ impl ClientBuilder {
     }
 
     /// Build socket with only a websocket transport
-    pub async fn build_websocket(self) -> Result<Client> {
+    pub async fn build_websocket(mut self) -> Result<Client> {
         // A blackholed websocket (proxy that accepts TCP and drops the upgrade) would otherwise
         // hang here forever, and `build_with_fallback` would never fall back to polling.
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, self.build_websocket_unbounded())
+        let connect = async move {
+            let headers = if let Some(map) = self.headers.clone() {
+                Some(map.try_into()?)
+            } else {
+                None
+            };
+
+            match self.url.scheme() {
+                "http" | "ws" => {
+                    let mut transport = WebsocketTransport::new(self.url.clone(), headers).await?;
+
+                    if self.handshake.is_some() {
+                        transport.upgrade().await?;
+                    } else {
+                        self.handshake_with_transport(&mut transport).await?;
+                    }
+                    // NOTE: Although self.url contains the sid, it does not propagate to the transport
+                    // SAFETY: handshake function called previously.
+                    Ok(Client::new(InnerSocket::new(
+                        transport.into(),
+                        self.handshake.unwrap(),
+                        self.on_close,
+                        self.on_data,
+                        self.on_error,
+                        self.on_open,
+                        self.on_packet,
+                    )))
+                }
+                "https" | "wss" => {
+                    let mut transport = WebsocketSecureTransport::new(
+                        self.url.clone(),
+                        self.tls_config.clone(),
+                        headers,
+                    )
+                    .await?;
+
+                    if self.handshake.is_some() {
+                        transport.upgrade().await?;
+                    } else {
+                        self.handshake_with_transport(&mut transport).await?;
+                    }
+                    // NOTE: Although self.url contains the sid, it does not propagate to the transport
+                    // SAFETY: handshake function called previously.
+                    Ok(Client::new(InnerSocket::new(
+                        transport.into(),
+                        self.handshake.unwrap(),
+                        self.on_close,
+                        self.on_data,
+                        self.on_error,
+                        self.on_open,
+                        self.on_packet,
+                    )))
+                }
+                _ => Err(Error::InvalidUrlScheme(self.url.scheme().to_string())),
+            }
+        };
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, connect)
             .await
             .map_err(|_| Error::IncompleteIo(std::io::ErrorKind::TimedOut.into()))?
-    }
-
-    async fn build_websocket_unbounded(mut self) -> Result<Client> {
-        let headers = if let Some(map) = self.headers.clone() {
-            Some(map.try_into()?)
-        } else {
-            None
-        };
-
-        match self.url.scheme() {
-            "http" | "ws" => {
-                let mut transport = WebsocketTransport::new(self.url.clone(), headers).await?;
-
-                if self.handshake.is_some() {
-                    transport.upgrade().await?;
-                } else {
-                    self.handshake_with_transport(&mut transport).await?;
-                }
-                // NOTE: Although self.url contains the sid, it does not propagate to the transport
-                // SAFETY: handshake function called previously.
-                Ok(Client::new(InnerSocket::new(
-                    transport.into(),
-                    self.handshake.unwrap(),
-                    self.on_close,
-                    self.on_data,
-                    self.on_error,
-                    self.on_open,
-                    self.on_packet,
-                )))
-            }
-            "https" | "wss" => {
-                let mut transport = WebsocketSecureTransport::new(
-                    self.url.clone(),
-                    self.tls_config.clone(),
-                    headers,
-                )
-                .await?;
-
-                if self.handshake.is_some() {
-                    transport.upgrade().await?;
-                } else {
-                    self.handshake_with_transport(&mut transport).await?;
-                }
-                // NOTE: Although self.url contains the sid, it does not propagate to the transport
-                // SAFETY: handshake function called previously.
-                Ok(Client::new(InnerSocket::new(
-                    transport.into(),
-                    self.handshake.unwrap(),
-                    self.on_close,
-                    self.on_data,
-                    self.on_error,
-                    self.on_open,
-                    self.on_packet,
-                )))
-            }
-            _ => Err(Error::InvalidUrlScheme(self.url.scheme().to_string())),
-        }
     }
 
     /// Build websocket if allowed, if not allowed or errored fall back to polling.
