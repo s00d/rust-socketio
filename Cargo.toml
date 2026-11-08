@@ -16,7 +16,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/s00d/rust-socketio"
-homepage = "https://github.com/s00d/rust-socketio"
+homepage = "https://s00d.github.io/rust-socketio/"
 authors = ["Pavel Kuzmin", "Bastian Kersting <bastian@cmbt.de>"]
 
 [workspace.dependencies]

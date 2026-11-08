@@ -8,7 +8,8 @@
     "url": "git+https://github.com/s00d/rust-socketio.git",
     "directory": "crates/tauri-plugin-socketio"
   },
-  "homepage": "https://github.com/s00d/rust-socketio/tree/main/crates/tauri-plugin-socketio",
+  "homepage": "https://s00d.github.io/rust-socketio/tauri/setup",
+  "bugs": "https://github.com/s00d/rust-socketio/issues",
   "license": "MIT",
   "keywords": [
     "tauri",
