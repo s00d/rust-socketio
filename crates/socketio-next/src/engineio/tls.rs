@@ -267,7 +267,9 @@ mod tests {
             feature = "platform-verifier",
             not(target_os = "android")
         ));
-        assert_eq!(!debug.contains("WebPkiServerVerifier"), platform, "{debug}");
+        // the platform crate's type is `Verifier` (on Linux it wraps a WebPki verifier over
+        // the OS roots); the bundled roots are a bare `WebPkiServerVerifier`
+        assert_eq!(debug.contains("verifier: Verifier {"), platform, "{debug}");
     }
 
     #[cfg(any(feature = "rustls", feature = "native-tls"))]
