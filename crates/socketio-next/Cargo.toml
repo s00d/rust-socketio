@@ -42,6 +42,8 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
+# the proxy matcher reqwest itself uses, so the websocket routes like polling
+hyper-util = { version = "0.1.12", default-features = false, features = ["client-proxy"] }
 native-tls = { workspace = true, optional = true }
 reqwest = { workspace = true }
 rustls = { workspace = true, optional = true }

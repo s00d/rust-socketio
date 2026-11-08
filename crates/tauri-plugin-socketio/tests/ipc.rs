@@ -916,6 +916,15 @@ fn connect_values_of_rust_clients_are_not_the_webviews() {
         h.err_kind("reconnect", json!({ "id": "ro" })),
         "AccessDenied"
     );
+    assert_eq!(
+        h.err_kind("reconnect", json!({ "id": "rs" })),
+        "NotConfigurable",
+        "Rust's own clients are Rust's to reconnect"
+    );
+    assert_eq!(
+        h.err_kind("reconnect", json!({ "id": "ro" })),
+        "AccessDenied"
+    );
     tauri::async_runtime::block_on(io.remove("rs").unwrap().disconnect()).unwrap();
     io.remove("ro").unwrap();
 }
@@ -984,4 +993,200 @@ fn a_ca_option_trusts_a_private_ca() {
         )
         .unwrap_err();
     assert_eq!(bad["kind"], "InvalidTlsConfig", "{bad}");
+}
+
+/// The allow-list checks the engine.io path the connection really uses (the `path` option;
+/// the URL's path is only the namespace).
+#[test]
+fn the_url_allow_list_checks_the_engine_path() {
+    let prefix = format!("{}/v1/", conformance_server());
+    let h = Harness::with(
+        &["socketio:default"],
+        tauri_plugin_socketio::Builder::new().allow_url_prefix(prefix),
+    );
+    for (n, options) in [
+        // the URL path says /v1/, but the engine path is the default /socket.io/
+        json!({ "url": format!("{}/v1/", conformance_server()) }),
+        json!({ "url": format!("{}/v1/x", conformance_server()), "path": "/socket.io/" }),
+        // the namespace option does not move the target
+        json!({ "url": conformance_server(), "namespace": "/v1/" }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let err = h
+            .invoke("connect", json!({ "id": format!("p{n}"), "options": options, "channel": format!("__CHANNEL__:{}", 70 + n) }))
+            .unwrap_err();
+        assert_eq!(err["kind"], "UrlNotAllowed", "{n}: {err}");
+    }
+    // inside /v1/: not refused by the allow-list (the server has no such path: it times out)
+    let err = h
+        .invoke(
+            "connect",
+            json!({ "id": "in", "options": { "url": conformance_server(), "path": "/v1/socket.io", "timeout": 500, "transports": "polling" }, "channel": "__CHANNEL__:79" }),
+        )
+        .unwrap_err();
+    assert_ne!(err["kind"], "UrlNotAllowed", "{err}");
+}
+
+#[test]
+fn webview_headers_are_limited() {
+    let mut h = Harness::new();
+    let err = h
+        .invoke(
+            "connect",
+            json!({ "id": "h", "options": { "url": conformance_server(), "headers": { "Host": "evil" } }, "channel": "__CHANNEL__:1" }),
+        )
+        .unwrap_err();
+    assert_eq!(err["kind"], "InvalidOptions");
+    assert!(
+        err.to_string().contains("Host") && !err.to_string().contains("evil"),
+        "{err}"
+    );
+    h.connect("h", conformance(), 2);
+    assert_eq!(
+        h.err_kind(
+            "set_headers",
+            json!({ "id": "h", "headers": { "Sec-WebSocket-Key": "x" } })
+        ),
+        "InvalidOptions"
+    );
+    h.ok(
+        "set_headers",
+        json!({ "id": "h", "headers": { "authorization": "Bearer x" } }),
+    );
+    h.ok("disconnect", json!({ "id": "h" }));
+}
+
+/// Connects in flight hold a subscription slot: concurrent connects cannot pass the cap.
+#[test]
+fn concurrent_connects_respect_the_subscription_cap() {
+    let h = Harness::new();
+    let max = tauri_plugin_socketio::MAX_SUBSCRIPTIONS_PER_WEBVIEW;
+    // a namespace that answers CONNECT after 200 ms: every check happens while all are pending
+    let url = format!("{}/slow", socket_io_server());
+    let results: Vec<Result<Value, Value>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..max + 6)
+            .map(|n| {
+                let webview = h.webview.clone();
+                let url = url.clone();
+                s.spawn(move || {
+                    invoke_on(
+                        &webview,
+                        "connect",
+                        json!({ "id": format!("c{n}"), "options": { "url": url }, "channel": format!("__CHANNEL__:{}", 200 + n) }),
+                    )
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let ok = results.iter().filter(|r| r.is_ok()).count();
+    assert!(ok <= max, "{ok} connects passed a cap of {max}");
+    assert!(
+        results
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .all(|e| e["kind"] == "TooManySubscriptions"),
+        "{results:?}"
+    );
+    for id in h.app.socketio().ids() {
+        h.ok("disconnect", json!({ "id": id }));
+    }
+}
+
+/// A JS `reconnect` and `disconnect` racing end with the client closed.
+#[test]
+fn concurrent_reconnect_and_disconnect_end_closed() {
+    let mut h = Harness::new();
+    h.connect(
+        "race",
+        json!({ "url": format!("{}/slow", socket_io_server()) }),
+        1,
+    );
+    let client = h.app.socketio().get("race").unwrap();
+    h.ok(
+        "emit",
+        json!({ "id": "race", "event": "server_disconnect", "args": { "args": [] } }),
+    );
+    h.state(1, "closed");
+    std::thread::scope(|s| {
+        let a = h.webview.clone();
+        let b = h.webview.clone();
+        let r = s.spawn(move || invoke_on(&a, "reconnect", json!({ "id": "race" })));
+        std::thread::sleep(Duration::from_millis(30));
+        let d = s.spawn(move || invoke_on(&b, "disconnect", json!({ "id": "race" })));
+        let _ = r.join().unwrap();
+        d.join().unwrap().unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        client.state().is_closed() && !client.connected(),
+        "{:?}",
+        client.state()
+    );
+    assert_eq!(h.ok("list", json!({})), json!([]));
+}
+
+/// A server that answers one HTTP request with `response` (raw) on a free port.
+fn http_once(response: &'static str) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for stream in listener.incoming().take(4) {
+            let Ok(mut stream) = stream else { return };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// socketio-next's error data reach JS: `HttpStatus` with the body's message.
+#[test]
+fn http_status_errors_carry_the_message() {
+    let h = Harness::new();
+    let body = r#"{"code":4,"message":"Forbidden"}"#;
+    let response: &'static str = Box::leak(
+        format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            .into_boxed_str(),
+    );
+    let url = http_once(response);
+    let err = h
+        .invoke("connect", json!({ "id": "st", "options": { "url": url, "transports": "polling" }, "channel": "__CHANNEL__:1" }))
+        .unwrap_err();
+    assert_eq!(err["kind"], "HttpStatus", "{err}");
+    assert_eq!(
+        err["data"],
+        json!({ "status": 403, "message": "Forbidden" })
+    );
+}
+
+/// ... and `WebsocketClosed` with the close code and reason.
+#[test]
+fn websocket_close_codes_reach_js() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+    let listener =
+        tauri::async_runtime::block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tauri::async_runtime::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let frame = CloseFrame {
+            code: CloseCode::from(4001),
+            reason: "kicked".into(),
+        };
+        ws.send(Message::Close(Some(frame))).await.unwrap();
+        let _ = ws.next().await;
+    });
+    let h = Harness::new();
+    let err = h
+        .invoke("connect", json!({ "id": "ws", "options": { "url": format!("http://{addr}"), "transports": "websocket" }, "channel": "__CHANNEL__:1" }))
+        .unwrap_err();
+    assert_eq!(err["kind"], "WebsocketClosed", "{err}");
+    assert_eq!(err["data"], json!({ "code": 4001, "reason": "kicked" }));
 }

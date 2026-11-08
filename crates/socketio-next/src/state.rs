@@ -62,11 +62,13 @@ impl fmt::Display for DisconnectReason {
 #[non_exhaustive]
 pub enum ConnectionState {
     /// A connect attempt is running (`attempt` 0 is the initial connect).
+    #[non_exhaustive]
     Connecting {
         /// 0 for the initial connect, then 1, 2, ... per reconnect attempt.
         attempt: u32,
     },
     /// The namespace is joined.
+    #[non_exhaustive]
     Connected {
         /// The socket id the server assigned (`socket.id`).
         sid: String,
@@ -74,6 +76,7 @@ pub enum ConnectionState {
         recovered: bool,
     },
     /// The connection was lost; a reconnect follows.
+    #[non_exhaustive]
     Disconnected {
         /// Why.
         reason: DisconnectReason,
@@ -81,6 +84,7 @@ pub enum ConnectionState {
         error: Option<Error>,
     },
     /// Waiting `delay` before reconnect attempt `attempt`.
+    #[non_exhaustive]
     Reconnecting {
         /// 1, 2, ... (socket.io-client `reconnect_attempt`).
         attempt: u32,
@@ -90,6 +94,7 @@ pub enum ConnectionState {
         error: Option<Error>,
     },
     /// Final: no more connects or events.
+    #[non_exhaustive]
     Closed {
         /// Why.
         reason: DisconnectReason,

@@ -104,6 +104,21 @@ impl Transport {
     }
 
     /// Polling or websocket.
+    /// A liveness probe: polling sends a noop (its answer proves the session), a websocket
+    /// sends a ping (its pong comes back as a noop packet). `Ok(true)`: alive already.
+    pub(crate) async fn probe(&self) -> Result<bool> {
+        match self {
+            Transport::Polling(t) => {
+                t.emit(Bytes::from_static(b"6"), false).await?;
+                Ok(true)
+            }
+            Transport::Websocket(t) => {
+                t.ping().await?;
+                Ok(false)
+            }
+        }
+    }
+
     pub fn kind(&self) -> TransportKind {
         match self {
             Transport::Polling(_) => TransportKind::Polling,

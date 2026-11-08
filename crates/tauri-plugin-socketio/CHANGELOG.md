@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `linkInfo` has `packetsIn` / `packetsOut`, `bytesIn` / `bytesOut`, `sessions`; `disconnected`
   states carry the error (`WebsocketClosed` with `data: { code, reason }`); `HttpStatus`
   errors have `data.message`.
+- The URL allow-list checks the engine.io path the connection uses (not the URL path, which
+  is the namespace); concurrent connects hold their id and subscription slot, so they cannot
+  pass the per-webview cap; `reconnect` only for clients a webview connected; headers the
+  webview may not set (`Host`, `Cookie`, `Sec-WebSocket-*`, `Proxy-*`, ...).
 - Typed `InvalidOptions` for wrong option types/values (values are not echoed); connect
   options' `Debug` hides query, header and auth values.
 - Binary arguments both ways (`Uint8Array` ↔ socket.io attachments).

@@ -26,6 +26,9 @@ pub(crate) struct Socket {
     /// The last ping (or the open), on the monotonic clock and on the wall clock: the
     /// monotonic one stops while the machine sleeps, the wall clock does not.
     last_ping: Arc<Mutex<(Instant, SystemTime)>>,
+    /// Set when the wall clock says the deadline passed but the monotonic clock does not (a
+    /// system sleep, or a clock step): the link must show life before this instant.
+    wake_check: Arc<Mutex<Option<Instant>>>,
     handshake: Arc<HandshakePacket>,
 }
 
@@ -41,6 +44,7 @@ impl Socket {
             callbacks,
             connected: Arc::new(AtomicBool::default()),
             last_ping: Arc::new(Mutex::new((Instant::now(), SystemTime::now()))),
+            wake_check: Arc::default(),
             handshake: Arc::new(handshake),
         }
     }
@@ -241,13 +245,53 @@ impl Socket {
         wall.elapsed().is_ok_and(|gap| gap > self.deadline())
     }
 
+    /// The link showed life (a packet, a probe answer): the wall clock counts from now and a
+    /// pending wake check is over.
+    fn alive(&self) {
+        self.last_ping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .1 = SystemTime::now();
+        *self
+            .wake_check
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// The pending wake check, or a new one (pingTimeout from now, with a probe) when the wall
+    /// clock jumped past the deadline. `Some(instant)`: the link must show life before it.
+    fn wake_deadline(&self) -> Option<Instant> {
+        let mut check = self
+            .wake_check
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if check.is_none() && self.wall_clock_expired() {
+            let grace = Duration::from_millis(self.handshake.ping_timeout);
+            *check = Some(Instant::now() + grace);
+            tracing::debug!(sid = %self.handshake.sid, "wall clock past the ping deadline; probing the link");
+            let socket = self.clone();
+            tokio::spawn(async move {
+                if let Ok(true) = socket.transport.probe().await {
+                    socket.alive();
+                }
+            });
+        }
+        *check
+    }
+
+    /// Moves the wall clock of the last ping back by `gap` (`forward`: a sleep or a forward
+    /// step) or ahead (a backward step), as the system would.
     #[cfg(test)]
-    pub(crate) fn pretend_sleep(&self, gap: Duration) {
+    pub(crate) fn shift_wall_clock(&self, gap: Duration, forward: bool) {
         let mut last = self
             .last_ping
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        last.1 -= gap;
+        if forward {
+            last.1 -= gap;
+        } else {
+            last.1 += gap;
+        }
     }
 
     /// Time left until a ping must have arrived (pingInterval + pingTimeout after the last one).
@@ -272,21 +316,33 @@ impl Socket {
                     return None;
                 }
                 // Waits in slices so the wall clock is checked now and then: tokio's timer
-                // does not count the time the machine slept.
+                // does not count the time the machine slept. A wall-clock jump alone does not
+                // close the link (an NTP step looks the same): it arms a probe and a short
+                // deadline, and any packet before it proves the link alive.
                 let outcome = {
                     let next = stream.next();
                     tokio::pin!(next);
                     loop {
-                        let slice = socket.time_to_next_ping().min(WALL_CHECK);
+                        let mut slice = socket.time_to_next_ping().min(WALL_CHECK);
+                        if let Some(at) = socket.wake_deadline() {
+                            slice = slice.min(at.saturating_duration_since(Instant::now()));
+                        }
                         match tokio::time::timeout(slice, &mut next).await {
-                            Ok(result) => break Some(result),
-                            Err(_)
-                                if socket.time_to_next_ping().is_zero()
-                                    || socket.wall_clock_expired() =>
-                            {
-                                break None;
+                            Ok(result) => {
+                                if matches!(result, Some(Ok(_))) {
+                                    socket.alive();
+                                }
+                                break Some(result);
                             }
-                            Err(_) => {}
+                            Err(_) if socket.time_to_next_ping().is_zero() => break None,
+                            Err(_) => {
+                                if socket
+                                    .wake_deadline()
+                                    .is_some_and(|at| Instant::now() >= at)
+                                {
+                                    break None;
+                                }
+                            }
                         }
                     }
                 };

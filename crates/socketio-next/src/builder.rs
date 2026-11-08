@@ -67,6 +67,14 @@ impl ConnectParams {
     }
 }
 
+/// The proxy setting of a builder.
+#[derive(Clone, Debug)]
+pub(crate) enum ProxyChoice {
+    Env,
+    Url(String),
+    Off,
+}
+
 pub(crate) type Inspector = Arc<dyn Fn(Direction, &Packet) + Send + Sync>;
 
 /// Everything the connection actor needs; fixed at `connect()`.
@@ -80,8 +88,8 @@ pub(crate) struct Config {
     pub(crate) auth: Option<Value>,
     pub(crate) auth_fn: Option<AuthFn>,
     pub(crate) params_fn: Option<ParamsFn>,
-    /// `http://[user:pass@]host:port` for every transport; `None`: the environment's.
-    pub(crate) proxy: Option<String>,
+    /// The environment's proxy, an explicit one, or none.
+    pub(crate) proxy: ProxyChoice,
     /// Built by `connect()`: one HTTP client (pool, cookies) for every attempt.
     pub(crate) http: Option<crate::engineio::http::Http>,
     #[cfg_attr(not(any(feature = "rustls", feature = "native-tls")), allow(dead_code))]
@@ -118,7 +126,7 @@ impl fmt::Debug for Config {
             .field("randomization_factor", &self.randomization_factor)
             .field("reconnect_on_disconnect", &self.reconnect_on_disconnect)
             .field("buffer_while_disconnected", &self.buffer_while_disconnected)
-            .field("proxy", &self.proxy.is_some())
+            .field("proxy", &!matches!(self.proxy, ProxyChoice::Env))
             .finish_non_exhaustive()
     }
 }
@@ -180,7 +188,7 @@ impl ClientBuilder {
                 auth: None,
                 auth_fn: None,
                 params_fn: None,
-                proxy: None,
+                proxy: ProxyChoice::Env,
                 http: None,
                 tls_config: None,
                 transport: TransportType::Any,
@@ -283,7 +291,16 @@ impl ClientBuilder {
     /// basic auth from the user info). Without it the environment is used: `HTTPS_PROXY` /
     /// `HTTP_PROXY` / `ALL_PROXY` and `NO_PROXY`, for polling and websocket alike.
     pub fn proxy(mut self, proxy: impl Into<String>) -> Self {
-        self.config.proxy = Some(proxy.into());
+        self.config.proxy = ProxyChoice::Url(proxy.into());
+        self
+    }
+
+    /// No proxy for any transport, whatever `HTTPS_PROXY` / `HTTP_PROXY` say (environment
+    /// proxies apply to `ws://` too; a proxy that refuses `CONNECT` to other ports than 443
+    /// would otherwise break websockets; with `TransportType::Any` the client then stays on
+    /// polling after the failed upgrade).
+    pub fn no_proxy(mut self) -> Self {
+        self.config.proxy = ProxyChoice::Off;
         self
     }
 
@@ -405,11 +422,15 @@ impl ClientBuilder {
                 .map_err(|_| Error::InvalidHeader(format!("bad value for header {key:?}")))?;
             self.config.headers.append(name, value);
         }
+        use crate::engineio::http::ProxyMode;
         let proxy = match &self.config.proxy {
-            Some(proxy) => Some(url::Url::parse(proxy).map_err(|_| {
-                crate::engineio::Error::ProxyFailed("the proxy is not a valid URL".into())
-            })?),
-            None => None,
+            ProxyChoice::Url(proxy) => {
+                ProxyMode::Explicit(url::Url::parse(proxy).map_err(|_| {
+                    crate::engineio::Error::ProxyFailed("the proxy is not a valid URL".into())
+                })?)
+            }
+            ProxyChoice::Env => ProxyMode::Env,
+            ProxyChoice::Off => ProxyMode::Off,
         };
         self.config.http = Some(crate::engineio::http::Http::new(
             self.config.tls_config.as_ref(),

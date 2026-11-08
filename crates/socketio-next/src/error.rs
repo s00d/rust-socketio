@@ -32,6 +32,7 @@ pub enum Error {
     /// namespace does not exist. socket.io-client's `connect_error` with `err.message` /
     /// `err.data`. The client does not reconnect after this.
     #[error("the server rejected the namespace: {message}")]
+    #[non_exhaustive]
     ConnectRejected {
         /// The error message from the server middleware (`next(new Error(message))`).
         message: String,

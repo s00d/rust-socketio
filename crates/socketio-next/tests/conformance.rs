@@ -170,7 +170,7 @@ async fn connection_state_recovery() {
         .await
         .unwrap();
     assert!(
-        matches!(state, socketio_next::ConnectionState::Connected { recovered: true, ref sid } if *sid == id),
+        matches!(state, socketio_next::ConnectionState::Connected { recovered: true, ref sid, .. } if *sid == id),
         "{state:?} (was {id})"
     );
     assert!(client.recovered());

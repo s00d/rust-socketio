@@ -47,12 +47,12 @@ impl WebsocketTransport {
         Self::connect(base_url, tls_config, headers, None).await
     }
 
-    /// Like [`new`](Self::new), through the HTTP proxy `proxy` (a `CONNECT` tunnel) if given.
+    /// Like [`new`](Self::new), through the HTTP proxy `route` (a `CONNECT` tunnel) if given.
     pub(crate) async fn connect(
         base_url: Url,
         tls_config: Option<TlsConfig>,
         headers: Option<HeaderMap>,
-        proxy: Option<Url>,
+        route: Option<crate::engineio::http::Route>,
     ) -> Result<Self> {
         tls::check_scheme(&base_url)?;
         let secure = matches!(base_url.scheme(), "https" | "wss");
@@ -66,21 +66,10 @@ impl WebsocketTransport {
             req.headers_mut().extend(map);
         }
         // TCP_NODELAY like the Node `ws` client: engine.io packets are small and latency-bound.
-        let tcp = match &proxy {
-            Some(proxy) => {
-                let host = url
-                    .host_str()
-                    .ok_or_else(|| Error::InvalidHandshake("the URL has no host".into()))?;
-                let port = url.port_or_known_default().unwrap_or(80);
-                crate::engineio::http::tunnel(proxy, host, port).await?
-            }
+        let tcp = match &route {
+            Some(route) => crate::engineio::http::tunnel(route, &url).await?,
             None => {
-                let host = url
-                    .host_str()
-                    .ok_or_else(|| Error::InvalidHandshake("the URL has no host".into()))?
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .to_owned();
+                let host = crate::engineio::http::connect_host(&url)?;
                 let port = url.port_or_known_default().unwrap_or(80);
                 let tcp = TcpStream::connect((host.as_str(), port))
                     .await
@@ -164,6 +153,16 @@ impl WebsocketTransport {
         futures_util::future::poll_fn(|cx| self.poll_message(cx)).await
     }
 
+    /// A websocket ping; the server's pong arrives as an engine.io noop frame.
+    pub(crate) async fn ping(&self) -> Result<()> {
+        self.sender
+            .lock()
+            .await
+            .send(Message::Ping(Bytes::new()))
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
         let message = if is_binary_att {
             Message::binary(data)
@@ -216,6 +215,8 @@ fn frame_to_packet_bytes(message: Message) -> Option<Frame> {
     match message {
         Message::Text(text) => Some(Frame::Text(Bytes::from(text))),
         Message::Binary(data) => Some(Frame::Binary(data)),
+        // a pong (to the liveness probe) is a sign of life: an engine.io noop
+        Message::Pong(_) => Some(Frame::Text(Bytes::from_static(b"6"))),
         _ => None,
     }
 }

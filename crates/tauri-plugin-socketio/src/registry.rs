@@ -52,6 +52,8 @@ pub struct SocketIo {
 struct Inner {
     clients: Mutex<HashMap<String, Entry>>,
     reserved: Mutex<HashSet<String>>,
+    /// Connects in flight: their ids and subscription slots.
+    pending: Mutex<Pending>,
     /// Bumped when a webview loads a new page: a JS connect that started before is stale.
     generations: Mutex<HashMap<String, u64>>,
     /// URL prefixes a webview may connect to; empty: any.
@@ -165,6 +167,7 @@ impl SocketIo {
         &self,
         id: String,
         url: &str,
+        engine_path: Option<&str>,
         builder: ClientBuilder,
         dynamic: Arc<Mutex<Dynamic>>,
         sub: SubscribeArgs,
@@ -172,7 +175,7 @@ impl SocketIo {
         if lock(&self.inner.reserved).contains(&id) {
             return Err(Error::Reserved(id));
         }
-        if !self.url_allowed(url) {
+        if !self.url_allowed(url, engine_path) {
             return Err(Error::UrlNotAllowed);
         }
         let (_, sub) = self
@@ -189,15 +192,26 @@ impl SocketIo {
         dynamic: Option<Arc<Mutex<Dynamic>>>,
     ) -> Result<(Client, Option<(SubscriptionId, State)>)> {
         let webview = sub.as_ref().and_then(|s| s.webview.clone());
-        {
+        // The id and (for a webview) one subscription slot are held while connecting, so
+        // concurrent connects can neither share an id nor exceed the cap.
+        let _pending = {
             let clients = lock(&self.inner.clients);
-            if clients.contains_key(&id) {
+            let mut pending = lock(&self.inner.pending);
+            if clients.contains_key(&id) || pending.ids.contains(&id) {
                 return Err(Error::AlreadyExists(id));
             }
             if let Some(label) = &webview {
-                check_cap(&clients, label)?;
+                let held = pending.slots.get(label).copied().unwrap_or_default();
+                check_cap(&clients, label, held)?;
+                *pending.slots.entry(label.clone()).or_default() += 1;
             }
-        }
+            pending.ids.insert(id.clone());
+            PendingGuard {
+                inner: &self.inner,
+                id: id.clone(),
+                webview: webview.clone(),
+            }
+        };
         let generation = webview.as_deref().map(|l| self.generation(l));
         let hub = Hub::new(true);
         let sub_id = sub.map(|args| {
@@ -336,7 +350,12 @@ impl SocketIo {
     ) -> Result<(SubscriptionId, State)> {
         let clients = lock(&self.inner.clients);
         if let Some(label) = &args.webview {
-            check_cap(&clients, label)?;
+            let held = lock(&self.inner.pending)
+                .slots
+                .get(label)
+                .copied()
+                .unwrap_or_default();
+            check_cap(&clients, label, held)?;
         }
         let entry = clients
             .get(id)
@@ -388,26 +407,24 @@ impl SocketIo {
         self.inner.next_sub.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// `url` is under one of the allowed prefixes (same scheme, host and port; path prefix
-    /// on a segment boundary), or there is no allow-list.
-    pub(crate) fn url_allowed(&self, url: &str) -> bool {
+    /// The connection goes where an allowed prefix says: same scheme, host and port, and the
+    /// **engine.io path** (the `path` option, default `/socket.io/`; the URL's own path is the
+    /// namespace and replaced by it) under the prefix's path on a `/` boundary. The namespace
+    /// is not part of the check. No allow-list: anything.
+    pub(crate) fn url_allowed(&self, url: &str, engine_path: Option<&str>) -> bool {
         if self.inner.allowed.is_empty() {
             return true;
         }
         let Ok(url) = url::Url::parse(url) else {
             return false;
         };
+        let path = normalize_engine_path(engine_path.unwrap_or("/socket.io/"));
         self.inner.allowed.iter().any(|p| {
             let base = p.path().trim_end_matches('/');
             p.scheme() == url.scheme()
                 && p.host_str() == url.host_str()
                 && p.port_or_known_default() == url.port_or_known_default()
-                && (base.is_empty()
-                    || url.path() == base
-                    || url
-                        .path()
-                        .strip_prefix(base)
-                        .is_some_and(|r| r.starts_with('/')))
+                && (base.is_empty() || path.strip_prefix(base).is_some_and(|r| r.starts_with('/')))
         })
     }
 
@@ -461,6 +478,22 @@ impl SocketIo {
         Ok(())
     }
 
+    /// A client a webview connected ([`Access::Full`], not registered from Rust): what
+    /// `reconnect` may restart.
+    pub(crate) fn webview_client(&self, id: &str) -> Result<Client> {
+        let clients = lock(&self.inner.clients);
+        let entry = clients
+            .get(id)
+            .ok_or_else(|| Error::UnknownClient(id.to_owned()))?;
+        if entry.access == Access::ReadOnly {
+            return Err(Error::AccessDenied(id.to_owned()));
+        }
+        if entry.dynamic.is_none() {
+            return Err(Error::NotConfigurable(id.to_owned()));
+        }
+        Ok(entry.client.clone())
+    }
+
     /// Answers server ack `ack_id` of client `id`, offered to `webview`.
     pub(crate) fn ack(&self, id: &str, ack_id: u64, webview: &str, payload: Payload) -> Result<()> {
         let hub = {
@@ -500,8 +533,47 @@ impl SocketIo {
     }
 }
 
-fn check_cap(clients: &HashMap<String, Entry>, label: &str) -> Result<()> {
-    let count: usize = clients.values().map(|e| e.hub.count(label)).sum();
+/// Like socketio-next's `path()`: a leading and a trailing `/`.
+fn normalize_engine_path(path: &str) -> String {
+    let mut path = path.to_owned();
+    if !path.starts_with('/') {
+        path.insert(0, '/');
+    }
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path
+}
+
+/// Ids and subscription slots held by connects in flight.
+#[derive(Default)]
+struct Pending {
+    ids: HashSet<String>,
+    slots: HashMap<String, usize>,
+}
+
+/// Gives the pending id and slot back when the connect ends (success or failure; on success
+/// the client and its subscription are registered by then).
+struct PendingGuard<'a> {
+    inner: &'a Inner,
+    id: String,
+    webview: Option<String>,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        let mut pending = lock(&self.inner.pending);
+        pending.ids.remove(&self.id);
+        if let Some(label) = &self.webview {
+            if let Some(n) = pending.slots.get_mut(label) {
+                *n = n.saturating_sub(1);
+            }
+        }
+    }
+}
+
+fn check_cap(clients: &HashMap<String, Entry>, label: &str, held: usize) -> Result<()> {
+    let count: usize = clients.values().map(|e| e.hub.count(label)).sum::<usize>() + held;
     if count >= MAX_SUBSCRIPTIONS_PER_WEBVIEW {
         return Err(Error::TooManySubscriptions(MAX_SUBSCRIPTIONS_PER_WEBVIEW));
     }
@@ -581,11 +653,14 @@ impl Hub {
     }
 
     fn state(&self, state: &ConnectionState) {
+        self.forward_state(State::from(state));
+    }
+
+    fn forward_state(&self, state: State) {
         let mut st = lock(&self.state);
         if st.closed {
             return;
         }
-        let state = State::from(state);
         st.last = Some(state.clone());
         st.send_all(|_| {
             Some(Message::State {
@@ -887,7 +962,7 @@ mod tests {
             let hub = Arc::clone(&hub);
             std::thread::spawn(move || {
                 for attempt in 1..=2000 {
-                    hub.state(&ConnectionState::Connecting { attempt });
+                    hub.forward_state(State::Connecting { attempt });
                 }
             })
         };
@@ -931,8 +1006,8 @@ mod tests {
             matches!(hub.snapshot_to(1, &client), State::Connected { .. }),
             "fallback"
         );
-        hub.state(&ConnectionState::Disconnected {
-            reason: socketio_next::DisconnectReason::TransportClose,
+        hub.forward_state(State::Disconnected {
+            reason: "transport close".into(),
             error: None,
         });
         let (ch2, rx2) = channel();
@@ -960,6 +1035,7 @@ mod tests {
                 io.connect_from_webview(
                     "slow".into(),
                     &url,
+                    None,
                     builder,
                     Default::default(),
                     sub(ch, "w"),
@@ -996,16 +1072,25 @@ mod tests {
             url::Url::parse("https://api.example.com").unwrap(),
             url::Url::parse("wss://rt.example.com/v1/").unwrap(),
         ]);
-        assert!(io.url_allowed("https://api.example.com"));
-        assert!(io.url_allowed("https://api.example.com:443/admin?x=1"));
-        assert!(!io.url_allowed("https://api.example.com.evil.com"));
-        assert!(!io.url_allowed("https://api.example.com:8443"));
-        assert!(!io.url_allowed("http://api.example.com"));
-        assert!(io.url_allowed("wss://rt.example.com/v1"));
-        assert!(io.url_allowed("wss://rt.example.com/v1/chat"));
-        assert!(!io.url_allowed("wss://rt.example.com/v10"));
-        assert!(!io.url_allowed("not a url"));
-        assert!(SocketIo::default().url_allowed("http://anything"));
+        let ok = |url: &str, path: Option<&str>| io.url_allowed(url, path);
+        assert!(ok("https://api.example.com", None));
+        assert!(ok(
+            "https://api.example.com:443/admin?x=1",
+            Some("/anything/")
+        ));
+        assert!(!ok("https://api.example.com.evil.com", None));
+        assert!(!ok("https://api.example.com:8443", None));
+        assert!(!ok("http://api.example.com", None));
+        // the engine.io path is what is checked: the URL's path is only the namespace
+        assert!(ok("wss://rt.example.com", Some("/v1/socket.io")));
+        assert!(ok("wss://rt.example.com/v1", Some("v1/")));
+        assert!(
+            !ok("wss://rt.example.com/v1", None),
+            "default /socket.io/ is outside /v1/"
+        );
+        assert!(!ok("wss://rt.example.com/v1/chat", Some("/v10/")));
+        assert!(!ok("not a url", None));
+        assert!(SocketIo::default().url_allowed("http://anything", Some("/x/")));
     }
 
     #[test]

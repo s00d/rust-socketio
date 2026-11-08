@@ -363,7 +363,7 @@ async fn connect_rejected_carries_message_and_data() {
         .await
         .unwrap_err();
     match err {
-        Error::ConnectRejected { message, data } => {
+        Error::ConnectRejected { message, data, .. } => {
             assert_eq!(message, "not authorized");
             assert_eq!(data, Some(json!({"reason": "test"})));
         }
@@ -509,7 +509,7 @@ async fn transport_close_reconnects_with_state_transitions() {
     })
     .await;
     next_state(&mut states, |s| {
-        matches!(s, ConnectionState::Connecting { attempt: 1 })
+        matches!(s, ConnectionState::Connecting { attempt: 1, .. })
     })
     .await;
     next_state(&mut states, ConnectionState::is_connected).await;
@@ -530,7 +530,8 @@ async fn invalid_packet_is_a_parse_error() {
             closed,
             ConnectionState::Closed {
                 reason: DisconnectReason::ParseError,
-                error: Some(_)
+                error: Some(_),
+                ..
             }
         ),
         "{closed:?}"
@@ -569,7 +570,8 @@ async fn reconnect_attempts_are_bounded() {
             closed,
             ConnectionState::Closed {
                 reason: DisconnectReason::ReconnectFailed,
-                error: Some(_)
+                error: Some(_),
+                ..
             }
         ),
         "{closed:?}"
@@ -1106,7 +1108,8 @@ async fn bad_auth_on_reconnect_is_final() {
             closed,
             ConnectionState::Closed {
                 reason: DisconnectReason::ConnectRejected,
-                error: Some(Error::InvalidAuth(_))
+                error: Some(Error::InvalidAuth(_)),
+                ..
             }
         ),
         "{closed:?}"
@@ -1300,14 +1303,21 @@ async fn cookies_reach_polling_and_the_websocket() {
         (TransportType::Polling, "polling"),
         (TransportType::WebsocketUpgrade, "websocket"),
     ] {
-        let client = connect(ClientBuilder::new(cookie_server()).transport_type(transport)).await;
+        // the caller's own cookie and the jar's (the sticky one) both go out
+        let client = connect(
+            ClientBuilder::new(cookie_server())
+                .header("Cookie", "user=1")
+                .transport_type(transport),
+        )
+        .await;
         client.emit_with_ack("echo", 1, WAIT).await.unwrap();
         let sid = client.link_info().engine_sid.unwrap();
         let seen = cookies_seen(&sid).await;
         let cookie = format!("io={sid}");
         assert!(
-            seen.iter()
-                .any(|l| l.starts_with(&format!("{kind} ")) && l.contains(&cookie)),
+            seen.iter().any(|l| l.starts_with(&format!("{kind} "))
+                && l.contains(&cookie)
+                && l.contains("user=1")),
             "{kind}: {seen:?}"
         );
         client.disconnect().await.unwrap();
@@ -1342,4 +1352,45 @@ async fn without_the_ca_tls_fails() {
         .connect()
         .await;
     assert!(matches!(result, Err(Error::Engine(_))), "{result:?}");
+}
+
+/// IPv6: a `[::1]` server through a proxy (the `CONNECT` line keeps the brackets), and a proxy
+/// on `[::1]` (the connect address drops them).
+#[tokio::test]
+async fn ipv6_targets_and_proxies() {
+    let port = host_port(&server()).rsplit(':').next().unwrap().to_owned();
+    let v6 = format!("http://[::1]:{port}");
+    for proxy in [
+        HttpProxy::start().await,
+        HttpProxy::start_on("[::1]:0").await,
+    ] {
+        let client = connect(
+            ClientBuilder::new(v6.clone())
+                .proxy(proxy.url())
+                .transport_type(TransportType::Websocket),
+        )
+        .await;
+        client.emit_with_ack("echo", 1, WAIT).await.unwrap();
+        assert!(
+            proxy.log().contains(&format!("CONNECT [::1]:{port}")),
+            "{:?}",
+            proxy.log()
+        );
+        client.disconnect().await.unwrap();
+    }
+}
+
+/// `no_proxy()` wins over the environment for both transports (the environment is not touched
+/// here: an unreachable explicit proxy would fail, `no_proxy` after it connects directly).
+#[tokio::test]
+async fn no_proxy_connects_directly() {
+    let client = connect(
+        ClientBuilder::new(server())
+            .proxy("http://127.0.0.1:9")
+            .no_proxy()
+            .transport_type(TransportType::WebsocketUpgrade),
+    )
+    .await;
+    client.emit_with_ack("echo", 1, WAIT).await.unwrap();
+    client.disconnect().await.unwrap();
 }

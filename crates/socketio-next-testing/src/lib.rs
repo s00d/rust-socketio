@@ -284,7 +284,12 @@ pub struct HttpProxy {
 impl HttpProxy {
     /// Starts the proxy on a free local port.
     pub async fn start() -> HttpProxy {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        HttpProxy::start_on("127.0.0.1:0").await
+    }
+
+    /// Starts the proxy on `addr` (`[::1]:0` for IPv6).
+    pub async fn start_on(addr: &str) -> HttpProxy {
+        let listener = TcpListener::bind(addr).await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let task_log = Arc::clone(&log);
@@ -296,7 +301,7 @@ impl HttpProxy {
         HttpProxy { addr, log }
     }
 
-    /// `http://127.0.0.1:<port>`.
+    /// `http://<addr>` (`[::1]:port` for IPv6).
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
     }

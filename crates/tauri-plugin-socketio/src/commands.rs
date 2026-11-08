@@ -50,11 +50,11 @@ pub(crate) async fn connect<R: Runtime>(
     channel: Channel<Message>,
 ) -> Result<Subscribed> {
     let options = ConnectOptions::parse(options)?;
-    let url = options.url.clone();
+    let (url, path) = (options.url.clone(), options.path.clone());
     let (builder, dynamic) = options.into_builder()?;
     let sub = sub_args(&webview, events, channel);
     let (subscription, state) = io
-        .connect_from_webview(id, &url, builder, dynamic, sub)
+        .connect_from_webview(id, &url, path.as_deref(), builder, dynamic, sub)
         .await?;
     Ok(Subscribed {
         subscription,
@@ -156,6 +156,7 @@ pub(crate) fn set_headers(
     id: String,
     headers: BTreeMap<String, String>,
 ) -> Result<()> {
+    crate::models::check_headers(&headers)?;
     io.configure(&id, |d| d.headers = headers)
 }
 
@@ -169,10 +170,12 @@ pub(crate) fn set_query(
     io.configure(&id, |d| d.query = query)
 }
 
-/// Connects a closed client again (rejected, reconnect attempts used up, server disconnect).
+/// Connects a closed client the webview connected again (rejected, reconnect attempts used
+/// up, server disconnect); the target is the one checked at connect (query and headers do
+/// not change it). Rust's clients: `NotConfigurable`.
 #[tauri::command]
 pub(crate) async fn reconnect(io: State<'_, SocketIo>, id: String) -> Result<ConnState> {
-    let client = io.full(&id)?;
+    let client = io.webview_client(&id)?;
     client.reconnect().await?;
     Ok(ConnState::from(&client.state()))
 }

@@ -101,11 +101,13 @@ fn engine_kind(err: &engineio::Error, data: &mut Option<Value>) -> &'static str 
         E::InvalidUrl(_) => "InvalidUrl",
         E::InvalidUrlScheme(_) => "InvalidUrlScheme",
         E::Http(_) => "Http",
-        E::HttpStatus { status, message } => {
+        E::HttpStatus {
+            status, message, ..
+        } => {
             *data = Some(json!({ "status": status, "message": message }));
             "HttpStatus"
         }
-        E::WebsocketClosed { code, reason } => {
+        E::WebsocketClosed { code, reason, .. } => {
             *data = Some(json!({ "code": code, "reason": reason }));
             "WebsocketClosed"
         }
@@ -156,43 +158,15 @@ impl Serialize for Error {
 mod tests {
     use super::*;
 
+    /// Plugin errors here; socketio-next's (`ConnectRejected`, `HttpStatus`,
+    /// `WebsocketClosed`) come from real servers in the IPC tests.
     #[test]
     fn kinds_and_data() {
-        let rejected = Error::SocketIo(socketio_next::Error::ConnectRejected {
-            message: "not authorized".into(),
-            data: Some(json!({ "reason": "test" })),
-        });
-        assert_eq!(
-            serde_json::to_value(&rejected).unwrap(),
-            json!({
-                "kind": "ConnectRejected",
-                "message": "the server rejected the namespace: not authorized",
-                "data": { "reason": "test" }
-            })
-        );
-        let status = Error::SocketIo(
-            engineio::Error::HttpStatus {
-                status: 403,
-                message: Some("denied".into()),
-            }
-            .into(),
-        );
-        let v = serde_json::to_value(&status).unwrap();
-        assert_eq!(v["kind"], "HttpStatus");
-        assert_eq!(v["data"]["status"], 403);
-        assert_eq!(v["data"]["message"], "denied");
-        let closed = Error::SocketIo(
-            engineio::Error::WebsocketClosed {
-                code: 4001,
-                reason: "kicked".into(),
-            }
-            .into(),
-        );
-        let v = serde_json::to_value(&closed).unwrap();
-        assert_eq!(v["kind"], "WebsocketClosed");
-        assert_eq!(v["data"], json!({ "code": 4001, "reason": "kicked" }));
         let denied = serde_json::to_value(Error::AccessDenied("core".into())).unwrap();
         assert_eq!(denied["kind"], "AccessDenied");
         assert!(denied.get("data").is_none());
+        let not =
+            serde_json::to_value(Error::SocketIo(socketio_next::Error::NotConnected)).unwrap();
+        assert_eq!(not["kind"], "NotConnected");
     }
 }

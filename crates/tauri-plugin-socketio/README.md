@@ -81,8 +81,8 @@ Options (milliseconds for durations): `url`, `namespace`, `path`, `query`, `head
 `bufferWhileDisconnected`, `ca` (PEM certificates of a private CA; checks cannot be turned
 off), plus `events` (the forwarding filter). Auth, headers and query are read again before every
 connect attempt, so `setAuth` / `setHeaders` / `setQuery` take effect on the next reconnect;
-they work on clients the webview connected (`NotConfigurable` for Rust's, `AccessDenied` for
-read-only ones).
+they and `reconnect` work on clients a webview connected (`NotConfigurable` for Rust's,
+`AccessDenied` for read-only ones).
 
 **Timing.** `connect` attaches the subscription before connecting, so the events the server
 sends right after the connect are not lost. When `connect` / `attach` resolve, the socket
@@ -200,8 +200,16 @@ answerable from JS (`ack` is refused); answer them in Rust.
   )
   ```
 
+  What is enforced: the scheme, the host, the port, and the **engine.io path** (the `path`
+  option, default `/socket.io/`) under the prefix's path on a `/` boundary. The URL's own
+  path is the namespace and is not part of the check, nor is the `namespace` option. Query and
+  headers changed later (`setQuery`, `setHeaders`) and `reconnect` cannot move the target.
   Without `allow_url_prefix` every URL is allowed (`init()`). Rust's `connect` / `insert` are
-  never restricted. Grant `allow-read` instead of `default` to windows that only observe.
+  never restricted.
+- **Headers from the webview are limited.** `Host`, `Connection`, `Upgrade`,
+  `Content-Length`, `Transfer-Encoding`, `Cookie` (cookies come from the jar),
+  `Sec-WebSocket-*` and `Proxy-*` are refused with `InvalidOptions` naming the header, in the
+  connect options and in `setHeaders`. Rust's clients are not limited. Grant `allow-read` instead of `default` to windows that only observe.
 - **Webviews are isolated.** `unsubscribe` and `ack` act only on the calling webview's
   subscriptions and on acks offered to it (`UnknownAck` otherwise). A webview has at most
   `MAX_SUBSCRIPTIONS_PER_WEBVIEW` (64) subscriptions and, per client, at most

@@ -14,7 +14,7 @@ async fn main() -> socketio_next::Result<()> {
         // every transition, in order (the watch below only sees the latest)
         .on_state_change(|state: ConnectionState, _: Client| async move {
             match state {
-                ConnectionState::Connected { sid, recovered } => {
+                ConnectionState::Connected { sid, recovered, .. } => {
                     println!("connected {sid} recovered={recovered}")
                 }
                 ConnectionState::Disconnected { reason, .. } => println!("lost: {reason}"),
@@ -22,10 +22,13 @@ async fn main() -> socketio_next::Result<()> {
                     attempt,
                     delay,
                     error,
+                    ..
                 } => {
                     println!("attempt {attempt} in {delay:?} (last error: {error:?})")
                 }
-                ConnectionState::Closed { reason, error } => println!("closed: {reason} {error:?}"),
+                ConnectionState::Closed { reason, error, .. } => {
+                    println!("closed: {reason} {error:?}")
+                }
                 other => println!("{other:?}"),
             }
         })

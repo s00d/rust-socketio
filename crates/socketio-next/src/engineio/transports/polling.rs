@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
 use http::HeaderMap;
-use reqwest::{Client, RequestBuilder};
+use reqwest::RequestBuilder;
 use std::fmt::Debug;
 use std::time::Duration;
 use std::{pin::Pin, sync::Arc};
@@ -21,7 +21,7 @@ const MAX_BODY: usize = 64 << 20;
 /// methods.
 #[derive(Clone)]
 pub struct PollingTransport {
-    client: Client,
+    http: Http,
     headers: HeaderMap,
     base_url: Arc<RwLock<Url>>,
     generator: StreamGenerator<Bytes>,
@@ -33,7 +33,7 @@ impl PollingTransport {
         tls_config: Option<TlsConfig>,
         opening_headers: Option<HeaderMap>,
     ) -> Result<Self> {
-        let http = Http::new(tls_config.as_ref(), None)?;
+        let http = Http::new(tls_config.as_ref(), crate::engineio::http::ProxyMode::Env)?;
         Self::with_client(base_url, &http, opening_headers.unwrap_or_default(), None)
     }
 
@@ -47,16 +47,15 @@ impl PollingTransport {
         poll_timeout: Option<Duration>,
     ) -> Result<Self> {
         tls::check_scheme(&base_url)?;
-        let client = http.client.clone();
         let mut url = base_url;
         url.query_pairs_mut().append_pair("transport", "polling");
         let get = Get {
-            client: client.clone(),
+            http: http.clone(),
             headers: headers.clone(),
             timeout: poll_timeout,
         };
         Ok(PollingTransport {
-            client,
+            http: http.clone(),
             headers,
             base_url: Arc::new(RwLock::new(url.clone())),
             generator: StreamGenerator::new(Self::stream(url, get)),
@@ -92,10 +91,8 @@ impl PollingTransport {
     }
 
     fn post(&self, url: Url, body: Bytes) -> RequestBuilder {
-        self.client
-            .post(url)
-            .headers(self.headers.clone())
-            .body(body)
+        let headers = self.http.with_cookies(&self.headers, &url);
+        self.http.client.post(url).headers(headers).body(body)
     }
 
     pub(crate) async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
@@ -138,17 +135,21 @@ impl PollingTransport {
 /// The long-poll GET: headers of this attempt, bounded by the heartbeat.
 #[derive(Clone)]
 struct Get {
-    client: Client,
+    http: Http,
     headers: HeaderMap,
     timeout: Option<Duration>,
 }
 
 impl Get {
+    /// The caller's `Cookie` and the jar's are merged here (reqwest would add the jar only
+    /// when the request has no `Cookie` header of its own).
     fn request(&self, url: &Url) -> RequestBuilder {
+        let headers = self.http.with_cookies(&self.headers, url);
         let request = self
+            .http
             .client
             .get(crate::engineio::util::with_timestamp(url.clone()))
-            .headers(self.headers.clone());
+            .headers(headers);
         match self.timeout {
             Some(timeout) => request.timeout(timeout),
             None => request,
@@ -233,7 +234,7 @@ mod test {
     /// Only the long-poll GET is bounded by the heartbeat; a POST (an upload) is not.
     #[test]
     fn only_the_long_poll_has_a_total_timeout() {
-        let http = Http::new(None, None).unwrap();
+        let http = Http::new(None, crate::engineio::http::ProxyMode::Env).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-token", "t".parse().unwrap());
         let url = Url::parse("http://h/engine.io/").unwrap();
@@ -242,7 +243,7 @@ mod test {
             PollingTransport::with_client(url.clone(), &http, headers.clone(), Some(timeout))
                 .unwrap();
         let get = Get {
-            client: http.client.clone(),
+            http: http.clone(),
             headers,
             timeout: Some(timeout),
         }
@@ -257,6 +258,42 @@ mod test {
             .unwrap();
         assert_eq!(post.timeout(), None);
         assert_eq!(post.headers()["x-token"], "t");
+    }
+
+    /// A server that answers every request with `response` (raw HTTP).
+    async fn fixed_server(response: &'static str) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = tcp.read(&mut buf).await;
+                let _ = tcp.write_all(response.as_bytes()).await;
+            }
+        });
+        Url::parse(&format!("http://{addr}/engine.io/?EIO=4")).unwrap()
+    }
+
+    /// engine.io never redirects; a 3xx is an error that shows neither the target nor the
+    /// query (following it would send the tokens elsewhere).
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let url = fixed_server(
+            "HTTP/1.1 302 Found\r\nLocation: http://evil.example/?token=SECRET\r\nContent-Length: 46\r\nConnection: close\r\n\r\nRedirecting to http://evil.example/?token=SECRET",
+        )
+        .await;
+        let mut transport = PollingTransport::new(url, None, None).unwrap();
+        match transport.next().await {
+            Some(Err(Error::HttpStatus {
+                status: 302,
+                message,
+            })) => {
+                let text = format!("{message:?}");
+                assert!(!text.contains("SECRET") && !text.contains("evil"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]

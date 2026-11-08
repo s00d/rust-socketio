@@ -27,7 +27,9 @@ async fn main() -> socketio_next::Result<()> {
         .connect()
         .await
     {
-        Err(Error::ConnectRejected { message, data }) => println!("rejected: {message} {data:?}"),
+        Err(Error::ConnectRejected { message, data, .. }) => {
+            println!("rejected: {message} {data:?}")
+        }
         other => println!("unexpected: {other:?}"),
     }
     Ok(())

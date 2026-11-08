@@ -44,6 +44,9 @@ pub(crate) struct Inner {
     url: url::Url,
     /// One `reconnect()` at a time.
     restart: tokio::sync::Mutex<()>,
+    /// Counts `disconnect()` calls. Held while an actor is started or a disconnect takes the
+    /// running one, so a disconnect wins over a concurrent `reconnect()`.
+    lifecycle: Mutex<u64>,
     handlers: Mutex<Handlers>,
     shared: Arc<Shared>,
     nsp: Arc<str>,
@@ -103,6 +106,7 @@ pub(crate) async fn connect(config: Config, handlers: Handlers) -> Result<Client
         config,
         url,
         restart: tokio::sync::Mutex::new(()),
+        lifecycle: Mutex::new(0),
         actor: Mutex::default(),
         dispatcher: Mutex::default(),
     });
@@ -278,6 +282,7 @@ impl Client {
     /// while the client is not closed. Must not be called from one of its handlers.
     pub async fn reconnect(&self) -> Result<()> {
         let _guard = self.inner.restart.lock().await;
+        let seen = *self.lifecycle();
         if !self.state().is_closed() {
             return Ok(());
         }
@@ -307,10 +312,27 @@ impl Client {
                 );
             }
         }
-        match start(&self.inner).await {
+        #[cfg(test)]
+        tests::reconnect_pause().await;
+        let ready = {
+            let lifecycle = self.lifecycle();
+            // a disconnect() since this call began wins: the client stays closed
+            if *lifecycle != seen {
+                return Err(Error::Closed);
+            }
+            start(&self.inner)
+        };
+        match ready.await {
             Ok(result) => result,
             Err(_) => Err(Error::Closed),
         }
+    }
+
+    fn lifecycle(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.inner
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn handlers(&self) -> std::sync::MutexGuard<'_, Handlers> {
@@ -479,26 +501,37 @@ impl Client {
     /// from inside a handler (it then does not wait for the handlers; the event task ends after
     /// the running handler).
     pub async fn disconnect(&self) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        if self.cmd().send(Command::Disconnect { done: tx }).is_ok() {
-            let _ = rx.await;
-        }
-        let actor = self
-            .inner
-            .actor
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(actor) = actor {
-            let _ = actor.await;
-        }
-        if !in_handler() {
-            let dispatcher = self
+        // The actor this call stops, its command queue and event task, taken together: a
+        // concurrent `reconnect()` either started its actor before (it is stopped here) or
+        // sees the count change and does not start one.
+        let (cmd, actor, dispatcher) = {
+            let mut lifecycle = self.lifecycle();
+            *lifecycle += 1;
+            let actor = self
                 .inner
-                .dispatcher
+                .actor
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
+            let dispatcher = if in_handler() {
+                None
+            } else {
+                self.inner
+                    .dispatcher
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+            };
+            (self.cmd(), actor, dispatcher)
+        };
+        let (tx, rx) = oneshot::channel();
+        if cmd.send(Command::Disconnect { done: tx }).is_ok() {
+            let _ = rx.await;
+        }
+        if let Some(actor) = actor {
+            let _ = actor.await;
+        }
+        {
             if let Some(mut dispatcher) = dispatcher {
                 if tokio::time::timeout(HANDLER_DRAIN, &mut dispatcher)
                     .await
@@ -527,6 +560,83 @@ impl Drop for Inner {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+    use tokio::sync::Notify;
+
+    /// (reached, go): `reconnect()` waits at the point between its awaits and the start.
+    type Pause = (Arc<Notify>, Arc<Notify>);
+    static PAUSE: OnceLock<Mutex<Option<Pause>>> = OnceLock::new();
+
+    pub(super) async fn reconnect_pause() {
+        let pause = PAUSE.get_or_init(Mutex::default).lock().unwrap().clone();
+        if let Some((reached, go)) = pause {
+            reached.notify_one();
+            go.notified().await;
+        }
+    }
+
+    async fn closed_client(url: String) -> Client {
+        let client = crate::ClientBuilder::new(url).connect().await.unwrap();
+        client.emit("server_disconnect", ()).unwrap();
+        client.wait_for(ConnectionState::is_closed).await;
+        client
+    }
+
+    /// Case A: `disconnect()` while `reconnect()` waits for the old tasks: the client must
+    /// stay closed (it was revived before).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_during_reconnect_wins() {
+        let client = closed_client(socketio_next_testing::socket_io_server()).await;
+        let (reached, go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        *PAUSE.get_or_init(Mutex::default).lock().unwrap() =
+            Some((Arc::clone(&reached), Arc::clone(&go)));
+        let reconnecting = {
+            let client = client.clone();
+            tokio::spawn(async move { client.reconnect().await })
+        };
+        reached.notified().await;
+        *PAUSE.get().unwrap().lock().unwrap() = None;
+        client.disconnect().await.unwrap();
+        go.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), reconnecting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(Error::Closed)), "{result:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(client.state().is_closed() && !client.connected());
+    }
+
+    /// Case B: `disconnect()` while the restarted connection task is connecting (a namespace
+    /// that answers CONNECT after 200 ms) returns promptly and leaves the client closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_during_a_reconnect_attempt_returns() {
+        let client = closed_client(format!(
+            "{}/slow",
+            socketio_next_testing::socket_io_server()
+        ))
+        .await;
+        let reconnecting = {
+            let client = client.clone();
+            tokio::spawn(async move { client.reconnect().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+            .await
+            .expect("disconnect did not hang")
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), reconnecting)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            client.state().is_closed() && !client.connected(),
+            "{:?}",
+            client.state()
+        );
+    }
+
     #[test]
     fn percent_decode_paths() {
         assert_eq!(super::percent_decode("/%C3%A4dmin"), "/ädmin");

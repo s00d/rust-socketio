@@ -103,7 +103,9 @@ pub(crate) fn invalid(err: &serde_json::Error) -> crate::Error {
 impl ConnectOptions {
     /// From the webview's JSON; a bad field is [`Error::InvalidOptions`](crate::Error).
     pub(crate) fn parse(value: Value) -> crate::Result<Self> {
-        serde_json::from_value(value).map_err(|e| invalid(&e))
+        let options: Self = serde_json::from_value(value).map_err(|e| invalid(&e))?;
+        check_headers(&options.headers)?;
+        Ok(options)
     }
 
     /// The builder, plus the values the webview may change later (`setAuth`, `setHeaders`,
@@ -180,6 +182,33 @@ impl ConnectOptions {
         }
         Ok((b, dynamic))
     }
+}
+
+/// Headers a webview may not set: they belong to the HTTP / websocket machinery or to the
+/// proxy, and cookies come from the jar. Rust's own clients are not limited.
+const FORBIDDEN_HEADERS: &[&str] = &[
+    "host",
+    "connection",
+    "upgrade",
+    "content-length",
+    "transfer-encoding",
+    "cookie",
+];
+
+/// `InvalidOptions` naming the first forbidden header (never its value).
+pub(crate) fn check_headers(headers: &BTreeMap<String, String>) -> crate::Result<()> {
+    for name in headers.keys() {
+        let lower = name.to_ascii_lowercase();
+        if FORBIDDEN_HEADERS.contains(&lower.as_str())
+            || lower.starts_with("sec-websocket-")
+            || lower.starts_with("proxy-")
+        {
+            return Err(crate::Error::InvalidOptions(format!(
+                "the header `{name}` may not be set from the webview"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Connect values a webview may replace on a client it connected; used from the next attempt.
@@ -294,12 +323,12 @@ impl From<&ConnectionState> for State {
     fn from(state: &ConnectionState) -> Self {
         let err = |e: &Option<socketio_next::Error>| e.as_ref().map(ErrorPayload::from_core);
         match state {
-            ConnectionState::Connecting { attempt } => State::Connecting { attempt: *attempt },
-            ConnectionState::Connected { sid, recovered } => State::Connected {
+            ConnectionState::Connecting { attempt, .. } => State::Connecting { attempt: *attempt },
+            ConnectionState::Connected { sid, recovered, .. } => State::Connected {
                 sid: sid.clone(),
                 recovered: *recovered,
             },
-            ConnectionState::Disconnected { reason, error } => State::Disconnected {
+            ConnectionState::Disconnected { reason, error, .. } => State::Disconnected {
                 reason: reason.as_str().to_owned(),
                 error: err(error),
             },
@@ -307,12 +336,13 @@ impl From<&ConnectionState> for State {
                 attempt,
                 delay,
                 error,
+                ..
             } => State::Reconnecting {
                 attempt: *attempt,
                 delay: millis(*delay),
                 error: err(error),
             },
-            ConnectionState::Closed { reason, error } => State::Closed {
+            ConnectionState::Closed { reason, error, .. } => State::Closed {
                 reason: reason.as_str().to_owned(),
                 error: err(error),
             },
@@ -480,23 +510,27 @@ mod tests {
         );
     }
 
+    /// The JS shape of states (the conversion from socketio-next's states is exercised by
+    /// the IPC tests: reasons, delays, errors of real transitions).
     #[test]
     fn states_serialize_with_js_reasons() {
-        let s: State = (&ConnectionState::Disconnected {
-            reason: socketio_next::DisconnectReason::TransportClose,
+        let s = State::Disconnected {
+            reason: "transport close".into(),
             error: None,
-        })
-            .into();
+        };
         assert_eq!(
             serde_json::to_value(s).unwrap(),
             json!({ "status": "disconnected", "reason": "transport close" })
         );
-        let s: State = (&ConnectionState::Reconnecting {
+        let s = State::Reconnecting {
             attempt: 2,
-            delay: Duration::from_millis(1500),
-            error: Some(socketio_next::Error::NotConnected),
-        })
-            .into();
+            delay: 1500,
+            error: Some(ErrorPayload {
+                kind: "NotConnected",
+                message: "x".into(),
+                data: None,
+            }),
+        };
         let v = serde_json::to_value(s).unwrap();
         assert_eq!(v["delay"], 1500);
         assert_eq!(v["error"]["kind"], "NotConnected");
@@ -535,6 +569,30 @@ mod tests {
         for secret in ["token=q", "\"a\"", "qv", "hv"] {
             assert!(!dbg.contains(secret), "{dbg}");
         }
+    }
+
+    #[test]
+    fn webview_headers_are_limited() {
+        for name in [
+            "Host",
+            "cookie",
+            "Sec-WebSocket-Key",
+            "Proxy-Authorization",
+            "Upgrade",
+        ] {
+            let err =
+                ConnectOptions::parse(json!({ "url": "http://x", "headers": { name: "s3cr3t" } }))
+                    .err()
+                    .unwrap_or_else(|| panic!("{name} accepted"));
+            let text = err.to_string();
+            assert!(text.contains(name) && !text.contains("s3cr3t"), "{text}");
+        }
+        assert!(
+            ConnectOptions::parse(
+                json!({ "url": "http://x", "headers": { "authorization": "Bearer x" } })
+            )
+            .is_ok()
+        );
     }
 
     #[test]

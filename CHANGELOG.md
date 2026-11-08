@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Breaking (pre-release): `ConnectionState::Disconnected` has an `error` field and
+  `engineio::Error::HttpStatus` a `message` field; the struct-like variants of
+  `ConnectionState`, `Error::ConnectRejected`, `engineio::Error::HttpStatus` and
+  `WebsocketClosed` are `#[non_exhaustive]` (match them with `..`), so fields can be added
+  later without a break. Code ported from rust_socketio matches states with `..` anyway.
+- Environment proxies (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY`) now also apply to
+  the websocket, `ws://` included, with the same matcher reqwest uses for polling; a proxy that
+  refuses `CONNECT` to non-443 ports refuses the websocket (with `TransportType::Any` the client
+  stays on polling). `ClientBuilder::no_proxy()` turns proxies off for both transports.
+  `https://` and SOCKS proxies are a `ProxyFailed` error for the websocket.
+- Redirects are not followed (a 3xx is an `HttpStatus` error without the target).
+- The wall-clock check of the heartbeat probes the link and waits pingTimeout instead of
+  closing at once, so an NTP step on a live link does not disconnect.
+- `HttpStatus.message` is at most 200 characters and drops words that look like URLs, paths,
+  queries or credentials, for JSON messages too.
 - One reqwest client per socket.io client, shared by every transport and reconnect (it was
   two per connect attempt); only long-poll GETs are bounded by pingInterval + pingTimeout, so
   slow POST uploads are no longer cut.
@@ -37,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wake-up instead of after the remaining monotonic time.
 - The websocket reader could miss a wakeup when another task held the receiver (a lock
   future polled once and dropped); the receiver is now polled under a short std lock.
+- `reconnect()` racing `disconnect()`: a disconnect always wins (no revived client, no hang).
+- The caller's `Cookie` header and the cookie jar are merged (`user; jar`) on polling and on
+  the websocket handshake (`cookies` feature).
+- IPv6 servers and proxies through the `CONNECT` tunnel (`[::1]`).
 - `connect().await` could return before the client was connected: `connected()` false,
   `state()` `Connecting`, `id()` None and `emit()` failing with `NotConnected` on a
   multi-thread runtime or with the blocking client. The connected state is now set before

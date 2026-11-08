@@ -82,7 +82,10 @@ impl ClientBuilder {
 
     fn http_settings(&mut self) -> Result<Http> {
         if self.http.is_none() {
-            self.http = Some(Http::new(self.tls_config.as_ref(), None)?);
+            self.http = Some(Http::new(
+                self.tls_config.as_ref(),
+                crate::engineio::http::ProxyMode::Env,
+            )?);
         }
         Ok(self.http.clone().expect("set above"))
     }
@@ -265,17 +268,12 @@ impl ClientBuilder {
         let timeout = self.timeout;
         let connect = async move {
             let http = self.http_settings()?;
-            #[allow(unused_mut)]
-            let mut headers = self.headers.clone().unwrap_or_default();
-            #[cfg(feature = "cookies")]
-            if let Some(cookies) = http.cookies(&self.url) {
-                headers.insert(http::header::COOKIE, cookies);
-            }
+            let headers = http.with_cookies(&self.headers.clone().unwrap_or_default(), &self.url);
             let mut transport = WebsocketTransport::connect(
                 self.url.clone(),
                 self.tls_config.clone(),
                 Some(headers),
-                http.ws_proxy(&self.url),
+                http.ws_route(&self.url)?,
             )
             .await?;
             if self.handshake.is_some() {

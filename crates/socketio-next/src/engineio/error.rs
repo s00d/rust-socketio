@@ -25,6 +25,7 @@ pub enum Error {
     /// The server answered a polling request with a non-200 status (400 "Session ID unknown"
     /// after a server restart, 403 from a proxy, ...).
     #[error("server answered HTTP {status}{}", message.as_ref().map(|m| format!(": {m}")).unwrap_or_default())]
+    #[non_exhaustive]
     HttpStatus {
         /// The HTTP status code.
         status: u16,
@@ -37,6 +38,7 @@ pub enum Error {
     ProxyFailed(String),
     /// The server closed the websocket with a close frame (code and reason as sent).
     #[error("the server closed the websocket (code {code}{})", if reason.is_empty() { String::new() } else { format!(": {reason}") })]
+    #[non_exhaustive]
     WebsocketClosed {
         /// The close code (1000 normal, 1001 going away, 4xxx application codes, ...).
         code: u16,
@@ -100,21 +102,36 @@ impl From<std::str::Utf8Error> for Error {
 }
 
 /// The message of a non-200 polling body (read up to 4 KiB): engine.io's JSON `message`, else
-/// the text, shortened and without URLs (a proxy page may echo the request).
+/// the text. Either way at most 200 characters, and words that may carry a secret are replaced
+/// (a proxy or server page may echo the request line with its query).
 pub(crate) fn body_message(body: &[u8]) -> Option<String> {
-    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-        if let Some(message) = json.get("message").and_then(|m| m.as_str()) {
-            return Some(message.to_owned());
-        }
-    }
-    let text = String::from_utf8_lossy(body);
-    let text: String = text
+    let raw = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| json.get("message")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    let text = raw
         .split_whitespace()
-        .map(|w| if w.contains("://") { "<url>" } else { w })
+        .map(scrub)
         .collect::<Vec<_>>()
         .join(" ");
     let text: String = text.chars().take(200).collect();
     (!text.is_empty()).then_some(text)
+}
+
+/// `<url>` for URLs, `<redacted>` for paths, queries and anything naming a credential.
+fn scrub(word: &str) -> &str {
+    let lower = word.to_ascii_lowercase();
+    let query_like = (lower.contains('?') || lower.contains('&')) && lower.contains('=');
+    let credential = ["token", "key", "secret", "password", "auth"]
+        .iter()
+        .any(|w| lower.contains(w));
+    if word.contains("://") {
+        "<url>"
+    } else if word.starts_with('/') || word.starts_with('?') || query_like || credential {
+        "<redacted>"
+    } else {
+        word
+    }
 }
 
 /// Result alias of this crate.
@@ -134,6 +151,18 @@ mod tests {
             body_message(b"<h1>Forbidden</h1> see https://proxy/x?token=s").as_deref(),
             Some("<h1>Forbidden</h1> see <url>")
         );
+        // an echoed request line, in a text body and in the JSON message
+        for body in [
+            &b"Cannot GET /socket.io/?EIO=4&token=SECRET"[..],
+            br#"{"code":3,"message":"Bad request ?sid=x&token=SECRET"}"#,
+            b"denied: apiKey=SECRET",
+            b"x a&b=SECRET",
+        ] {
+            let message = body_message(body).unwrap();
+            assert!(!message.contains("SECRET"), "{message}");
+        }
+        let long_json = format!(r#"{{"message":"{}"}}"#, "a".repeat(500));
+        assert_eq!(body_message(long_json.as_bytes()).unwrap().len(), 200);
         assert_eq!(body_message(b"  "), None);
         let long = body_message(&[b'a'; 500]).unwrap();
         assert_eq!(long.len(), 200);

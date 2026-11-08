@@ -3128,6 +3128,7 @@ dependencies = [
  "criterion",
  "futures-util",
  "http",
+ "hyper-util",
  "native-tls",
  "reqwest",
  "rustls",
@@ -3439,6 +3440,7 @@ dependencies = [
 name = "tauri-plugin-socketio"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "serde",
  "serde_json",
  "socketio-next",
@@ -3447,6 +3449,7 @@ dependencies = [
  "tauri-plugin",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite",
  "toml 1.2.1+spec-1.1.0",
  "url",
 ]

@@ -122,24 +122,94 @@ mod test {
     /// As the documentation of the engine.io client states, the object needs to maintain it's internal
     /// state when cloned and the cloned object should reflect the same state throughout the lifetime
     /// of both objects (initial and cloned).
-    /// After a system sleep the monotonic timer still has most of pingInterval + pingTimeout
-    /// (45 s on this server) to go; the wall clock says the deadline passed long ago.
+    /// Reads until `deadline`; `Some(err)` for an error, `None` when it stayed healthy.
+    async fn watch(
+        socket: &mut Client,
+        deadline: std::time::Duration,
+    ) -> Option<crate::engineio::Error> {
+        let end = tokio::time::Instant::now() + deadline;
+        loop {
+            match tokio::time::timeout_at(end, socket.next()).await {
+                Err(_) => return None,
+                Ok(Some(Err(err))) => return Some(err),
+                Ok(Some(Ok(_))) => continue,
+                Ok(None) => return Some(crate::engineio::Error::NotConnected),
+            }
+        }
+    }
+
+    /// A system sleep on a dead link: the monotonic timer has most of pingInterval +
+    /// pingTimeout (45 s here) to go, the wall clock says the deadline passed. The probe gets
+    /// no answer and the link is declared dead after pingTimeout (20 s), not 45 s.
     #[tokio::test]
-    async fn a_wall_clock_gap_is_a_ping_timeout() -> Result<()> {
+    async fn a_sleep_on_a_dead_link_is_a_ping_timeout_after_ping_timeout() -> Result<()> {
+        let tcp = socketio_next_testing::Proxy::start(&socketio_next_testing::host_port(
+            crate::engineio::test::engine_io_server()?.as_str(),
+        ))
+        .await;
+        let mut socket = builder(Url::parse(&tcp.url())?).build_polling().await?;
+        socket.connect().await?;
+        // the link is dead: open connections stall, new ones are refused
+        tcp.refuse(true);
+        tcp.freeze();
+        let started = std::time::Instant::now();
+        socket
+            .socket
+            .shift_wall_clock(std::time::Duration::from_secs(3600), true);
+        let err = watch(&mut socket, std::time::Duration::from_secs(30)).await;
+        assert!(
+            matches!(err, Some(crate::engineio::Error::PingTimeout)),
+            "{err:?}"
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= std::time::Duration::from_secs(19),
+            "probed first: {took:?}"
+        );
+        assert!(took < std::time::Duration::from_secs(25), "{took:?}");
+        tcp.cut();
+        Ok(())
+    }
+
+    /// A forward clock step (NTP on a gateway without RTC) on a live link: the probe is
+    /// answered (a noop POST, or a websocket ping), nothing closes.
+    #[tokio::test]
+    async fn a_forward_clock_step_on_a_live_link_keeps_it() -> Result<()> {
+        let url = crate::engineio::test::engine_io_server()?;
+        for websocket in [false, true] {
+            let mut socket = if websocket {
+                builder(url.clone()).build_websocket().await?
+            } else {
+                builder(url.clone()).build_polling().await?
+            };
+            socket.connect().await?;
+            socket
+                .socket
+                .shift_wall_clock(std::time::Duration::from_secs(3600), true);
+            let err = watch(&mut socket, std::time::Duration::from_secs(3)).await;
+            assert!(err.is_none(), "websocket={websocket}: {err:?}");
+            assert!(socket.is_connected());
+            socket.disconnect().await?;
+        }
+        Ok(())
+    }
+
+    /// A backward step changes nothing.
+    #[tokio::test]
+    async fn a_backward_clock_step_has_no_effect() -> Result<()> {
         let url = crate::engineio::test::engine_io_server()?;
         let mut socket = builder(url).build_polling().await?;
         socket.connect().await?;
         socket
             .socket
-            .pretend_sleep(std::time::Duration::from_secs(3600));
-        let deadline = std::time::Duration::from_secs(5);
-        loop {
-            match tokio::time::timeout(deadline, socket.next()).await {
-                Ok(Some(Err(crate::engineio::Error::PingTimeout))) => return Ok(()),
-                Ok(Some(_)) => continue,
-                other => panic!("expected a ping timeout, got {other:?}"),
-            }
-        }
+            .shift_wall_clock(std::time::Duration::from_secs(3600), false);
+        assert!(
+            watch(&mut socket, std::time::Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+        socket.disconnect().await?;
+        Ok(())
     }
 
     #[tokio::test]

@@ -57,3 +57,6 @@ tauri = { version = "2", default-features = false, features = ["test"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # parses the permission files to resolve a real ACL in tests/ipc.rs
 toml = "1"
+# a websocket server that closes with a code (tests/ipc.rs)
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }

@@ -128,8 +128,11 @@ disconnect`, `ping timeout`, `transport close`, `transport error`, `parse error`
 sids, ping interval/timeout, last ping, last packet, attempts, pending acks, packets and bytes
 in and out, and `sessions` (successful connects). `Disconnected { reason, error }` carries the
 error that ended the connection, such as `WebsocketClosed { code, reason }` from a close frame.
-The heartbeat also compares the wall clock with the deadline, so a link that died while the
-machine slept is noticed on wake-up (engine.io-client does the same).
+The heartbeat also compares the wall clock with the deadline. When the wall clock says the
+deadline passed but the monotonic clock does not (the machine slept, or the clock was stepped
+forward by NTP), the client probes the link (a noop POST over polling, a websocket ping) and
+gives it pingTimeout to show life; only then is it a `PingTimeout`. A backward step has no
+effect.
 
 **Connect values per attempt.** `auth_with` and `connect_params_with` run before every connect
 and reconnect, inside the attempt's timeout (a panic fails the attempt): a refreshed token, a
@@ -138,7 +141,14 @@ signed timestamp. Their values replace the builder's ones of the same key.
 **Proxy.** Polling requests and the websocket go through the same HTTP proxy: the one given to
 `proxy(..)`, else the environment's (`HTTPS_PROXY` for `https`/`wss`, `HTTP_PROXY` for
 `http`/`ws`, `ALL_PROXY`, minus `NO_PROXY`). The websocket uses a `CONNECT` tunnel with basic
-auth from the proxy URL's user info. Only `http://` proxies are spoken.
+auth from the proxy URL's user info. Both transports take the same decision (the websocket
+uses the matcher reqwest uses for polling: `NO_PROXY` with domains, IPs, CIDR and `*`). Only
+`http://` proxies are spoken for the websocket: an `https://` or SOCKS proxy is a
+`ProxyFailed` error, never a silent direct connection. `no_proxy()` turns proxies off for
+both. Note that environment proxies apply to `ws://` too: a proxy that only allows `CONNECT`
+to port 443 then refuses the websocket, and with `TransportType::Any` the client stays on
+polling. Redirects are never followed (engine.io does not use them; a 3xx is an
+`HttpStatus` error).
 
 **One HTTP client per client.** The handshake, the polls and the POSTs of one client share one
 reqwest client (its connection pool and, with `cookies`, its jar) across reconnects. Long-poll
