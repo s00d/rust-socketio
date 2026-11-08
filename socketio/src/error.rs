@@ -1,4 +1,3 @@
-use base64::DecodeError;
 use serde_json::Error as JsonError;
 use std::io::Error as IoError;
 use std::num::ParseIntError;
@@ -10,7 +9,6 @@ use url::ParseError as UrlParseError;
 /// TODO: 0.4.X Do not expose non-trivial internal errors. Convert error to string.
 #[derive(Error, Debug)]
 #[non_exhaustive]
-#[cfg_attr(tarpaulin, ignore)]
 pub enum Error {
     // Conform to https://rust-lang.github.io/api-guidelines/naming.html#names-use-a-consistent-word-order-c-word-order
     // Negative verb-object
@@ -22,8 +20,6 @@ pub enum Error {
     InvalidPacket(),
     #[error("An error occurred while decoding the utf-8 text: {0}")]
     InvalidUtf8(#[from] Utf8Error),
-    #[error("An error occurred while encoding/decoding base64: {0}")]
-    InvalidBase64(#[from] DecodeError),
     #[error("Invalid Url during parsing")]
     InvalidUrl(#[from] UrlParseError),
     #[error("Invalid Url Scheme: {0}")]

@@ -1,8 +1,7 @@
-use super::transports::{PollingTransport, WebsocketSecureTransport, WebsocketTransport};
+use super::transports::{PollingTransport, WebsocketTransport};
 use crate::error::Result;
-use adler32::adler32;
 use bytes::Bytes;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use url::Url;
 
 pub trait Transport {
@@ -24,30 +23,19 @@ pub trait Transport {
 
     /// Full query address
     fn address(&self) -> Result<Url> {
-        let reader = format!("{:#?}", SystemTime::now());
-        let hash = adler32(reader.as_bytes()).unwrap();
-        let mut url = self.base_url()?;
-        url.query_pairs_mut().append_pair("t", &hash.to_string());
-        Ok(url)
+        Ok(crate::util::with_timestamp(self.base_url()?))
     }
 }
 
 #[derive(Debug)]
 pub enum TransportType {
     Polling(PollingTransport),
-    WebsocketSecure(WebsocketSecureTransport),
     Websocket(WebsocketTransport),
 }
 
 impl From<PollingTransport> for TransportType {
     fn from(transport: PollingTransport) -> Self {
         TransportType::Polling(transport)
-    }
-}
-
-impl From<WebsocketSecureTransport> for TransportType {
-    fn from(transport: WebsocketSecureTransport) -> Self {
-        TransportType::WebsocketSecure(transport)
     }
 }
 
@@ -62,7 +50,6 @@ impl TransportType {
         match self {
             TransportType::Polling(transport) => transport,
             TransportType::Websocket(transport) => transport,
-            TransportType::WebsocketSecure(transport) => transport,
         }
     }
 }

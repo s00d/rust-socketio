@@ -28,7 +28,6 @@ impl<I> OptionalCallback<I> {
     }
 }
 
-#[cfg_attr(tarpaulin, ignore)]
 impl Debug for OptionalCallback<String> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.write_fmt(format_args!(
@@ -42,7 +41,6 @@ impl Debug for OptionalCallback<String> {
     }
 }
 
-#[cfg_attr(tarpaulin, ignore)]
 impl Debug for OptionalCallback<()> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.write_fmt(format_args!(
@@ -56,7 +54,6 @@ impl Debug for OptionalCallback<()> {
     }
 }
 
-#[cfg_attr(tarpaulin, ignore)]
 impl Debug for OptionalCallback<Packet> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.write_fmt(format_args!(
@@ -70,7 +67,6 @@ impl Debug for OptionalCallback<Packet> {
     }
 }
 
-#[cfg_attr(tarpaulin, ignore)]
 impl Debug for OptionalCallback<Bytes> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.write_fmt(format_args!(

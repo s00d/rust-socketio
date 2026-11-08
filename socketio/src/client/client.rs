@@ -7,20 +7,18 @@ use std::{
 };
 
 use super::{ClientBuilder, RawClient};
+use crate::backoff::Backoff;
 use crate::{
     error::Result,
     packet::{Packet, PacketId},
     Error,
 };
 pub(crate) use crate::{event::Event, payload::Payload};
-use backoff::ExponentialBackoff;
-use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 
 #[derive(Clone)]
 pub struct Client {
     builder: Arc<Mutex<ClientBuilder>>,
     client: Arc<RwLock<RawClient>>,
-    backoff: ExponentialBackoff,
     // set by disconnect(); outlives the RawClient, which a reconnect replaces
     disconnected: Arc<AtomicBool>,
 }
@@ -29,15 +27,10 @@ impl Client {
     pub(crate) fn new(builder: ClientBuilder) -> Result<Self> {
         let builder_clone = builder.clone();
         let client = builder_clone.connect_raw()?;
-        let backoff = ExponentialBackoffBuilder::new()
-            .with_initial_interval(Duration::from_millis(builder.reconnect_delay_min))
-            .with_max_interval(Duration::from_millis(builder.reconnect_delay_max))
-            .build();
 
         let s = Self {
             builder: Arc::new(Mutex::new(builder)),
             client: Arc::new(RwLock::new(client)),
-            backoff,
             disconnected: Arc::new(AtomicBool::new(false)),
         };
         s.poll_callback();
@@ -179,24 +172,26 @@ impl Client {
 
     /// Returns whether a new connection was established.
     fn reconnect(&mut self) -> Result<bool> {
-        let mut reconnect_attempts = 0;
-        let (reconnect, max_reconnect_attempts) = {
+        let (reconnect, max_reconnect_attempts, mut backoff) = {
             let builder = self.builder.lock()?;
-            (builder.reconnect, builder.max_reconnect_attempts)
+            (
+                builder.reconnect,
+                builder.max_reconnect_attempts,
+                Backoff::new(
+                    builder.reconnect_delay_min,
+                    builder.reconnect_delay_max,
+                    builder.randomization_factor,
+                ),
+            )
         };
 
         if reconnect {
             loop {
-                if let Some(max_reconnect_attempts) = max_reconnect_attempts {
-                    reconnect_attempts += 1;
-                    if reconnect_attempts > max_reconnect_attempts {
-                        break;
-                    }
+                if max_reconnect_attempts.is_some_and(|max| backoff.attempts() >= u32::from(max)) {
+                    break;
                 }
 
-                if let Some(backoff) = self.backoff.next_backoff() {
-                    std::thread::sleep(backoff);
-                }
+                std::thread::sleep(backoff.duration());
 
                 if self.disconnected_manually() {
                     break;
@@ -512,7 +507,6 @@ mod test {
         let mut socket = Client {
             builder: Arc::new(Mutex::new(builder)),
             client,
-            backoff: Default::default(),
             disconnected: Default::default(),
         };
         let socket_clone = socket.clone();

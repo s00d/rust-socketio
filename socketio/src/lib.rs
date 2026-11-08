@@ -1,51 +1,4 @@
 //! Rust-socket.io is a socket.io client written in the Rust Programming Language.
-//! ## Example usage
-//!
-//! ``` rust
-//! use rust_socketio::{ClientBuilder, Payload, RawClient};
-//! use serde_json::json;
-//! use std::time::Duration;
-//!
-//! // define a callback which is called when a payload is received
-//! // this callback gets the payload as well as an instance of the
-//! // socket to communicate with the server
-//! let callback = |payload: Payload, socket: RawClient| {
-//!        match payload {
-//!            Payload::Text(values) => println!("Received: {:#?}", values),
-//!            Payload::Binary(bin_data) => println!("Received bytes: {:#?}", bin_data),
-//!            // This variant is deprecated, use Payload::Text instead
-//!            Payload::String(str) => println!("Received: {}", str),
-//!        }
-//!        socket.emit("test", json!({"got ack": true})).expect("Server unreachable")
-//! };
-//!
-//! // get a socket that is connected to the admin namespace
-//! let mut socket = ClientBuilder::new("http://localhost:4200/")
-//!      .namespace("/admin")
-//!      .on("test", callback)
-//!      .on("error", |err, _| eprintln!("Error: {:#?}", err))
-//!      .connect()
-//!      .expect("Connection failed");
-//!
-//! // emit to the "foo" event
-//! let json_payload = json!({"token": 123});
-//!
-//! socket.emit("foo", json_payload).expect("Server unreachable");
-//!
-//! // define a callback, that's executed when the ack got acked
-//! let ack_callback = |message: Payload, _: RawClient| {
-//!     println!("Yehaa! My ack got acked?");
-//!     println!("Ack data: {:#?}", message);
-//! };
-//!
-//! let json_payload = json!({"myAckData": 123});
-//!
-//! // emit with an ack
-//! let ack = socket
-//!     .emit_with_ack("test", json_payload, Duration::from_secs(2), ack_callback)
-//!     .expect("Server unreachable");
-//! ```
-//!
 //! The main entry point for using this crate is the [`ClientBuilder`] which provides
 //! a way to easily configure a socket in the needed way. When the `connect` method
 //! is called on the builder, it returns a connected client which then could be used
@@ -75,6 +28,58 @@
 //! handling).
 //! - send JSON data to the server and receive an `ack`.
 //! - send and handle Binary data.
+#![cfg_attr(
+    feature = "sync",
+    doc = r#"
+## Example usage
+
+``` rust
+use rust_socketio::{ClientBuilder, Payload, RawClient};
+use serde_json::json;
+use std::time::Duration;
+
+// define a callback which is called when a payload is received
+// this callback gets the payload as well as an instance of the
+// socket to communicate with the server
+let callback = |payload: Payload, socket: RawClient| {
+       match payload {
+           Payload::Text(values) => println!("Received: {:#?}", values),
+           Payload::Binary(bin_data) => println!("Received bytes: {:#?}", bin_data),
+           // This variant is deprecated, use Payload::Text instead
+           Payload::String(str) => println!("Received: {}", str),
+       }
+       socket.emit("test", json!({"got ack": true})).expect("Server unreachable")
+};
+
+// get a socket that is connected to the admin namespace
+let mut socket = ClientBuilder::new("http://localhost:4200/")
+     .namespace("/admin")
+     .on("test", callback)
+     .on("error", |err, _| eprintln!("Error: {:#?}", err))
+     .connect()
+     .expect("Connection failed");
+
+// emit to the "foo" event
+let json_payload = json!({"token": 123});
+
+socket.emit("foo", json_payload).expect("Server unreachable");
+
+// define a callback, that's executed when the ack got acked
+let ack_callback = |message: Payload, _: RawClient| {
+    println!("Yehaa! My ack got acked?");
+    println!("Ack data: {:#?}", message);
+};
+
+let json_payload = json!({"myAckData": 123});
+
+// emit with an ack
+let ack = socket
+    .emit_with_ack("test", json_payload, Duration::from_secs(2), ack_callback)
+    .expect("Server unreachable");
+```
+
+"#
+)]
 #![cfg_attr(
     feature = "async",
     doc = r#"
@@ -160,13 +165,14 @@ async fn main() {
 }
 ```"#
 )]
-#![allow(clippy::rc_buffer)]
 #![warn(clippy::complexity)]
 #![warn(clippy::style)]
 #![warn(clippy::perf)]
 #![warn(clippy::correctness)]
 
-/// Defines client only structs
+mod backoff;
+/// The blocking client.
+#[cfg(feature = "sync")]
 pub mod client;
 /// Deprecated import since 0.3.0-alpha-2, use Event in the crate root instead.
 /// Defines the events that could be sent or received.
@@ -176,7 +182,9 @@ pub(crate) mod packet;
 /// Defines the types of payload (binary or string), that
 /// could be sent or received.
 pub mod payload;
-pub(self) mod socket;
+#[cfg(feature = "sync")]
+mod socket;
+mod transport_type;
 
 /// Deprecated import since 0.3.0-alpha-2, use Error in the crate root instead.
 /// Contains the error type which will be returned with every result in this
@@ -193,9 +201,14 @@ pub use error::Error;
 
 pub use {event::CloseReason, event::Event, payload::Payload};
 
-pub use client::{ClientBuilder, RawClient, TransportType};
+pub use rust_engineio::TlsConfig;
+pub use transport_type::TransportType;
+
+#[cfg(feature = "sync")]
+pub use client::{ClientBuilder, RawClient};
 
 // TODO: 0.4.0 remove
+#[cfg(feature = "sync")]
 #[deprecated(since = "0.3.0-alpha-2", note = "Socket renamed to Client")]
 pub use client::{ClientBuilder as SocketBuilder, RawClient as Socket};
 

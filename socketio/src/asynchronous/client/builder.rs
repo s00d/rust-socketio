@@ -1,9 +1,9 @@
 use futures_util::future::BoxFuture;
 use log::trace;
-use native_tls::TlsConnector;
 use rust_engineio::{
     asynchronous::ClientBuilder as EngineIoClientBuilder,
     header::{HeaderMap, HeaderValue},
+    TlsConfig,
 };
 use std::collections::HashMap;
 use url::Url;
@@ -28,7 +28,7 @@ pub struct ClientBuilder {
     pub(crate) on_any: Option<Callback<DynAsyncAnyCallback>>,
     pub(crate) on_reconnect: Option<Callback<DynAsyncReconnectSettingsCallback>>,
     pub(crate) namespace: String,
-    tls_config: Option<TlsConnector>,
+    tls_config: Option<TlsConfig>,
     pub(crate) opening_headers: Option<HeaderMap>,
     transport_type: TransportType,
     pub(crate) auth: Option<serde_json::Value>,
@@ -38,6 +38,7 @@ pub struct ClientBuilder {
     pub(crate) max_reconnect_attempts: Option<u8>,
     pub(crate) reconnect_delay_min: u64,
     pub(crate) reconnect_delay_max: u64,
+    pub(crate) randomization_factor: f64,
 }
 
 impl ClientBuilder {
@@ -97,6 +98,7 @@ impl ClientBuilder {
             max_reconnect_attempts: None,
             reconnect_delay_min: 1000,
             reconnect_delay_max: 5000,
+            randomization_factor: crate::backoff::DEFAULT_JITTER,
         }
     }
 
@@ -263,31 +265,25 @@ impl ClientBuilder {
         self
     }
 
-    /// Uses a preconfigured TLS connector for secure communication. This configures
-    /// both the `polling` as well as the `websocket` transport type.
+    /// Uses a TLS configuration for `https`/`wss` (both the `polling` and the `websocket`
+    /// transport). Accepts a [`TlsConfig`] or a backend type: `rustls::ClientConfig`
+    /// (feature `rustls`) or `native_tls::TlsConnector` (feature `native-tls`).
+    /// Without it the backend default roots are used.
     /// # Example
-    /// ```rust
-    /// use rust_socketio::{asynchronous::ClientBuilder, Payload};
-    /// use native_tls::TlsConnector;
-    /// use futures_util::future::FutureExt;
+    /// ```rust,no_run
+    /// use rust_socketio::{asynchronous::ClientBuilder, TlsConfig};
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let tls_connector =  TlsConnector::builder()
-    ///                .use_sni(true)
-    ///                .build()
-    ///             .expect("Found illegal configuration");
-    ///
-    ///     let socket = ClientBuilder::new("http://localhost:4200/")
-    ///         .namespace("/admin")
-    ///         .on("error", |err, _| async move { eprintln!("Error: {:#?}", err) }.boxed())
-    ///         .tls_config(tls_connector)
+    ///     let pem = std::fs::read("ca.crt").unwrap();
+    ///     let socket = ClientBuilder::new("https://localhost:4200/")
+    ///         .tls_config(TlsConfig::with_root_certificates_pem(&pem).unwrap())
     ///         .connect()
     ///         .await;
     /// }
     /// ```
-    pub fn tls_config(mut self, tls_config: TlsConnector) -> Self {
-        self.tls_config = Some(tls_config);
+    pub fn tls_config(mut self, tls_config: impl Into<TlsConfig>) -> Self {
+        self.tls_config = Some(tls_config.into());
         self
     }
 
@@ -382,10 +378,20 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the minimum and maximum delay between reconnection attempts
+    /// Sets the minimum and maximum delay between reconnection attempts in milliseconds
+    /// (socket.io-client `reconnectionDelay` / `reconnectionDelayMax`, defaults 1000 / 5000).
+    /// Attempt `n` waits `min * 2^n` randomised by the [randomization
+    /// factor](Self::randomization_factor), capped at `max`; the first attempt waits too.
     pub fn reconnect_delay(mut self, min: u64, max: u64) -> Self {
         self.reconnect_delay_min = min;
         self.reconnect_delay_max = max;
+        self
+    }
+
+    /// Randomises each reconnection delay by up to ± this fraction (socket.io-client
+    /// `randomizationFactor`, default 0.5; 0 disables, values outside (0, 1] are ignored).
+    pub fn randomization_factor(mut self, factor: f64) -> Self {
+        self.randomization_factor = factor;
         self
     }
 

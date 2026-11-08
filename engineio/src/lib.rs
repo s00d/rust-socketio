@@ -4,30 +4,6 @@
 //! supports revision 4 of the engine.io protocol. If you have any connection issues with this client,
 //! make sure the server uses at least revision 4 of the engine.io protocol.
 //!
-//! ## Example usage
-//!
-//! ``` rust
-//! use rust_engineio::{ClientBuilder, Client, packet::{Packet, PacketId}};
-//! use url::Url;
-//! use bytes::Bytes;
-//!
-//! // get a client with an `on_open` callback
-//! let client: Client = ClientBuilder::new(Url::parse("http://localhost:4201").unwrap())
-//!      .on_open(|_| println!("Connection opened!"))
-//!      .build()
-//!      .expect("Creating client failed");
-//!
-//! // connect to the server
-//! client.connect().expect("Connection failed");
-//!
-//! // create a packet, in this case a message packet and emit it
-//! let packet = Packet::new(PacketId::Message, Bytes::from_static(b"Hello World"));
-//! client.emit(packet).expect("Server unreachable");
-//!
-//! // disconnect from the server
-//! client.disconnect().expect("Disconnect failed")
-//! ```
-//!
 //! The main entry point for using this crate is the [`ClientBuilder`] (or [`asynchronous::ClientBuilder`] respectively)
 //! which provides the opportunity to define how you want to connect to a certain endpoint.
 //! The following connection methods are available:
@@ -48,8 +24,8 @@
 //! * on_error
 //! * on_packet
 //!
-//! It is also possible to pass in custom tls configurations via the `TlsConnector` as well
-//! as custom headers for the opening request.
+//! It is also possible to pass in a custom TLS configuration ([`TlsConfig`]: rustls or native-tls,
+//! selected by cargo feature) as well as custom headers for the opening request.
 //!
 //! ## Async version
 //!
@@ -64,63 +40,84 @@
 //! rust-engineio = { version = "0.3.1", features = ["async"] }
 //! ```
 //!
-#![allow(clippy::rc_buffer)]
+#![cfg_attr(
+    feature = "sync",
+    doc = r#"
+## Example usage
+
+``` rust
+use rust_engineio::{ClientBuilder, Client, packet::{Packet, PacketId}};
+use url::Url;
+use bytes::Bytes;
+
+// get a client with an `on_open` callback
+let client: Client = ClientBuilder::new(Url::parse("http://localhost:4201").unwrap())
+     .on_open(|_| println!("Connection opened!"))
+     .build()
+     .expect("Creating client failed");
+
+// connect to the server
+client.connect().expect("Connection failed");
+
+// create a packet, in this case a message packet and emit it
+let packet = Packet::new(PacketId::Message, Bytes::from_static(b"Hello World"));
+client.emit(packet).expect("Server unreachable");
+
+// disconnect from the server
+client.disconnect().expect("Disconnect failed")
+```
+
+"#
+)]
 #![warn(clippy::complexity)]
 #![warn(clippy::style)]
 #![warn(clippy::perf)]
 #![warn(clippy::correctness)]
-/// A small macro that spawns a scoped thread. Used for calling the callback
-/// functions.
-macro_rules! spawn_scoped {
-    ($e:expr) => {
-        std::thread::scope(|s| {
-            s.spawn(|| $e);
-        });
-    };
-}
 
 pub mod asynchronous;
+#[cfg(feature = "sync")]
 mod callback;
+#[cfg(feature = "sync")]
 pub mod client;
 /// Generic header map
 pub mod header;
 pub mod packet;
-pub(self) mod socket;
+#[cfg(feature = "sync")]
+mod socket;
+pub mod tls;
+#[cfg(feature = "sync")]
 pub mod transport;
+#[cfg(feature = "sync")]
 pub mod transports;
+mod util;
 
 pub const ENGINE_IO_VERSION: i32 = 4;
+
+/// Bound for the handshake and the websocket connect (socket.io-client `timeout`, 20 s).
+pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Contains the error type which will be returned with every result in this
 /// crate. Handles all kinds of errors.
 pub mod error;
 
+#[cfg(feature = "sync")]
 pub use client::{Client, ClientBuilder};
 pub use error::Error;
 pub use packet::{Packet, PacketId};
+pub use tls::TlsConfig;
 
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use native_tls::TlsConnector;
     const CERT_PATH: &str = "../ci/cert/ca.crt";
-    use native_tls::Certificate;
-    use std::fs::File;
-    use std::io::Read;
 
-    pub(crate) fn tls_connector() -> error::Result<TlsConnector> {
+    /// Trusts the test CA from `ci/cert` (`CA_CERT_PATH` overrides the path).
+    #[cfg(any(feature = "rustls", feature = "native-tls"))]
+    pub(crate) fn tls_config() -> error::Result<TlsConfig> {
         let cert_path = std::env::var("CA_CERT_PATH").unwrap_or_else(|_| CERT_PATH.to_owned());
-        let mut cert_file = File::open(cert_path)?;
-        let mut buf = vec![];
-        cert_file.read_to_end(&mut buf)?;
-        let cert: Certificate = Certificate::from_pem(&buf[..]).unwrap();
-        Ok(TlsConnector::builder()
-            // ONLY USE FOR TESTING!
-            .danger_accept_invalid_hostnames(true)
-            .add_root_certificate(cert)
-            .build()
-            .unwrap())
+        TlsConfig::with_root_certificates_pem(&std::fs::read(cert_path)?)
     }
+
     /// The `engine.io` server for testing runs on port 4201
     const SERVER_URL: &str = "http://localhost:4201";
     /// The `engine.io` server that refuses upgrades runs on port 4203
@@ -139,6 +136,7 @@ pub(crate) mod test {
         Ok(Url::parse(&url)?)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn engine_io_server_secure() -> crate::error::Result<Url> {
         let url = std::env::var("ENGINE_IO_SECURE_SERVER")
             .unwrap_or_else(|_| SERVER_URL_SECURE.to_owned());

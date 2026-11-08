@@ -1,44 +1,18 @@
-use crate::error::Result;
-use adler32::adler32;
-use async_trait::async_trait;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use bytes::Bytes;
-use futures_util::Stream;
-use std::{pin::Pin, time::SystemTime};
+use futures_util::{Stream, StreamExt};
 use url::Url;
 
-use super::async_transports::{PollingTransport, WebsocketSecureTransport, WebsocketTransport};
+use super::async_transports::{PollingTransport, WebsocketTransport};
+use crate::error::Result;
 
-#[async_trait]
-pub trait AsyncTransport: Stream<Item = Result<Bytes>> + Unpin {
-    /// Sends a packet to the server. This optionally handles sending of a
-    /// socketio binary attachment via the boolean attribute `is_binary_att`.
-    async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()>;
-
-    /// Returns start of the url. ex. http://localhost:2998/engine.io/?EIO=4&transport=polling
-    /// Must have EIO and transport already set.
-    async fn base_url(&self) -> Result<Url>;
-
-    /// Used to update the base path, like when adding the sid.
-    async fn set_base_url(&self, base_url: Url) -> Result<()>;
-
-    /// Full query address
-    async fn address(&self) -> Result<Url>
-    where
-        Self: Sized,
-    {
-        let reader = format!("{:#?}", SystemTime::now());
-        let hash = adler32(reader.as_bytes()).unwrap();
-        let mut url = self.base_url().await?;
-        url.query_pairs_mut().append_pair("t", &hash.to_string());
-        Ok(url)
-    }
-}
-
+/// The transport of an async engine.io socket (enum dispatch, no boxed trait objects).
 #[derive(Debug, Clone)]
 pub enum AsyncTransportType {
     Polling(PollingTransport),
     Websocket(WebsocketTransport),
-    WebsocketSecure(WebsocketSecureTransport),
 }
 
 impl From<PollingTransport> for AsyncTransportType {
@@ -53,27 +27,42 @@ impl From<WebsocketTransport> for AsyncTransportType {
     }
 }
 
-impl From<WebsocketSecureTransport> for AsyncTransportType {
-    fn from(transport: WebsocketSecureTransport) -> Self {
-        AsyncTransportType::WebsocketSecure(transport)
-    }
-}
-
-#[cfg(feature = "async")]
 impl AsyncTransportType {
-    pub fn as_transport(&self) -> &(dyn AsyncTransport + Send) {
+    /// Sends one encoded packet; `is_binary_att` marks raw binary data.
+    pub async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
         match self {
-            AsyncTransportType::Polling(transport) => transport,
-            AsyncTransportType::Websocket(transport) => transport,
-            AsyncTransportType::WebsocketSecure(transport) => transport,
+            AsyncTransportType::Polling(t) => t.emit(data, is_binary_att).await,
+            AsyncTransportType::Websocket(t) => t.emit(data, is_binary_att).await,
         }
     }
 
-    pub fn as_pin_box(&mut self) -> Pin<Box<&mut (dyn AsyncTransport + Send)>> {
+    /// The transport URL (with `EIO`, `transport` and, after the handshake, `sid`).
+    pub async fn base_url(&self) -> Result<Url> {
         match self {
-            AsyncTransportType::Polling(transport) => Box::pin(transport),
-            AsyncTransportType::Websocket(transport) => Box::pin(transport),
-            AsyncTransportType::WebsocketSecure(transport) => Box::pin(transport),
+            AsyncTransportType::Polling(t) => t.base_url().await,
+            AsyncTransportType::Websocket(t) => t.base_url().await,
+        }
+    }
+
+    pub async fn set_base_url(&self, url: Url) -> Result<()> {
+        match self {
+            AsyncTransportType::Polling(t) => t.set_base_url(url).await,
+            AsyncTransportType::Websocket(t) => t.set_base_url(url).await,
+        }
+    }
+
+    pub(crate) fn is_polling(&self) -> bool {
+        matches!(self, AsyncTransportType::Polling(_))
+    }
+}
+
+impl Stream for AsyncTransportType {
+    type Item = Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            AsyncTransportType::Polling(t) => t.poll_next_unpin(cx),
+            AsyncTransportType::Websocket(t) => t.poll_next_unpin(cx),
         }
     }
 }

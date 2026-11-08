@@ -34,3 +34,20 @@ impl<T> StreamGenerator<T> {
         }
     }
 }
+
+#[cfg(feature = "async")]
+/// Ends `stream` right after its first error, like a `try_stream!` block that hit `?`.
+pub(crate) fn end_after_error<T, S>(stream: S) -> impl Stream<Item = Result<T>> + Send
+where
+    S: Stream<Item = Result<T>> + Send + Unpin,
+    T: Send,
+{
+    futures_util::stream::unfold((stream, false), |(mut stream, failed)| async move {
+        if failed {
+            return None;
+        }
+        let item = stream.next().await?;
+        let failed = item.is_err();
+        Some((item, (stream, failed)))
+    })
+}

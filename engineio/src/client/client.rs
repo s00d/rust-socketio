@@ -6,10 +6,10 @@ use crate::transport::Transport;
 use crate::error::{Error, Result};
 use crate::header::HeaderMap;
 use crate::packet::{HandshakePacket, Packet, PacketId};
-use crate::transports::{PollingTransport, WebsocketSecureTransport, WebsocketTransport};
+use crate::tls::TlsConfig;
+use crate::transports::{PollingTransport, WebsocketTransport};
 use crate::ENGINE_IO_VERSION;
 use bytes::Bytes;
-use native_tls::TlsConnector;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::fmt::Debug;
@@ -30,7 +30,7 @@ pub struct Client {
 #[derive(Clone, Debug)]
 pub struct ClientBuilder {
     url: Url,
-    tls_config: Option<TlsConnector>,
+    tls_config: Option<TlsConfig>,
     headers: Option<HeaderMap>,
     handshake: Option<HandshakePacket>,
     on_error: OptionalCallback<String>,
@@ -64,8 +64,8 @@ impl ClientBuilder {
     }
 
     /// Specify transport's tls config
-    pub fn tls_config(mut self, tls_config: TlsConnector) -> Self {
-        self.tls_config = Some(tls_config);
+    pub fn tls_config(mut self, tls_config: impl Into<TlsConfig>) -> Self {
+        self.tls_config = Some(tls_config.into());
         self
     }
 
@@ -151,8 +151,8 @@ impl ClientBuilder {
         let transport = PollingTransport::new(
             self.url.clone(),
             self.tls_config.clone(),
-            self.headers.clone().map(|v| v.try_into().unwrap()),
-        );
+            self.http_headers()?,
+        )?;
 
         self.handshake_with_transport(&transport)
     }
@@ -173,17 +173,14 @@ impl ClientBuilder {
         self.handshake()?;
 
         // Make a polling transport with new sid
-        let transport = PollingTransport::new(
-            self.url,
-            self.tls_config,
-            self.headers.map(|v| v.try_into().unwrap()),
-        );
+        let headers = self.http_headers()?;
+        let transport = PollingTransport::new(self.url, self.tls_config, headers)?;
+        let handshake = self.handshake.ok_or(Error::IncompletePacket())?;
 
-        // SAFETY: handshake function called previously.
         Ok(Client {
             socket: InnerSocket::new(
                 transport.into(),
-                self.handshake.unwrap(),
+                handshake,
                 self.on_close,
                 self.on_data,
                 self.on_error,
@@ -206,60 +203,33 @@ impl ClientBuilder {
 
     /// Build socket with only a websocket transport
     pub fn build_websocket(mut self) -> Result<Client> {
-        // SAFETY: Already a Url
-        let url = url::Url::parse(self.url.as_ref())?;
-
-        let headers: Option<http::HeaderMap> = if let Some(map) = self.headers.clone() {
-            Some(map.try_into()?)
+        let headers = self.http_headers()?;
+        let transport =
+            WebsocketTransport::new(self.url.clone(), self.tls_config.clone(), headers)?;
+        if self.handshake.is_some() {
+            transport.upgrade()?;
         } else {
-            None
-        };
+            self.handshake_with_transport(&transport)?;
+        }
+        let handshake = self.handshake.ok_or(Error::IncompletePacket())?;
+        // NOTE: Although self.url contains the sid, it does not propagate to the transport
+        Ok(Client {
+            socket: InnerSocket::new(
+                transport.into(),
+                handshake,
+                self.on_close,
+                self.on_data,
+                self.on_error,
+                self.on_open,
+                self.on_packet,
+            ),
+        })
+    }
 
-        match url.scheme() {
-            "http" | "ws" => {
-                let transport = WebsocketTransport::new(url, headers)?;
-                if self.handshake.is_some() {
-                    transport.upgrade()?;
-                } else {
-                    self.handshake_with_transport(&transport)?;
-                }
-                // NOTE: Although self.url contains the sid, it does not propagate to the transport
-                // SAFETY: handshake function called previously.
-                Ok(Client {
-                    socket: InnerSocket::new(
-                        transport.into(),
-                        self.handshake.unwrap(),
-                        self.on_close,
-                        self.on_data,
-                        self.on_error,
-                        self.on_open,
-                        self.on_packet,
-                    ),
-                })
-            }
-            "https" | "wss" => {
-                let transport =
-                    WebsocketSecureTransport::new(url, self.tls_config.clone(), headers)?;
-                if self.handshake.is_some() {
-                    transport.upgrade()?;
-                } else {
-                    self.handshake_with_transport(&transport)?;
-                }
-                // NOTE: Although self.url contains the sid, it does not propagate to the transport
-                // SAFETY: handshake function called previously.
-                Ok(Client {
-                    socket: InnerSocket::new(
-                        transport.into(),
-                        self.handshake.unwrap(),
-                        self.on_close,
-                        self.on_data,
-                        self.on_error,
-                        self.on_open,
-                        self.on_packet,
-                    ),
-                })
-            }
-            _ => Err(Error::InvalidUrlScheme(url.scheme().to_string())),
+    fn http_headers(&self) -> Result<Option<http::HeaderMap>> {
+        match self.headers.clone() {
+            Some(map) => Ok(Some(map.try_into()?)),
+            None => Ok(None),
         }
     }
 
@@ -276,14 +246,12 @@ impl ClientBuilder {
 
     /// Checks the handshake to see if websocket upgrades are allowed
     fn websocket_upgrade(&mut self) -> Result<bool> {
-        // SAFETY: handshake set by above function.
-        Ok(self
-            .handshake
-            .as_ref()
-            .unwrap()
-            .upgrades
-            .iter()
-            .any(|upgrade| upgrade.to_lowercase() == *"websocket"))
+        Ok(self.handshake.as_ref().is_some_and(|handshake| {
+            handshake
+                .upgrades
+                .iter()
+                .any(|upgrade| upgrade.eq_ignore_ascii_case("websocket"))
+        }))
     }
 }
 
@@ -353,7 +321,7 @@ impl Client {
         self.socket.is_connected()
     }
 
-    pub fn iter(&self) -> Iter {
+    pub fn iter(&self) -> Iter<'_> {
         Iter { socket: self }
     }
 }
@@ -544,11 +512,12 @@ mod test {
         test_connection(socket)
     }
 
+    #[cfg(any(feature = "rustls", feature = "native-tls"))]
     #[test]
     fn test_connection_dynamic_secure() -> Result<()> {
         let url = crate::test::engine_io_server_secure()?;
         let mut builder = builder(url);
-        builder = builder.tls_config(crate::test::tls_connector()?);
+        builder = builder.tls_config(crate::test::tls_config()?);
         let socket = builder.build()?;
         test_connection(socket)
     }
@@ -560,6 +529,7 @@ mod test {
         test_connection(socket)
     }
 
+    #[cfg(any(feature = "rustls", feature = "native-tls"))]
     #[test]
     fn test_connection_wss() -> Result<()> {
         let url = crate::test::engine_io_polling_server()?;
@@ -573,7 +543,7 @@ mod test {
         headers.insert(HOST, host);
         let mut builder = builder(url.clone());
 
-        builder = builder.tls_config(crate::test::tls_connector()?);
+        builder = builder.tls_config(crate::test::tls_config()?);
         builder = builder.headers(headers.clone());
         let socket = builder.clone().build_websocket_with_upgrade()?;
 
@@ -586,7 +556,7 @@ mod test {
         url.set_scheme("wss").unwrap();
 
         let builder = self::builder(url)
-            .tls_config(crate::test::tls_connector()?)
+            .tls_config(crate::test::tls_config()?)
             .headers(headers);
         let socket = builder.clone().build_websocket()?;
 
@@ -648,14 +618,7 @@ mod test {
             std::env::var("ENGINE_IO_SECURE_HOST").unwrap_or_else(|_| "localhost".to_owned());
         headers.insert(HOST, host);
 
-        let _ = builder(url.clone())
-            .tls_config(
-                TlsConnector::builder()
-                    .danger_accept_invalid_certs(true)
-                    .build()
-                    .unwrap(),
-            )
-            .build()?;
+        let _ = builder(url.clone()).build()?;
         let _ = builder(url).headers(headers).build()?;
         Ok(())
     }

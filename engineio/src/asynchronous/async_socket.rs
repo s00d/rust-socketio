@@ -7,9 +7,10 @@ use std::{
     },
 };
 
-use async_stream::try_stream;
 use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
+
+use super::generator::end_after_error;
 use tokio::{runtime::Handle, sync::Mutex, time::Instant};
 
 use crate::{
@@ -76,11 +77,9 @@ impl Socket {
             self.handle.spawn(async move { on_open(()).await });
         }
 
-        // set the last ping to now and set the connected state
+        // The heartbeat deadline starts at the handshake. Like engine.io-client, nothing is sent
+        // here: the client answers the server's pings and never pongs unasked.
         *self.last_ping.lock().await = Instant::now();
-
-        // emit a pong packet to keep trigger the ping cycle on the server
-        self.emit(Packet::new(PacketId::Pong, Bytes::new())).await?;
 
         Ok(())
     }
@@ -117,36 +116,29 @@ impl Socket {
     }
 
     /// Helper method that parses bytes and returns an iterator over the elements.
-    fn parse_payload(bytes: Bytes, is_polling: bool) -> impl Stream<Item = Result<Packet>> {
-        try_stream! {
-            // A polling body joins packets with 0x1e; a websocket frame is a single packet.
-            let payload = if is_polling {
-                Payload::try_from(bytes)?
-            } else {
-                Payload::from(Packet::try_from(bytes)?)
-            };
-
-            for elem in payload.into_iter() {
-                yield elem;
-            }
-        }
+    /// A polling body joins packets with 0x1e; a websocket frame is a single packet.
+    fn parse_payload(bytes: Bytes, is_polling: bool) -> Result<Vec<Packet>> {
+        let payload = if is_polling {
+            Payload::try_from(bytes)?
+        } else {
+            Payload::from(Packet::try_from(bytes)?)
+        };
+        Ok(payload.into_iter().collect())
     }
 
-    /// Creates a stream over the incoming packets, uses the streams provided by the
-    /// underlying transport types.
+    /// The packet stream of the transport; it ends after the first error.
     fn stream(
-        mut transport: AsyncTransportType,
-    ) -> Pin<Box<impl Stream<Item = Result<Packet>> + 'static + Send>> {
-        // map the byte stream of the underlying transport
-        // to a packet stream
-        let is_polling = matches!(transport, AsyncTransportType::Polling(_));
-        Box::pin(try_stream! {
-            for await payload in transport.as_pin_box() {
-                for await packet in Self::parse_payload(payload?, is_polling) {
-                    yield packet?;
-                }
-            }
-        })
+        transport: AsyncTransportType,
+    ) -> Pin<Box<dyn Stream<Item = Result<Packet>> + 'static + Send>> {
+        let is_polling = transport.is_polling();
+        let packets = transport.flat_map(move |payload| {
+            let packets = match payload.and_then(|bytes| Self::parse_payload(bytes, is_polling)) {
+                Ok(packets) => packets.into_iter().map(Ok).collect(),
+                Err(err) => vec![Err(err)],
+            };
+            stream::iter(packets)
+        });
+        end_after_error(packets).boxed()
     }
 
     pub async fn disconnect(&self) -> Result<()> {
@@ -183,9 +175,7 @@ impl Socket {
         };
 
         let lock = self.transport.lock().await;
-        let fut = lock.as_transport().emit(data, is_binary);
-
-        if let Err(error) = fut.await {
+        if let Err(error) = lock.emit(data, is_binary).await {
             self.call_error_callback(error.to_string());
             return Err(error);
         }
@@ -251,33 +241,24 @@ impl Socket {
         self.connected.store(false, Ordering::Release);
     }
 
-    /// Returns the packet stream for the client.
-    pub(crate) fn as_stream<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Stream<Item = Result<Packet>> + Send + 'a>> {
+    /// The packet stream with the heartbeat check: it ends when the socket closes and fails with
+    /// [`Error::PingTimeout`] when no ping arrives within pingInterval + pingTimeout.
+    pub(crate) fn as_stream(&self) -> Pin<Box<dyn Stream<Item = Result<Packet>> + Send + 'static>> {
         stream::unfold(
-            Self::stream(self.transport_raw.clone()),
-            |mut stream| async {
+            (Self::stream(self.transport_raw.clone()), self.clone()),
+            |(mut stream, socket)| async move {
                 // A closed socket (disconnect() or a server Close packet) yields nothing more.
-                if !self.is_connected() {
+                if !socket.is_connected() {
                     return None;
                 }
-                // Wait for the next payload or until we should have received the next ping.
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(self.time_to_next_ping().await),
-                    stream.next(),
-                )
-                .await
-                {
-                    Ok(result) => result.map(|result| (result, stream)),
-                    // We didn't receive a ping in time and now consider the connection as closed.
+                let deadline = std::time::Duration::from_millis(socket.time_to_next_ping().await);
+                match tokio::time::timeout(deadline, stream.next()).await {
+                    Ok(result) => result.map(|result| (result, (stream, socket))),
+                    // No ping in time: the connection is dead. Be nice and disconnect properly.
                     Err(_) => {
-                        // Be nice and disconnect properly.
-                        if let Err(e) = self.disconnect().await {
-                            Some((Err(e), stream))
-                        } else {
-                            Some((Err(Error::PingTimeout()), stream))
-                        }
+                        // The reason is the timeout even when the Close packet cannot be sent.
+                        let _ = socket.disconnect().await;
+                        Some((Err(Error::PingTimeout()), (stream, socket)))
                     }
                 }
             },
@@ -286,7 +267,6 @@ impl Socket {
     }
 }
 
-#[cfg_attr(tarpaulin, ignore)]
 impl Debug for Socket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Socket")

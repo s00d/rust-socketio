@@ -1,18 +1,17 @@
 use crate::{
     asynchronous::{
         async_socket::Socket as InnerSocket,
-        async_transports::{PollingTransport, WebsocketSecureTransport, WebsocketTransport},
+        async_transports::{PollingTransport, WebsocketTransport},
         callback::OptionalCallback,
-        transport::AsyncTransport,
     },
     error::Result,
     header::HeaderMap,
     packet::HandshakePacket,
+    tls::TlsConfig,
     Error, Packet, ENGINE_IO_VERSION,
 };
 use bytes::Bytes;
 use futures_util::{future::BoxFuture, StreamExt};
-use native_tls::TlsConnector;
 use std::time::Duration;
 use url::Url;
 
@@ -20,12 +19,12 @@ use super::Client;
 
 /// Budget for opening a connection (handshake request, websocket connect and upgrade probe),
 /// the same as the `timeout` default of socket.io-client's Manager.
-pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) use crate::HANDSHAKE_TIMEOUT;
 
 #[derive(Clone, Debug)]
 pub struct ClientBuilder {
     url: Url,
-    tls_config: Option<TlsConnector>,
+    tls_config: Option<TlsConfig>,
     headers: Option<HeaderMap>,
     handshake: Option<HandshakePacket>,
     on_error: OptionalCallback<String>,
@@ -59,8 +58,8 @@ impl ClientBuilder {
     }
 
     /// Specify transport's tls config
-    pub fn tls_config(mut self, tls_config: TlsConnector) -> Self {
-        self.tls_config = Some(tls_config);
+    pub fn tls_config(mut self, tls_config: impl Into<TlsConfig>) -> Self {
+        self.tls_config = Some(tls_config.into());
         self
     }
 
@@ -71,7 +70,6 @@ impl ClientBuilder {
     }
 
     /// Registers the `on_close` callback.
-    #[cfg(feature = "async-callbacks")]
     pub fn on_close<T>(mut self, callback: T) -> Self
     where
         T: 'static + Send + Sync + Fn(()) -> BoxFuture<'static, ()>,
@@ -81,7 +79,6 @@ impl ClientBuilder {
     }
 
     /// Registers the `on_data` callback.
-    #[cfg(feature = "async-callbacks")]
     pub fn on_data<T>(mut self, callback: T) -> Self
     where
         T: 'static + Send + Sync + Fn(Bytes) -> BoxFuture<'static, ()>,
@@ -91,7 +88,6 @@ impl ClientBuilder {
     }
 
     /// Registers the `on_error` callback.
-    #[cfg(feature = "async-callbacks")]
     pub fn on_error<T>(mut self, callback: T) -> Self
     where
         T: 'static + Send + Sync + Fn(String) -> BoxFuture<'static, ()>,
@@ -101,7 +97,6 @@ impl ClientBuilder {
     }
 
     /// Registers the `on_open` callback.
-    #[cfg(feature = "async-callbacks")]
     pub fn on_open<T>(mut self, callback: T) -> Self
     where
         T: 'static + Send + Sync + Fn(()) -> BoxFuture<'static, ()>,
@@ -111,7 +106,6 @@ impl ClientBuilder {
     }
 
     /// Registers the `on_packet` callback.
-    #[cfg(feature = "async-callbacks")]
     pub fn on_packet<T>(mut self, callback: T) -> Self
     where
         T: 'static + Send + Sync + Fn(Packet) -> BoxFuture<'static, ()>,
@@ -121,7 +115,7 @@ impl ClientBuilder {
     }
 
     /// Performs the handshake
-    async fn handshake_with_transport<T: AsyncTransport + Unpin>(
+    async fn handshake_with_transport<T: futures_util::Stream<Item = Result<Bytes>> + Unpin>(
         &mut self,
         transport: &mut T,
     ) -> Result<()> {
@@ -163,7 +157,7 @@ impl ClientBuilder {
             self.tls_config.clone(),
             headers,
             Some(HANDSHAKE_TIMEOUT),
-        );
+        )?;
 
         self.handshake_with_transport(&mut transport).await
     }
@@ -183,8 +177,7 @@ impl ClientBuilder {
     pub async fn build_polling(mut self) -> Result<Client> {
         self.handshake().await?;
 
-        // SAFETY: handshake function called previously.
-        let handshake = self.handshake.unwrap();
+        let handshake = self.handshake.take().ok_or(Error::IncompletePacket())?;
 
         // A long-poll GET is answered at least once per ping interval; a request still open after
         // the ping deadline belongs to a dead connection.
@@ -192,12 +185,16 @@ impl ClientBuilder {
             Duration::from_millis(handshake.ping_interval + handshake.ping_timeout);
 
         // Make a polling transport with new sid
+        let headers = match self.headers {
+            Some(map) => Some(map.try_into()?),
+            None => None,
+        };
         let transport = PollingTransport::with_timeout(
             self.url,
             self.tls_config,
-            self.headers.map(|v| v.try_into().unwrap()),
+            headers,
             Some(request_timeout),
-        );
+        )?;
 
         Ok(Client::new(InnerSocket::new(
             transport.into(),
@@ -232,54 +229,25 @@ impl ClientBuilder {
                 None
             };
 
-            match self.url.scheme() {
-                "http" | "ws" => {
-                    let mut transport = WebsocketTransport::new(self.url.clone(), headers).await?;
+            let mut transport =
+                WebsocketTransport::new(self.url.clone(), self.tls_config.clone(), headers).await?;
 
-                    if self.handshake.is_some() {
-                        transport.upgrade().await?;
-                    } else {
-                        self.handshake_with_transport(&mut transport).await?;
-                    }
-                    // NOTE: Although self.url contains the sid, it does not propagate to the transport
-                    // SAFETY: handshake function called previously.
-                    Ok(Client::new(InnerSocket::new(
-                        transport.into(),
-                        self.handshake.unwrap(),
-                        self.on_close,
-                        self.on_data,
-                        self.on_error,
-                        self.on_open,
-                        self.on_packet,
-                    )))
-                }
-                "https" | "wss" => {
-                    let mut transport = WebsocketSecureTransport::new(
-                        self.url.clone(),
-                        self.tls_config.clone(),
-                        headers,
-                    )
-                    .await?;
-
-                    if self.handshake.is_some() {
-                        transport.upgrade().await?;
-                    } else {
-                        self.handshake_with_transport(&mut transport).await?;
-                    }
-                    // NOTE: Although self.url contains the sid, it does not propagate to the transport
-                    // SAFETY: handshake function called previously.
-                    Ok(Client::new(InnerSocket::new(
-                        transport.into(),
-                        self.handshake.unwrap(),
-                        self.on_close,
-                        self.on_data,
-                        self.on_error,
-                        self.on_open,
-                        self.on_packet,
-                    )))
-                }
-                _ => Err(Error::InvalidUrlScheme(self.url.scheme().to_string())),
+            if self.handshake.is_some() {
+                transport.upgrade().await?;
+            } else {
+                self.handshake_with_transport(&mut transport).await?;
             }
+            let handshake = self.handshake.ok_or(Error::IncompletePacket())?;
+            // NOTE: Although self.url contains the sid, it does not propagate to the transport
+            Ok(Client::new(InnerSocket::new(
+                transport.into(),
+                handshake,
+                self.on_close,
+                self.on_data,
+                self.on_error,
+                self.on_open,
+                self.on_packet,
+            )))
         };
         tokio::time::timeout(HANDSHAKE_TIMEOUT, connect)
             .await
@@ -299,16 +267,11 @@ impl ClientBuilder {
 
     /// Checks the handshake to see if websocket upgrades are allowed
     fn websocket_upgrade(&mut self) -> Result<bool> {
-        if self.handshake.is_none() {
-            return Ok(false);
-        }
-
-        Ok(self
-            .handshake
-            .as_ref()
-            .unwrap()
-            .upgrades
-            .iter()
-            .any(|upgrade| upgrade.to_lowercase() == *"websocket"))
+        Ok(self.handshake.as_ref().is_some_and(|handshake| {
+            handshake
+                .upgrades
+                .iter()
+                .any(|upgrade| upgrade.eq_ignore_ascii_case("websocket"))
+        }))
     }
 }

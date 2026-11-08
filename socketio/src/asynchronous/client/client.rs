@@ -7,7 +7,6 @@ use std::{
     },
 };
 
-use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use futures_util::{future::BoxFuture, stream, Stream, StreamExt};
 use log::{error, trace};
 use rust_engineio::header::{HeaderMap, HeaderValue};
@@ -25,6 +24,7 @@ use super::{
 };
 use crate::{
     asynchronous::socket::Socket as InnerSocket,
+    backoff::Backoff,
     error::{Error, Result},
     packet::{Packet, PacketId},
     CloseReason, Event, Payload,
@@ -202,6 +202,7 @@ impl Client {
         let builder = self.builder.read().await;
         let reconnect_delay_min = builder.reconnect_delay_min;
         let reconnect_delay_max = builder.reconnect_delay_max;
+        let randomization_factor = builder.randomization_factor;
         let max_reconnect_attempts = builder.max_reconnect_attempts;
         let reconnect = builder.reconnect;
         let reconnect_on_disconnect = builder.reconnect_on_disconnect;
@@ -262,28 +263,34 @@ impl Client {
                 };
 
                 if should_reconnect {
-                    let mut reconnect_attempts = 0;
-                    let mut backoff = ExponentialBackoffBuilder::new()
-                        .with_initial_interval(Duration::from_millis(reconnect_delay_min))
-                        .with_max_interval(Duration::from_millis(reconnect_delay_max))
-                        .build();
-
+                    // socket.io-client Manager.reconnect(): every attempt, the first one too,
+                    // waits for the backoff delay; `reconnectionAttempts` bounds the attempts.
+                    let mut backoff = Backoff::new(
+                        reconnect_delay_min,
+                        reconnect_delay_max,
+                        randomization_factor,
+                    );
                     let mut reconnected = false;
                     loop {
                         // A disconnect() during the outage ends the reconnect loop.
                         if client_clone.disconnected_manually().await {
                             break;
                         }
-                        if let Some(max_reconnect_attempts) = max_reconnect_attempts {
-                            reconnect_attempts += 1;
-                            if reconnect_attempts > max_reconnect_attempts {
-                                trace!("Max reconnect attempts reached without success");
-                                break;
-                            }
+                        if max_reconnect_attempts
+                            .is_some_and(|max| backoff.attempts() >= u32::from(max))
+                        {
+                            trace!("Max reconnect attempts reached without success");
+                            break;
+                        }
+                        let delay = backoff.duration();
+                        trace!("Waiting for {}ms before reconnecting", delay.as_millis());
+                        sleep(delay).await;
+                        if client_clone.disconnected_manually().await {
+                            break;
                         }
                         match client_clone.reconnect().await {
                             Ok(_) => {
-                                trace!("Reconnected after {reconnect_attempts} attempts");
+                                trace!("Reconnected after {} attempts", backoff.attempts());
                                 // disconnect() raced with this attempt and closed the old socket:
                                 // close the new one too.
                                 if client_clone.disconnected_manually().await {
@@ -292,14 +299,7 @@ impl Client {
                                 reconnected = true;
                                 break;
                             }
-                            Err(e) => {
-                                trace!("Failed to reconnect: {e:?}");
-                                if let Some(delay) = backoff.next_backoff() {
-                                    let delay_ms = delay.as_millis();
-                                    trace!("Waiting for {delay_ms}ms before reconnecting");
-                                    sleep(delay).await;
-                                }
-                            }
+                            Err(e) => trace!("Failed to reconnect: {e:?}"),
                         }
                     }
                     // Out of attempts (or disconnected manually): give up for good, like
@@ -764,7 +764,6 @@ mod test {
 
     use bytes::Bytes;
     use futures_util::{FutureExt, StreamExt};
-    use native_tls::TlsConnector;
     use serde_json::json;
     use serial_test::serial;
     use tokio::{
@@ -879,14 +878,8 @@ mod test {
         // test socket build logic
         let socket_builder = ClientBuilder::new(url);
 
-        let tls_connector = TlsConnector::builder()
-            .use_sni(true)
-            .build()
-            .expect("Found illegal configuration");
-
         let socket = socket_builder
             .namespace("/admin")
-            .tls_config(tls_connector)
             .opening_header("accept-encoding", "application/json")
             .on("test", |str, _| {
                 async move { println!("Received: {:#?}", str) }.boxed()
@@ -1038,14 +1031,8 @@ mod test {
         // test socket build logic
         let socket_builder = ClientBuilder::new(url);
 
-        let tls_connector = TlsConnector::builder()
-            .use_sni(true)
-            .build()
-            .expect("Found illegal configuration");
-
         let socket = socket_builder
             .namespace("/admin")
-            .tls_config(tls_connector)
             .opening_header("accept-encoding", "application/json")
             .on("test", |str, _| {
                 async move { println!("Received: {:#?}", str) }.boxed()

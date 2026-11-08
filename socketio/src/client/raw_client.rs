@@ -249,7 +249,7 @@ impl RawClient {
     }
 
     #[cfg(test)]
-    pub(crate) fn iter(&self) -> Iter {
+    pub(crate) fn iter(&self) -> Iter<'_> {
         Iter { socket: self }
     }
 
@@ -403,18 +403,16 @@ impl RawClient {
     }
 }
 
-pub struct Iter<'a> {
+#[cfg(test)]
+pub(crate) struct Iter<'a> {
     socket: &'a RawClient,
 }
 
-impl<'a> Iterator for Iter<'a> {
+#[cfg(test)]
+impl Iterator for Iter<'_> {
     type Item = Result<Packet>;
-    fn next(&mut self) -> std::option::Option<<Self as std::iter::Iterator>::Item> {
-        match self.socket.poll() {
-            Err(err) => Some(Err(err)),
-            Ok(Some(packet)) => Some(Ok(packet)),
-            Ok(None) => None,
-        }
+    fn next(&mut self) -> Option<Self::Item> {
+        self.socket.poll().transpose()
     }
 }
 
@@ -424,9 +422,8 @@ mod test {
     use std::thread::sleep;
 
     use super::*;
-    use crate::{client::TransportType, payload::Payload, ClientBuilder};
+    use crate::{payload::Payload, ClientBuilder, TransportType};
     use bytes::Bytes;
-    use native_tls::TlsConnector;
     use serde_json::json;
     use std::time::Duration;
 
@@ -534,14 +531,8 @@ mod test {
         // test socket build logic
         let socket_builder = ClientBuilder::new(url);
 
-        let tls_connector = TlsConnector::builder()
-            .use_sni(true)
-            .build()
-            .expect("Found illegal configuration");
-
         let socket = socket_builder
             .namespace("/admin")
-            .tls_config(tls_connector)
             .opening_header("accept-encoding", "application/json")
             .on("test", |str, _| println!("Received: {:#?}", str))
             .on("message", |payload, _| println!("{:#?}", payload))
@@ -575,14 +566,8 @@ mod test {
         // test socket build logic
         let socket_builder = ClientBuilder::new(url);
 
-        let tls_connector = TlsConnector::builder()
-            .use_sni(true)
-            .build()
-            .expect("Found illegal configuration");
-
         let socket = socket_builder
             .namespace("/admin")
-            .tls_config(tls_connector)
             .opening_header("accept-encoding", "application/json")
             .on("test", |str, _| println!("Received: {:#?}", str))
             .on("message", |payload, _| println!("{:#?}", payload))

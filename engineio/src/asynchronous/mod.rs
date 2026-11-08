@@ -1,15 +1,13 @@
 pub mod async_transports;
 pub mod transport;
 
-pub(self) mod async_socket;
-#[cfg(feature = "async-callbacks")]
+#[cfg(feature = "async")]
+mod async_socket;
+#[cfg(feature = "async")]
 mod callback;
 #[cfg(feature = "async")]
 pub mod client;
 mod generator;
 
 #[cfg(feature = "async")]
-pub use client::Client;
-
-#[cfg(feature = "async")]
-pub use client::ClientBuilder;
+pub use client::{Client, ClientBuilder};

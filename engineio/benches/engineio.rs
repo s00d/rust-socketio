@@ -1,9 +1,6 @@
 use criterion::{criterion_group, criterion_main};
-use native_tls::Certificate;
-use native_tls::TlsConnector;
 use rust_engineio::error::Error;
-use std::fs::File;
-use std::io::Read;
+use rust_engineio::TlsConfig;
 use url::Url;
 
 pub use criterion_wrappers::*;
@@ -24,19 +21,10 @@ pub mod util {
         Ok(Url::parse(&url)?)
     }
 
-    pub fn tls_connector() -> Result<TlsConnector, Error> {
+    pub fn tls_connector() -> Result<TlsConfig, Error> {
         let cert_path = "../".to_owned()
             + &std::env::var("CA_CERT_PATH").unwrap_or_else(|_| "ci/cert/ca.crt".to_owned());
-        let mut cert_file = File::open(cert_path)?;
-        let mut buf = vec![];
-        cert_file.read_to_end(&mut buf)?;
-        let cert: Certificate = Certificate::from_pem(&buf[..]).unwrap();
-        Ok(TlsConnector::builder()
-            // ONLY USE FOR TESTING!
-            .danger_accept_invalid_hostnames(true)
-            .add_root_certificate(cert)
-            .build()
-            .unwrap())
+        TlsConfig::with_root_certificates_pem(&std::fs::read(cert_path)?)
     }
 }
 
@@ -85,7 +73,8 @@ pub mod tests {
 
 #[cfg(not(feature = "async"))]
 mod criterion_wrappers {
-    use criterion::{black_box, Criterion};
+    use criterion::Criterion;
+    use std::hint::black_box;
 
     use super::*;
 
@@ -250,9 +239,10 @@ mod criterion_wrappers {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use criterion::{black_box, Criterion};
-    use lazy_static::lazy_static;
+    use criterion::Criterion;
     use rust_engineio::{Packet, PacketId};
+    use std::hint::black_box;
+    use std::sync::LazyLock;
     use tokio::runtime::{Builder, Runtime};
 
     use super::tests::{
@@ -262,10 +252,8 @@ mod criterion_wrappers {
     };
     use super::util::{engine_io_url, engine_io_url_secure};
 
-    lazy_static! {
-        static ref RUNTIME: Arc<Runtime> =
-            Arc::new(Builder::new_multi_thread().enable_all().build().unwrap());
-    }
+    static RUNTIME: LazyLock<Arc<Runtime>> =
+        LazyLock::new(|| Arc::new(Builder::new_multi_thread().enable_all().build().unwrap()));
 
     pub fn criterion_engine_io_socket_build(c: &mut Criterion) {
         let url = engine_io_url().unwrap();

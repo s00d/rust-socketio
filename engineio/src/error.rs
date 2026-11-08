@@ -4,13 +4,12 @@ use serde_json::Error as JsonError;
 use std::io::Error as IoError;
 use std::str::Utf8Error;
 use thiserror::Error;
-use tungstenite::Error as TungsteniteError;
+use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use url::ParseError as UrlParseError;
 
 /// Enumeration of all possible errors in the `socket.io` context.
 #[derive(Error, Debug)]
 #[non_exhaustive]
-#[cfg_attr(tarpaulin, ignore)]
 pub enum Error {
     // Conform to https://rust-lang.github.io/api-guidelines/naming.html#names-use-a-consistent-word-order-c-word-order
     // Negative verb-object
@@ -54,6 +53,12 @@ pub enum Error {
     InvalidHeaderValueFromReqwest(#[from] reqwest::header::InvalidHeaderValue),
     #[error("The server did not send a PING packet in time")]
     PingTimeout(),
+    #[error(
+        "`{0}` needs TLS, but the crate was built without the `rustls` or `native-tls` feature"
+    )]
+    TlsNotEnabled(String),
+    #[error("Invalid TLS configuration: {0}")]
+    InvalidTlsConfig(String),
 }
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;

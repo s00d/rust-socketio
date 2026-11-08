@@ -1,10 +1,10 @@
 use super::super::{event::Event, payload::Payload};
 use super::callback::Callback;
 use super::client::Client;
-use crate::RawClient;
-use native_tls::TlsConnector;
+use crate::{RawClient, TransportType};
 use rust_engineio::client::ClientBuilder as EngineIoClientBuilder;
 use rust_engineio::header::{HeaderMap, HeaderValue};
+use rust_engineio::TlsConfig;
 use url::Url;
 
 use crate::client::callback::{SocketAnyCallback, SocketCallback};
@@ -13,19 +13,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::socket::Socket as InnerSocket;
-
-/// Flavor of Engine.IO transport.
-#[derive(Clone, Eq, PartialEq)]
-pub enum TransportType {
-    /// Handshakes with polling, upgrades if possible
-    Any,
-    /// Handshakes with websocket. Does not use polling.
-    Websocket,
-    /// Handshakes with polling, errors if upgrade fails
-    WebsocketUpgrade,
-    /// Handshakes with polling
-    Polling,
-}
 
 /// A builder class for a `socket.io` socket. This handles setting up the client and
 /// configuring the callback, the namespace and metadata of the socket. If no
@@ -37,7 +24,7 @@ pub struct ClientBuilder {
     on: Arc<Mutex<HashMap<Event, Callback<SocketCallback>>>>,
     on_any: Arc<Mutex<Option<Callback<SocketAnyCallback>>>>,
     namespace: String,
-    tls_config: Option<TlsConnector>,
+    tls_config: Option<TlsConfig>,
     opening_headers: Option<HeaderMap>,
     transport_type: TransportType,
     auth: Option<serde_json::Value>,
@@ -47,6 +34,7 @@ pub struct ClientBuilder {
     pub(crate) max_reconnect_attempts: Option<u8>,
     pub(crate) reconnect_delay_min: u64,
     pub(crate) reconnect_delay_max: u64,
+    pub(crate) randomization_factor: f64,
 }
 
 impl ClientBuilder {
@@ -98,6 +86,7 @@ impl ClientBuilder {
             max_reconnect_attempts: None,
             reconnect_delay_min: 1000,
             reconnect_delay_max: 5000,
+            randomization_factor: crate::backoff::DEFAULT_JITTER,
         }
     }
 
@@ -208,27 +197,21 @@ impl ClientBuilder {
         self
     }
 
-    /// Uses a preconfigured TLS connector for secure communication. This configures
-    /// both the `polling` as well as the `websocket` transport type.
+    /// Uses a TLS configuration for `https`/`wss` (both the `polling` and the `websocket`
+    /// transport). Accepts a [`TlsConfig`] or a backend type: `rustls::ClientConfig`
+    /// (feature `rustls`) or `native_tls::TlsConnector` (feature `native-tls`).
+    /// Without it the backend default roots are used.
     /// # Example
-    /// ```rust
-    /// use rust_socketio::{ClientBuilder, Payload};
-    /// use native_tls::TlsConnector;
+    /// ```rust,no_run
+    /// use rust_socketio::{ClientBuilder, TlsConfig};
     ///
-    /// let tls_connector =  TlsConnector::builder()
-    ///            .use_sni(true)
-    ///            .build()
-    ///            .expect("Found illegal configuration");
-    ///
-    /// let socket = ClientBuilder::new("http://localhost:4200/")
-    ///     .namespace("/admin")
-    ///     .on("error", |err, _| eprintln!("Error: {:#?}", err))
-    ///     .tls_config(tls_connector)
+    /// let pem = std::fs::read("ca.crt").unwrap();
+    /// let socket = ClientBuilder::new("https://localhost:4200/")
+    ///     .tls_config(TlsConfig::with_root_certificates_pem(&pem).unwrap())
     ///     .connect();
-    ///
     /// ```
-    pub fn tls_config(mut self, tls_config: TlsConnector) -> Self {
-        self.tls_config = Some(tls_config);
+    pub fn tls_config(mut self, tls_config: impl Into<TlsConfig>) -> Self {
+        self.tls_config = Some(tls_config.into());
         self
     }
 

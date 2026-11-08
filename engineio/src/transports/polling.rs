@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
+use crate::tls::{self, apply_reqwest_tls, TlsConfig};
 use crate::transport::Transport;
 use base64::{engine::general_purpose, Engine as _};
 use bytes::{BufMut, Bytes, BytesMut};
-use native_tls::TlsConnector;
 use reqwest::{
     blocking::{Client, ClientBuilder},
     header::HeaderMap,
@@ -21,30 +21,23 @@ impl PollingTransport {
     /// Creates an instance of `PollingTransport`.
     pub fn new(
         base_url: Url,
-        tls_config: Option<TlsConnector>,
+        tls_config: Option<TlsConfig>,
         opening_headers: Option<HeaderMap>,
-    ) -> Self {
-        let client = match (tls_config, opening_headers) {
-            (Some(config), Some(map)) => ClientBuilder::new()
-                .use_preconfigured_tls(config)
-                .default_headers(map)
-                .build()
-                .unwrap(),
-            (Some(config), None) => ClientBuilder::new()
-                .use_preconfigured_tls(config)
-                .build()
-                .unwrap(),
-            (None, Some(map)) => ClientBuilder::new().default_headers(map).build().unwrap(),
-            (None, None) => Client::new(),
-        };
+    ) -> Result<Self> {
+        tls::check_scheme(&base_url)?;
+        let mut builder = apply_reqwest_tls!(ClientBuilder::new(), tls_config.as_ref());
+        if let Some(map) = opening_headers {
+            builder = builder.default_headers(map);
+        }
+        let client = builder.build()?;
 
         let mut url = base_url;
         url.query_pairs_mut().append_pair("transport", "polling");
 
-        PollingTransport {
+        Ok(PollingTransport {
             client: Arc::new(client),
             base_url: Arc::new(RwLock::new(url)),
-        }
+        })
     }
 }
 
@@ -79,12 +72,13 @@ impl Transport for PollingTransport {
     }
 
     fn poll(&self, timeout: Duration) -> Result<Bytes> {
-        Ok(self
-            .client
-            .get(self.address()?)
-            .timeout(timeout)
-            .send()?
-            .bytes()?)
+        let response = self.client.get(self.address()?).timeout(timeout).send()?;
+        // An error status carries an error body, not a payload (same rule as the async transport).
+        let status = response.status().as_u16();
+        if status != 200 {
+            return Err(Error::IncompleteHttp(status));
+        }
+        Ok(response.bytes()?)
     }
 
     fn base_url(&self) -> Result<Url> {
@@ -111,7 +105,7 @@ mod test {
     #[test]
     fn polling_transport_base_url() -> Result<()> {
         let url = crate::test::engine_io_server()?.to_string();
-        let transport = PollingTransport::new(Url::from_str(&url[..]).unwrap(), None, None);
+        let transport = PollingTransport::new(Url::from_str(&url[..]).unwrap(), None, None)?;
         assert_eq!(
             transport.base_url()?.to_string(),
             url.clone() + "?transport=polling"
@@ -136,7 +130,7 @@ mod test {
     fn transport_debug() -> Result<()> {
         let mut url = crate::test::engine_io_server()?;
         let transport =
-            PollingTransport::new(Url::from_str(&url.to_string()[..]).unwrap(), None, None);
+            PollingTransport::new(Url::from_str(&url.to_string()[..]).unwrap(), None, None)?;
         url.query_pairs_mut().append_pair("transport", "polling");
         assert_eq!(format!("PollingTransport {{ client: {:?}, base_url: RwLock {{ data: {:?}, poisoned: false, .. }} }}", transport.client, url), format!("{:?}", transport));
         let test: Box<dyn Transport> = Box::new(transport);

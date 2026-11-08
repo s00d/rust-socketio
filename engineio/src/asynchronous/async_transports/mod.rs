@@ -1,8 +1,12 @@
 mod polling;
 mod websocket;
-mod websocket_general;
-mod websocket_secure;
 
 pub use self::polling::PollingTransport;
 pub use self::websocket::WebsocketTransport;
-pub use self::websocket_secure::WebsocketSecureTransport;
+
+/// `ws` and `wss` are one transport now; the scheme follows the URL.
+#[deprecated(
+    since = "0.7.0",
+    note = "use WebsocketTransport, it handles wss:// too"
+)]
+pub type WebsocketSecureTransport = WebsocketTransport;

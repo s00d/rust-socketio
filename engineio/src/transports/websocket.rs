@@ -1,10 +1,6 @@
 use crate::{
-    asynchronous::{
-        async_transports::WebsocketTransport as AsyncWebsocketTransport, transport::AsyncTransport,
-    },
-    error::Result,
-    transport::Transport,
-    Error,
+    asynchronous::async_transports::WebsocketTransport as AsyncWebsocketTransport, error::Result,
+    tls::TlsConfig, transport::Transport, Error,
 };
 use bytes::Bytes;
 use http::HeaderMap;
@@ -20,12 +16,24 @@ pub struct WebsocketTransport {
 
 impl WebsocketTransport {
     /// Creates an instance of `WebsocketTransport`.
-    pub fn new(base_url: Url, headers: Option<HeaderMap>) -> Result<Self> {
+    pub fn new(
+        base_url: Url,
+        tls_config: Option<TlsConfig>,
+        headers: Option<HeaderMap>,
+    ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
 
-        let inner = runtime.block_on(AsyncWebsocketTransport::new(base_url, headers))?;
+        // Same bound as the async builder: a blackholed upgrade must not hang the caller.
+        let inner = runtime.block_on(async {
+            tokio::time::timeout(
+                crate::HANDSHAKE_TIMEOUT,
+                AsyncWebsocketTransport::new(base_url, tls_config, headers),
+            )
+            .await
+            .map_err(|_| Error::IncompleteIo(std::io::ErrorKind::TimedOut.into()))?
+        })?;
 
         Ok(WebsocketTransport {
             runtime: Arc::new(runtime),
@@ -90,7 +98,7 @@ mod test {
         let url = crate::test::engine_io_server()?.to_string()
             + "engine.io/?EIO="
             + &ENGINE_IO_VERSION.to_string();
-        WebsocketTransport::new(Url::from_str(&url[..])?, None)
+        WebsocketTransport::new(Url::from_str(&url[..])?, None, None)
     }
 
     #[test]
@@ -103,16 +111,14 @@ mod test {
             .append_pair("transport", "websocket");
         url.set_scheme("ws").unwrap();
         assert_eq!(transport.base_url()?.to_string(), url.to_string());
-        transport.set_base_url(reqwest::Url::parse("https://127.0.0.1")?)?;
+        transport.set_base_url(Url::parse("https://127.0.0.1")?)?;
         assert_eq!(
             transport.base_url()?.to_string(),
             "ws://127.0.0.1/?transport=websocket"
         );
         assert_ne!(transport.base_url()?.to_string(), url.to_string());
 
-        transport.set_base_url(reqwest::Url::parse(
-            "http://127.0.0.1/?transport=websocket",
-        )?)?;
+        transport.set_base_url(Url::parse("http://127.0.0.1/?transport=websocket")?)?;
         assert_eq!(
             transport.base_url()?.to_string(),
             "ws://127.0.0.1/?transport=websocket"

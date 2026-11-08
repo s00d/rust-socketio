@@ -1,20 +1,17 @@
-use adler32::adler32;
-use async_stream::try_stream;
-use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use bytes::{BufMut, Bytes, BytesMut};
-use futures_util::{Stream, StreamExt};
+use futures_util::{stream, Stream, StreamExt};
 use http::HeaderMap;
-use native_tls::TlsConnector;
-use reqwest::{Client, ClientBuilder, Response};
+use reqwest::{Client, ClientBuilder};
 use std::fmt::Debug;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use std::{pin::Pin, sync::Arc};
 use tokio::sync::RwLock;
 use url::Url;
 
 use crate::asynchronous::generator::StreamGenerator;
-use crate::{asynchronous::transport::AsyncTransport, error::Result, Error};
+use crate::tls::{self, apply_reqwest_tls, TlsConfig};
+use crate::{error::Result, Error};
 
 /// An asynchronous polling type. Makes use of the nonblocking reqwest types and
 /// methods.
@@ -28,9 +25,9 @@ pub struct PollingTransport {
 impl PollingTransport {
     pub fn new(
         base_url: Url,
-        tls_config: Option<TlsConnector>,
+        tls_config: Option<TlsConfig>,
         opening_headers: Option<HeaderMap>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::with_timeout(base_url, tls_config, opening_headers, None)
     }
 
@@ -38,69 +35,95 @@ impl PollingTransport {
     /// `timeout`, so a silent peer or a half-open connection cannot hang a request forever.
     pub(crate) fn with_timeout(
         base_url: Url,
-        tls_config: Option<TlsConnector>,
+        tls_config: Option<TlsConfig>,
         opening_headers: Option<HeaderMap>,
         timeout: Option<Duration>,
-    ) -> Self {
-        let mut builder = ClientBuilder::new();
-        if let Some(config) = tls_config {
-            builder = builder.use_preconfigured_tls(config);
-        }
+    ) -> Result<Self> {
+        tls::check_scheme(&base_url)?;
+        let mut builder = apply_reqwest_tls!(ClientBuilder::new(), tls_config.as_ref());
         if let Some(map) = opening_headers {
             builder = builder.default_headers(map);
         }
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }
-        let client = builder.build().unwrap();
+        let client = builder.build()?;
 
         let mut url = base_url;
         url.query_pairs_mut().append_pair("transport", "polling");
 
-        PollingTransport {
+        Ok(PollingTransport {
             client: client.clone(),
             base_url: Arc::new(RwLock::new(url.clone())),
             generator: StreamGenerator::new(Self::stream(url, client)),
-        }
-    }
-
-    fn address(mut url: Url) -> Result<Url> {
-        let reader = format!("{:#?}", SystemTime::now());
-        let hash = adler32(reader.as_bytes()).unwrap();
-        url.query_pairs_mut().append_pair("t", &hash.to_string());
-        Ok(url)
-    }
-
-    fn send_request(url: Url, client: Client) -> impl Stream<Item = Result<Response>> {
-        try_stream! {
-            let address = Self::address(url);
-
-            yield client
-                .get(address?)
-                .send().await?
-        }
+        })
     }
 
     fn stream(
         url: Url,
         client: Client,
     ) -> Pin<Box<dyn Stream<Item = Result<Bytes>> + 'static + Send>> {
-        Box::pin(try_stream! {
-            loop {
-                for await elem in Self::send_request(url.clone(), client.clone()) {
-                    let response = elem?;
-                    // A non-200 reply (e.g. 400 "Session ID unknown") carries an error body, not a
-                    // payload: report it instead of handing it to the decoder.
-                    let status = response.status().as_u16();
-                    if status != 200 {
-                        Err(Error::IncompleteHttp(status))?;
-                    }
-                    // One polling response is one engine.io payload. Read the whole body: yielding
-                    // the chunks of `bytes_stream()` one by one hands partial payloads to the decoder.
-                    yield response.bytes().await?;
-                }
+        stream::try_unfold((url, client), |(url, client)| async move {
+            let response = client
+                .get(crate::util::with_timestamp(url.clone()))
+                .send()
+                .await?;
+            // A non-200 reply (e.g. 400 "Session ID unknown") carries an error body, not a
+            // payload: report it instead of handing it to the decoder.
+            let status = response.status().as_u16();
+            if status != 200 {
+                return Err(Error::IncompleteHttp(status));
             }
+            // One polling response is one engine.io payload. Read the whole body: yielding
+            // the chunks of `bytes_stream()` one by one hands partial payloads to the decoder.
+            let body = response.bytes().await?;
+            Ok(Some((body, (url, client))))
         })
+        .boxed()
+    }
+
+    pub(crate) async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
+        let data_to_send = if is_binary_att {
+            // the binary attachment gets `base64` encoded
+            let encoded = general_purpose::STANDARD.encode(data);
+            let mut packet_bytes = BytesMut::with_capacity(encoded.len() + 1);
+            packet_bytes.put_u8(b'b');
+            packet_bytes.put(encoded.as_bytes());
+            packet_bytes.freeze()
+        } else {
+            data
+        };
+
+        let address = crate::util::with_timestamp(self.base_url().await?);
+        let status = self
+            .client
+            .post(address)
+            .body(data_to_send)
+            .send()
+            .await?
+            .status()
+            .as_u16();
+
+        if status != 200 {
+            return Err(Error::IncompleteHttp(status));
+        }
+        Ok(())
+    }
+
+    pub async fn base_url(&self) -> Result<Url> {
+        Ok(self.base_url.read().await.clone())
+    }
+
+    pub async fn set_base_url(&self, base_url: Url) -> Result<()> {
+        let mut url = base_url;
+        if !url
+            .query_pairs()
+            .any(|(k, v)| k == "transport" && v == "polling")
+        {
+            url.query_pairs_mut().append_pair("transport", "polling");
+        }
+        *self.base_url.write().await = url;
+        Ok(())
     }
 }
 
@@ -115,56 +138,6 @@ impl Stream for PollingTransport {
     }
 }
 
-#[async_trait]
-impl AsyncTransport for PollingTransport {
-    async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
-        let data_to_send = if is_binary_att {
-            // the binary attachment gets `base64` encoded
-            let mut packet_bytes = BytesMut::with_capacity(data.len() + 1);
-            packet_bytes.put_u8(b'b');
-
-            let encoded_data = general_purpose::STANDARD.encode(data);
-            packet_bytes.put(encoded_data.as_bytes());
-
-            packet_bytes.freeze()
-        } else {
-            data
-        };
-
-        let status = self
-            .client
-            .post(self.address().await?)
-            .body(data_to_send)
-            .send()
-            .await?
-            .status()
-            .as_u16();
-
-        if status != 200 {
-            let error = Error::IncompleteHttp(status);
-            return Err(error);
-        }
-
-        Ok(())
-    }
-
-    async fn base_url(&self) -> Result<Url> {
-        Ok(self.base_url.read().await.clone())
-    }
-
-    async fn set_base_url(&self, base_url: Url) -> Result<()> {
-        let mut url = base_url;
-        if !url
-            .query_pairs()
-            .any(|(k, v)| k == "transport" && v == "polling")
-        {
-            url.query_pairs_mut().append_pair("transport", "polling");
-        }
-        *self.base_url.write().await = url;
-        Ok(())
-    }
-}
-
 impl Debug for PollingTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PollingTransport")
@@ -176,15 +149,13 @@ impl Debug for PollingTransport {
 
 #[cfg(test)]
 mod test {
-    use crate::asynchronous::transport::AsyncTransport;
-
     use super::*;
     use std::str::FromStr;
 
     #[tokio::test]
     async fn polling_transport_base_url() -> Result<()> {
         let url = crate::test::engine_io_server()?.to_string();
-        let transport = PollingTransport::new(Url::from_str(&url[..]).unwrap(), None, None);
+        let transport = PollingTransport::new(Url::from_str(&url[..]).unwrap(), None, None)?;
         assert_eq!(
             transport.base_url().await?.to_string(),
             url.clone() + "?transport=polling"
@@ -216,7 +187,7 @@ mod test {
         url.query_pairs_mut()
             .append_pair("EIO", "4")
             .append_pair("sid", "unknown-session");
-        let mut transport = PollingTransport::new(url, None, None);
+        let mut transport = PollingTransport::new(url, None, None).unwrap();
 
         // engine.io answers an unknown sid with 400 and a JSON error body.
         match transport.next().await {

@@ -96,6 +96,11 @@ impl TryFrom<Packet> for HandshakePacket {
 }
 
 impl Packet {
+    /// The text encoding of a packet with string data (`2probe`, `5`).
+    pub(crate) fn text(packet_id: PacketId, data: &str) -> String {
+        format!("{packet_id}{data}")
+    }
+
     /// Creates a new `Packet`.
     pub fn new<T: Into<Bytes>>(packet_id: PacketId, data: T) -> Self {
         Packet {

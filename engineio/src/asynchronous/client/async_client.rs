@@ -1,11 +1,13 @@
 use std::{fmt::Debug, pin::Pin};
 
 use crate::{
-    asynchronous::{async_socket::Socket as InnerSocket, generator::StreamGenerator},
+    asynchronous::{
+        async_socket::Socket as InnerSocket,
+        generator::{end_after_error, StreamGenerator},
+    },
     error::Result,
     Packet,
 };
-use async_stream::try_stream;
 use futures_util::{Stream, StreamExt};
 
 /// An engine.io client that allows interaction with the connected engine.io
@@ -50,17 +52,18 @@ impl Client {
     }
 
     /// Static method that returns a generator for each element of the stream.
-    fn stream(
-        socket: InnerSocket,
-    ) -> Pin<Box<impl Stream<Item = Result<Packet>> + 'static + Send>> {
-        Box::pin(try_stream! {
+    fn stream(socket: InnerSocket) -> Pin<Box<dyn Stream<Item = Result<Packet>> + 'static + Send>> {
+        // Each packet is handled (pong, close, callbacks) before it is passed on; a failed
+        // handling ends the stream like a transport error.
+        let handled = socket.as_stream().then(move |item| {
             let socket = socket.clone();
-            for await item in socket.as_stream() {
+            async move {
                 let packet = item?;
                 socket.handle_incoming_packet(packet.clone()).await?;
-                yield packet;
+                Ok(packet)
             }
-        })
+        });
+        end_after_error(handled.boxed()).boxed()
     }
 
     /// Check if the underlying transport client is connected.
@@ -100,7 +103,6 @@ mod test {
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
-    use native_tls::TlsConnector;
     use url::Url;
 
     /// The purpose of this test is to check whether the Client is properly cloneable or not.
@@ -354,11 +356,12 @@ mod test {
         test_connection(socket).await
     }
 
+    #[cfg(any(feature = "rustls", feature = "native-tls"))]
     #[tokio::test]
     async fn test_connection_dynamic_secure() -> Result<()> {
         let url = crate::test::engine_io_server_secure()?;
         let mut socket_builder = builder(url);
-        socket_builder = socket_builder.tls_config(crate::test::tls_connector()?);
+        socket_builder = socket_builder.tls_config(crate::test::tls_config()?);
         let socket = socket_builder.build().await?;
         test_connection(socket).await
     }
@@ -370,6 +373,7 @@ mod test {
         test_connection(socket).await
     }
 
+    #[cfg(any(feature = "rustls", feature = "native-tls"))]
     #[tokio::test]
     async fn test_connection_wss() -> Result<()> {
         let url = crate::test::engine_io_polling_server()?;
@@ -383,7 +387,7 @@ mod test {
         headers.insert(HOST, host);
         let mut builder = builder(url.clone());
 
-        builder = builder.tls_config(crate::test::tls_connector()?);
+        builder = builder.tls_config(crate::test::tls_config()?);
         builder = builder.headers(headers.clone());
         let socket = builder.clone().build_websocket_with_upgrade().await?;
 
@@ -396,7 +400,7 @@ mod test {
         url.set_scheme("wss").unwrap();
 
         let builder = self::builder(url)
-            .tls_config(crate::test::tls_connector()?)
+            .tls_config(crate::test::tls_config()?)
             .headers(headers);
         let socket = builder.clone().build_websocket().await?;
 
@@ -460,15 +464,7 @@ mod test {
             std::env::var("ENGINE_IO_SECURE_HOST").unwrap_or_else(|_| "localhost".to_owned());
         headers.insert(HOST, host);
 
-        let _ = builder(url.clone())
-            .tls_config(
-                TlsConnector::builder()
-                    .danger_accept_invalid_certs(true)
-                    .build()
-                    .unwrap(),
-            )
-            .build()
-            .await?;
+        let _ = builder(url.clone()).build().await?;
         let _ = builder(url).headers(headers).build().await?;
         Ok(())
     }

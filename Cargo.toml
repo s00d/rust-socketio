@@ -1,2 +1,27 @@
 [workspace]
 members = ["engineio", "socketio"]
+resolver = "3"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/s00d/rust-socketio"
+
+[workspace.dependencies]
+base64 = "0.22.1"
+bytes = "1.10"
+futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
+http = "1.3"
+log = "0.4.27"
+native-tls = "0.2.14"
+reqwest = { version = "0.13", default-features = false }
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1.12", features = ["std"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0"
+tokio = "1.45"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+url = "2.5.4"
+webpki-roots = "1.0"

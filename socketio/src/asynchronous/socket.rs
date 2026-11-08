@@ -1,12 +1,11 @@
-use super::generator::StreamGenerator;
+use super::generator::{end_after_error, StreamGenerator};
 use crate::{
     error::Result,
     packet::{Packet, PacketId},
     Error, Event, Payload,
 };
-use async_stream::try_stream;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
+use futures_util::{stream, Stream, StreamExt};
 use rust_engineio::{
     asynchronous::Client as EngineClient, Packet as EnginePacket, PacketId as EnginePacketId,
 };
@@ -128,37 +127,57 @@ impl Socket {
         client: EngineClient,
         is_connected: Arc<AtomicBool>,
         send_buffer: Arc<Mutex<SendBuffer>>,
-    ) -> Pin<Box<impl Stream<Item = Result<Packet>> + Send>> {
-        Box::pin(try_stream! {
-                for await received_data in client.clone() {
-                    let packet = received_data?;
-
-                    if packet.packet_id == EnginePacketId::Message
-                        || packet.packet_id == EnginePacketId::MessageBinary
-                    {
-                        let packet = Self::handle_engineio_packet(packet, client.clone()).await?;
-                        match packet.packet_type {
-                            PacketId::Connect => {
-                                // Flush under the buffer lock: a concurrent send() either got
-                                // buffered before this or sends after the flush, so order holds.
-                                let mut buffer = send_buffer.lock().await;
-                                is_connected.store(true, Ordering::Release);
-                                for buffered in std::mem::take(&mut buffer.packets) {
-                                    Self::send_packet(&client, buffered).await?;
-                                }
-                            }
-                            PacketId::ConnectError | PacketId::Disconnect => {
-                                let mut buffer = send_buffer.lock().await;
-                                buffer.closed = true;
-                                is_connected.store(false, Ordering::Release);
-                            }
-                            _ => (),
+    ) -> Pin<Box<dyn Stream<Item = Result<Packet>> + Send>> {
+        let packets = stream::unfold(
+            (client, is_connected, send_buffer),
+            |(mut client, is_connected, send_buffer)| async move {
+                loop {
+                    let packet = match client.next().await? {
+                        Ok(packet) => packet,
+                        Err(err) => {
+                            return Some((Err(err.into()), (client, is_connected, send_buffer)))
                         }
-
-                        yield packet;
+                    };
+                    if packet.packet_id != EnginePacketId::Message
+                        && packet.packet_id != EnginePacketId::MessageBinary
+                    {
+                        continue;
                     }
+                    let result =
+                        Self::handle_message(packet, &client, &is_connected, &send_buffer).await;
+                    return Some((result, (client, is_connected, send_buffer)));
                 }
-        })
+            },
+        );
+        end_after_error(packets.boxed()).boxed()
+    }
+
+    /// Decodes one socket.io packet (with its attachments) and keeps the namespace state.
+    async fn handle_message(
+        packet: EnginePacket,
+        client: &EngineClient,
+        is_connected: &AtomicBool,
+        send_buffer: &Mutex<SendBuffer>,
+    ) -> Result<Packet> {
+        let packet = Self::handle_engineio_packet(packet, client.clone()).await?;
+        match packet.packet_type {
+            PacketId::Connect => {
+                // Flush under the buffer lock: a concurrent send() either got
+                // buffered before this or sends after the flush, so order holds.
+                let mut buffer = send_buffer.lock().await;
+                is_connected.store(true, Ordering::Release);
+                for buffered in std::mem::take(&mut buffer.packets) {
+                    Self::send_packet(client, buffered).await?;
+                }
+            }
+            PacketId::ConnectError | PacketId::Disconnect => {
+                let mut buffer = send_buffer.lock().await;
+                buffer.closed = true;
+                is_connected.store(false, Ordering::Release);
+            }
+            _ => (),
+        }
+        Ok(packet)
     }
 
     /// Handles new incoming engineio packets

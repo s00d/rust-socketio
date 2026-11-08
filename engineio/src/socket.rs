@@ -72,7 +72,7 @@ impl Socket {
         self.connected.store(true, Ordering::Release);
 
         if let Some(on_open) = self.on_open.as_ref() {
-            spawn_scoped!(on_open(()));
+            on_open(());
         }
 
         // set the last ping to now and set the connected state
@@ -86,7 +86,7 @@ impl Socket {
 
     pub fn disconnect(&self) -> Result<()> {
         if let Some(on_close) = self.on_close.as_ref() {
-            spawn_scoped!(on_close(()));
+            on_close(());
         }
 
         // will not succeed when connection to the server is interrupted
@@ -171,7 +171,7 @@ impl Socket {
     #[inline]
     fn call_error_callback(&self, text: String) {
         if let Some(function) = self.on_error.as_ref() {
-            spawn_scoped!(function(text));
+            function(text);
         }
     }
 
@@ -204,26 +204,25 @@ impl Socket {
 
     pub(crate) fn handle_packet(&self, packet: Packet) {
         if let Some(on_packet) = self.on_packet.as_ref() {
-            spawn_scoped!(on_packet(packet));
+            on_packet(packet);
         }
     }
 
     pub(crate) fn handle_data(&self, data: Bytes) {
         if let Some(on_data) = self.on_data.as_ref() {
-            spawn_scoped!(on_data(data));
+            on_data(data);
         }
     }
 
     pub(crate) fn handle_close(&self) {
         if let Some(on_close) = self.on_close.as_ref() {
-            spawn_scoped!(on_close(()));
+            on_close(());
         }
 
         self.connected.store(false, Ordering::Release);
     }
 }
 
-#[cfg_attr(tarpaulin, ignore)]
 impl Debug for Socket {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_fmt(format_args!(
