@@ -40,7 +40,7 @@ pub use builder::ClientBuilder;
 pub use client::Client;
 pub use error::{Error, Result};
 pub use tls::TlsConfig;
-pub use transport::{Transport, TransportKind};
+pub use transport::{Frame, Transport, TransportKind};
 
 /// The engine.io protocol revision this client speaks (`EIO=4`).
 pub const ENGINE_IO_VERSION: i32 = 4;

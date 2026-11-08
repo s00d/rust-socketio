@@ -35,7 +35,7 @@ pub struct Packet {
     pub nsp: String,
     /// The JSON payload as text, placeholders included.
     pub data: Option<String>,
-    pub id: Option<i32>,
+    pub id: Option<u64>,
     pub attachment_count: u8,
     pub attachments: Option<Vec<Bytes>>,
 }
@@ -105,7 +105,7 @@ fn reconstruct(args: Vec<Value>, mut attachments: Vec<Bytes>) -> Result<Payload>
 
 impl Packet {
     /// An EVENT (or BINARY_EVENT when the payload carries buffers) for `event`.
-    pub fn new_event(payload: Payload, event: &str, nsp: &str, id: Option<i32>) -> Result<Packet> {
+    pub fn new_event(payload: Payload, event: &str, nsp: &str, id: Option<u64>) -> Result<Packet> {
         let (args, attachments) = deconstruct(payload)?;
         let mut data = Vec::with_capacity(args.len() + 1);
         data.push(Value::String(event.to_owned()));
@@ -120,7 +120,7 @@ impl Packet {
     }
 
     /// The ACK (or BINARY_ACK) that answers the server's event `id`.
-    pub fn new_ack(payload: Payload, nsp: &str, id: i32) -> Result<Packet> {
+    pub fn new_ack(payload: Payload, nsp: &str, id: u64) -> Result<Packet> {
         let (args, attachments) = deconstruct(payload)?;
         Ok(Self::with_attachments(
             (PacketId::Ack, PacketId::BinaryAck),
@@ -135,7 +135,7 @@ impl Packet {
         (text, binary): (PacketId, PacketId),
         nsp: &str,
         data: Value,
-        id: Option<i32>,
+        id: Option<u64>,
         attachments: Vec<Bytes>,
     ) -> Packet {
         let (packet_type, count, attachments) = if attachments.is_empty() {
@@ -247,7 +247,7 @@ impl Packet {
         packet_type: PacketId,
         nsp: String,
         data: Option<String>,
-        id: Option<i32>,
+        id: Option<u64>,
         attachment_count: u8,
         attachments: Option<Vec<Bytes>>,
     ) -> Self {

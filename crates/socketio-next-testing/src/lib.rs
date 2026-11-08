@@ -77,6 +77,7 @@ struct ProxyState {
     cut: Notify,
     freeze: Notify,
     refuse: AtomicBool,
+    block_websocket: AtomicBool,
     accepted: AtomicUsize,
     open: AtomicUsize,
 }
@@ -105,6 +106,21 @@ impl Proxy {
                     let Ok(mut outbound) = TcpStream::connect(&target).await else {
                         return;
                     };
+                    if state.block_websocket.load(Ordering::SeqCst) {
+                        // read the request head; a websocket upgrade is swallowed (blackholed)
+                        let mut head = vec![0u8; 4096];
+                        let Ok(n) = inbound.read(&mut head).await else {
+                            return;
+                        };
+                        let text = String::from_utf8_lossy(&head[..n]).to_ascii_lowercase();
+                        if text.contains("upgrade: websocket") {
+                            state.cut.notified().await;
+                            return;
+                        }
+                        if outbound.write_all(&head[..n]).await.is_err() {
+                            return;
+                        }
+                    }
                     state.open.fetch_add(1, Ordering::SeqCst);
                     let cut = state.cut.notified();
                     let freeze = state.freeze.notified();
@@ -136,6 +152,12 @@ impl Proxy {
     /// link), until [`cut`](Self::cut).
     pub fn freeze(&self) {
         self.state.freeze.notify_waiters();
+    }
+
+    /// Swallow websocket upgrade requests on new connections (a proxy that blackholes
+    /// websockets); other HTTP requests pass.
+    pub fn block_websocket(&self, block: bool) {
+        self.state.block_websocket.store(block, Ordering::SeqCst);
     }
 
     /// Refuse (true) or accept (false) new connections.

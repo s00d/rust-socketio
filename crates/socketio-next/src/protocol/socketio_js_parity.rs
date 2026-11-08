@@ -10,7 +10,7 @@ fn decode(raw: &str) -> std::result::Result<Packet, String> {
 }
 
 /// Decodes `raw`, checks the fields and that encoding gives `raw` back.
-fn roundtrip(raw: &str, packet_type: PacketId, nsp: &str, data: Option<&str>, id: Option<i32>) {
+fn roundtrip(raw: &str, packet_type: PacketId, nsp: &str, data: Option<&str>, id: Option<u64>) {
     let packet = decode(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
     assert_eq!(packet.packet_type, packet_type, "{raw}");
     assert_eq!(packet.nsp, nsp, "{raw}");

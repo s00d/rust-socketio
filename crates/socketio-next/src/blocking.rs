@@ -235,8 +235,9 @@ where
     }
 }
 
-/// The blocking client. Cheap to clone; dropping the last clone the user holds closes the
-/// connection and stops the runtime.
+/// The blocking client. Cheap to clone; dropping the last clone the user holds disconnects
+/// (bounded, as [`Client::disconnect`]) and stops the runtime. The clients handed to handlers
+/// are for the duration of the call; do not keep them after the last user handle is gone.
 #[derive(Clone)]
 pub struct Client {
     inner: crate::Client,
@@ -247,6 +248,23 @@ pub struct Client {
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Client").field(&self.inner).finish()
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // The last user handle: say goodbye before the runtime goes (not possible from inside
+        // an async context, where the drop just closes the connection).
+        let last = self
+            ._runtime
+            .as_ref()
+            .is_some_and(|runtime| Arc::strong_count(runtime) == 1);
+        if last && Handle::try_current().is_err() && !self.inner.state().is_closed() {
+            let inner = self.inner.clone();
+            self.handle.block_on(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(3), inner.disconnect()).await;
+            });
+        }
     }
 }
 

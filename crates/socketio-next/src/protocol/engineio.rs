@@ -58,13 +58,13 @@ impl TryFrom<u8> for PacketId {
     /// Converts a byte into the corresponding `PacketId`.
     fn try_from(b: u8) -> Result<PacketId> {
         match b {
-            0 | b'0' => Ok(PacketId::Open),
-            1 | b'1' => Ok(PacketId::Close),
-            2 | b'2' => Ok(PacketId::Ping),
-            3 | b'3' => Ok(PacketId::Pong),
-            4 | b'4' => Ok(PacketId::Message),
-            5 | b'5' => Ok(PacketId::Upgrade),
-            6 | b'6' => Ok(PacketId::Noop),
+            b'0' => Ok(PacketId::Open),
+            b'1' => Ok(PacketId::Close),
+            b'2' => Ok(PacketId::Ping),
+            b'3' => Ok(PacketId::Pong),
+            b'4' => Ok(PacketId::Message),
+            b'5' => Ok(PacketId::Upgrade),
+            b'6' => Ok(PacketId::Noop),
             _ => Err(Error::InvalidPacketType(b as char)),
         }
     }
@@ -136,10 +136,7 @@ impl TryFrom<Bytes> for Packet {
             (*bytes.first().ok_or(Error::IncompletePacket)?).try_into()?
         };
 
-        if bytes.len() == 1 && packet_id == PacketId::Message {
-            return Err(Error::IncompletePacket);
-        }
-
+        // `4` alone is a message with empty data (engine.io-parser accepts it).
         let data: Bytes = bytes.slice(1..);
 
         Ok(Packet {
@@ -212,14 +209,13 @@ impl TryFrom<Batch> for Bytes {
     /// `\x30`.
     fn try_from(packets: Batch) -> Result<Self> {
         let mut buf = BytesMut::new();
-        for packet in packets {
-            // at the moment no base64 encoding is used
-            buf.extend(Bytes::from(packet.clone()));
-            buf.put_u8(Batch::SEPARATOR as u8);
+        for (i, packet) in packets.into_iter().enumerate() {
+            if i > 0 {
+                buf.put_u8(Batch::SEPARATOR as u8);
+            }
+            // binary packets go as `b` + base64 (engine.io-parser encodePayload)
+            buf.extend(Bytes::from(packet));
         }
-
-        // remove the last separator
-        let _ = buf.split_off(buf.len() - 1);
         Ok(buf.freeze())
     }
 }
@@ -321,10 +317,11 @@ mod tests {
 
     #[test]
     fn test_packet_id_conversion_and_incompl_packet() -> Result<()> {
-        let sut = Packet::try_from(Bytes::from_static(b"4"));
-        assert!(sut.is_err());
-        let _sut = sut.unwrap_err();
-        assert!(matches!(Error::IncompletePacket, _sut));
+        // engine.io-parser: an empty input is an error, `4` alone an empty message
+        assert!(matches!(
+            Packet::try_from(Bytes::new()),
+            Err(Error::IncompletePacket)
+        ));
 
         assert_eq!(PacketId::MessageBinary.to_string(), "b");
 
@@ -356,6 +353,13 @@ mod tests {
         assert_eq!(sut, PacketId::Noop);
         assert_eq!(sut.to_string(), "6");
 
+        // raw bytes are not packet types (only the ASCII digits are)
+        assert!(PacketId::try_from(4u8).is_err());
+        assert_eq!(
+            Packet::try_from(Bytes::from_static(b"4")).unwrap(),
+            Packet::new(PacketId::Message, Bytes::new())
+        );
+        assert_eq!(Bytes::try_from(Batch(Vec::new())).unwrap(), Bytes::new());
         let sut = PacketId::try_from(42);
         assert!(sut.is_err());
         assert!(matches!(sut.unwrap_err(), Error::InvalidPacketType('*')));

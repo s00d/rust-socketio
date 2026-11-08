@@ -13,6 +13,9 @@ use crate::engineio::generator::StreamGenerator;
 use crate::engineio::tls::{self, TlsConfig, apply_reqwest_tls};
 use crate::engineio::{Error, error::Result};
 
+/// Largest polling response body read.
+const MAX_BODY: usize = 64 << 20;
+
 /// An asynchronous polling type. Makes use of the nonblocking reqwest types and
 /// methods.
 #[derive(Clone)]
@@ -76,8 +79,19 @@ impl PollingTransport {
             }
             // One polling response is one engine.io payload. Read the whole body: yielding
             // the chunks of `bytes_stream()` one by one hands partial payloads to the decoder.
-            let body = response.bytes().await?;
-            Ok(Some((body, (url, client))))
+            // Bounded like a websocket message (tungstenite's 64 MiB default): a server that
+            // streams without end must not exhaust memory.
+            let mut response = response;
+            let mut body = bytes::BytesMut::new();
+            while let Some(chunk) = response.chunk().await? {
+                if body.len() + chunk.len() > MAX_BODY {
+                    return Err(Error::Protocol(crate::protocol::Error::InvalidPacket(
+                        "polling response larger than 64 MiB",
+                    )));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(Some((body.freeze(), (url, client))))
         })
         .boxed()
     }
@@ -140,9 +154,13 @@ impl Stream for PollingTransport {
 
 impl Debug for PollingTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The URL carries query tokens and the client its default headers: neither is printed.
+        let url = self.base_url.try_read().map_or_else(
+            |_| "<busy>".to_owned(),
+            |url| crate::redact::url(&url, true),
+        );
         f.debug_struct("PollingTransport")
-            .field("client", &self.client)
-            .field("base_url", &self.base_url)
+            .field("base_url", &url)
             .finish()
     }
 }

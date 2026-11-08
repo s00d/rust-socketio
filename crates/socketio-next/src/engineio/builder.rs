@@ -10,6 +10,7 @@ use crate::engineio::callback::{Callbacks, boxed};
 use crate::engineio::error::Result;
 use crate::engineio::socket::Socket as InnerSocket;
 use crate::engineio::tls::{self, TlsConfig};
+use crate::engineio::transport::Frame;
 use crate::engineio::transports::{PollingTransport, WebsocketTransport};
 use crate::engineio::{
     Client, DEFAULT_TIMEOUT, ENGINE_IO_VERSION, Error, HandshakePacket, Packet, PacketId,
@@ -18,7 +19,7 @@ use crate::engineio::{
 /// Configures and opens an engine.io [`Client`].
 ///
 /// `build*` performs the handshake; [`Client::connect`] then starts the session.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ClientBuilder {
     url: Url,
     tls_config: Option<TlsConfig>,
@@ -26,6 +27,28 @@ pub struct ClientBuilder {
     timeout: Duration,
     handshake: Option<HandshakePacket>,
     callbacks: Callbacks,
+}
+
+impl std::fmt::Debug for ClientBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // query values and header values may be secrets
+        f.debug_struct("ClientBuilder")
+            .field("url", &crate::redact::url(&self.url, true))
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .flat_map(|h| h.keys())
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("tls_config", &self.tls_config)
+            .field("timeout", &self.timeout)
+            .field("handshake", &self.handshake.is_some())
+            .field("callbacks", &self.callbacks)
+            .finish()
+    }
 }
 
 impl ClientBuilder {
@@ -118,9 +141,10 @@ impl ClientBuilder {
     }
 
     /// Reads the open packet from `transport` and adds the sid to the URL.
-    async fn handshake_with_transport<T>(&mut self, transport: &mut T) -> Result<()>
+    async fn handshake_with_transport<T, I>(&mut self, transport: &mut T) -> Result<()>
     where
-        T: Stream<Item = Result<Bytes>> + Unpin,
+        T: Stream<Item = Result<I>> + Unpin,
+        I: Into<Frame>,
     {
         if self.handshake.is_some() {
             return Ok(());
@@ -128,7 +152,14 @@ impl ClientBuilder {
         let first = transport.next().await.ok_or_else(|| {
             Error::InvalidHandshake("the connection closed before the open packet".into())
         })??;
-        let handshake = parse_handshake(first)?;
+        let handshake = match first.into() {
+            Frame::Text(bytes) => parse_handshake(bytes)?,
+            Frame::Binary(_) => {
+                return Err(Error::InvalidHandshake(
+                    "binary frame instead of the open packet".into(),
+                ));
+            }
+        };
         self.url
             .query_pairs_mut()
             .append_pair("sid", &handshake.sid);
@@ -241,15 +272,22 @@ impl ClientBuilder {
             .map_err(|_| Error::Timeout(timeout))?
     }
 
-    /// [`build`](Self::build), falling back to polling when the websocket fails.
-    pub async fn build_with_fallback(self) -> Result<Client> {
-        match self.clone().build().await {
-            Ok(client) => Ok(client),
-            Err(err) => {
-                tracing::debug!(error = %err, "websocket failed, falling back to polling");
-                self.build_polling().await
+    /// Polling handshake, then the websocket upgrade within half the timeout; when the upgrade
+    /// fails (blocked or blackholed websocket) the session stays on polling with the same sid,
+    /// as engine.io-client does after a failed probe.
+    pub async fn build_with_fallback(mut self) -> Result<Client> {
+        self.handshake().await?;
+        if self.websocket_upgrade() {
+            let mut upgrade = self.clone();
+            upgrade.timeout = self.timeout / 2;
+            match upgrade.build_websocket().await {
+                Ok(client) => return Ok(client),
+                Err(err) => {
+                    tracing::debug!(error = %err, "websocket upgrade failed, staying on polling");
+                }
             }
         }
+        self.build_polling().await
     }
 
     fn websocket_upgrade(&self) -> bool {

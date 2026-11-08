@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -94,8 +94,8 @@ pub(crate) struct Actor {
     state: watch::Sender<ConnectionState>,
     dispatch: mpsc::UnboundedSender<Dispatch>,
     shared: Arc<Shared>,
-    acks: HashMap<i32, PendingAck>,
-    next_ack_id: i32,
+    acks: HashMap<u64, PendingAck>,
+    next_ack_id: u64,
     buffer: VecDeque<Packet>,
     /// Connection state recovery: the server's private session id and the last offset.
     pid: Option<String>,
@@ -336,7 +336,10 @@ impl Actor {
                                     self.shared.link().last_ping_at = Some(now);
                                 }
                                 EnginePacketId::Message | EnginePacketId::MessageBinary => {
-                                    if let Some(outcome) = self.on_message(packet.data, &mut partial) {
+                                    let binary = packet.packet_id == EnginePacketId::MessageBinary;
+                                    if let Some(outcome) =
+                                        self.on_message(packet.data, binary, &mut partial)
+                                    {
                                         return outcome;
                                     }
                                 }
@@ -389,12 +392,28 @@ impl Actor {
         self.update_counts();
     }
 
-    /// One engine.io message: a socket.io packet or one of its binary attachments.
+    /// One engine.io message: a socket.io packet (text) or one of its attachments (binary).
+    /// Like socket.io-parser, text while attachments are pending and binary without a pending
+    /// packet are protocol errors.
     fn on_message(
         &mut self,
         data: Bytes,
+        binary: bool,
         partial: &mut Option<(Packet, Vec<Bytes>)>,
     ) -> Option<Outcome> {
+        let parse_error = |what: &'static str| {
+            Some(Outcome::Lost(
+                DisconnectReason::ParseError,
+                Some(crate::protocol::Error::InvalidPacket(what).into()),
+            ))
+        };
+        match (partial.is_some(), binary) {
+            (true, false) => return parse_error("got plaintext data when reconstructing a packet"),
+            (false, true) => {
+                return parse_error("got binary data when not reconstructing a packet");
+            }
+            _ => {}
+        }
         if let Some((mut packet, mut attachments)) = partial.take() {
             attachments.push(data);
             if attachments.len() < usize::from(packet.attachment_count) {
@@ -433,9 +452,7 @@ impl Actor {
             attachments = packet.attachment_count,
             "socket.io <-"
         );
-        if let Some(inspector) = &self.config.inspector {
-            inspector(Direction::Incoming, &packet);
-        }
+        inspect(&self.config, Direction::Incoming, &packet);
         if *packet.nsp != *self.nsp {
             return None;
         }
@@ -485,15 +502,15 @@ impl Actor {
         None
     }
 
-    fn register_ack(&mut self, reply: AckReply, timeout: Duration) -> i32 {
-        // Unique per client like socket.io-client's counter; wraps instead of overflowing.
+    fn register_ack(&mut self, reply: AckReply, timeout: Duration) -> u64 {
+        // Unique per client like socket.io-client's counter (u64: never wraps in practice).
         let id = self.next_ack_id;
-        self.next_ack_id = self.next_ack_id.wrapping_add(1) & i32::MAX;
+        self.next_ack_id += 1;
         self.acks.insert(
             id,
             PendingAck {
                 reply,
-                deadline: Instant::now() + timeout,
+                deadline: deadline(timeout),
                 timeout,
             },
         );
@@ -515,13 +532,14 @@ impl Actor {
         }
     }
 
+    // ponytail: O(pending acks) per loop turn; a deadline heap if thousands of acks are pending.
     fn next_ack_deadline(&self) -> Option<Instant> {
         self.acks.values().map(|ack| ack.deadline).min()
     }
 
     fn expire_acks(&mut self) {
         let now = Instant::now();
-        let expired: Vec<i32> = self
+        let expired: Vec<u64> = self
             .acks
             .iter()
             .filter(|(_, ack)| ack.deadline <= now)
@@ -546,8 +564,8 @@ impl Actor {
             link.engine_sid = None;
             link.transport = None;
         }
-        let buffered: Vec<i32> = self.buffer.iter().filter_map(|p| p.id).collect();
-        let failed: Vec<i32> = self
+        let buffered: Vec<u64> = self.buffer.iter().filter_map(|p| p.id).collect();
+        let failed: Vec<u64> = self
             .acks
             .keys()
             .filter(|id| !buffered.contains(id))
@@ -595,9 +613,7 @@ impl Actor {
             attachments = packet.attachment_count,
             "socket.io ->"
         );
-        if let Some(inspector) = &self.config.inspector {
-            inspector(Direction::Outgoing, &packet);
-        }
+        inspect(&self.config, Direction::Outgoing, &packet);
         let Some(writer) = &conn.writer_tx else {
             return;
         };
@@ -643,6 +659,26 @@ impl Actor {
     }
 }
 
+/// `now + timeout`, saturating (a `Duration::MAX` timeout means "about never", not a panic).
+fn deadline(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
+}
+
+/// Runs the packet inspector; a panicking inspector is logged, not fatal.
+fn inspect(config: &Config, direction: Direction, packet: &Packet) {
+    if let Some(inspector) = &config.inspector {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inspector(direction, packet)
+        }))
+        .is_err()
+        {
+            tracing::error!("the packet inspector panicked");
+        }
+    }
+}
+
 fn finish(done: Option<oneshot::Sender<()>>) {
     if let Some(done) = done {
         let _ = done.send(());
@@ -658,7 +694,7 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
 
 fn reason_for_attempt_error(err: &Error) -> DisconnectReason {
     match err {
-        Error::ConnectRejected { .. } | Error::IncompatibleServer => {
+        Error::ConnectRejected { .. } | Error::IncompatibleServer | Error::InvalidAuth(_) => {
             DisconnectReason::ConnectRejected
         }
         Error::Protocol(_) => DisconnectReason::ParseError,
@@ -718,9 +754,20 @@ async fn attempt_connect(
     let timeout = config.timeout;
     let attempt = async move {
         let auth = match &config.auth_fn {
-            Some(auth_fn) => Some(auth_fn().await),
+            Some(auth_fn) => {
+                let auth = std::panic::AssertUnwindSafe(auth_fn())
+                    .catch_unwind()
+                    .await
+                    .map_err(|_| Error::InvalidAuth("the auth_with function panicked"))?;
+                Some(auth)
+            }
             None => config.auth.clone(),
         };
+        // socket.io requires an object (socket.io-parser rejects anything else and the server
+        // closes the connection)
+        if auth.as_ref().is_some_and(|a| !a.is_object()) {
+            return Err(Error::InvalidAuth("the auth payload must be a JSON object"));
+        }
         let auth = connect_payload(auth, pid.as_deref(), offset.as_deref());
         attempt_connect_unbounded(config, url, nsp, auth).await
     };
@@ -771,9 +818,7 @@ async fn attempt_connect_unbounded(
         0,
         None,
     );
-    if let Some(inspector) = &config.inspector {
-        inspector(Direction::Outgoing, &connect);
-    }
+    inspect(&config, Direction::Outgoing, &connect);
     if let Some(writer) = &conn.writer_tx {
         let _ = writer.send(engineio::Packet::new(
             EnginePacketId::Message,
@@ -791,9 +836,7 @@ async fn attempt_connect_unbounded(
                 continue;
             }
             let packet = Packet::try_from(&packet.data)?;
-            if let Some(inspector) = &config.inspector {
-                inspector(Direction::Incoming, &packet);
-            }
+            inspect(&config, Direction::Incoming, &packet);
             if *packet.nsp != *nsp {
                 continue;
             }
@@ -836,8 +879,16 @@ async fn writer_task(
     mut rx: mpsc::UnboundedReceiver<engineio::Packet>,
     failed: oneshot::Sender<engineio::Error>,
 ) {
-    while let Some(packet) = rx.recv().await {
-        if let Err(err) = engine.emit(packet).await {
+    while let Some(first) = rx.recv().await {
+        // whatever queued up meanwhile goes in the same request (polling)
+        let mut batch = vec![first];
+        while batch.len() < 512 {
+            match rx.try_recv() {
+                Ok(packet) => batch.push(packet),
+                Err(_) => break,
+            }
+        }
+        if let Err(err) = engine.emit_all(batch).await {
             let _ = failed.send(err);
             return;
         }

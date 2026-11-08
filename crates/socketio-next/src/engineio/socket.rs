@@ -12,7 +12,7 @@ use tokio::time::Instant;
 use crate::engineio::callback::Callbacks;
 use crate::engineio::error::Result;
 use crate::engineio::generator::end_after_error;
-use crate::engineio::transport::Transport;
+use crate::engineio::transport::{Frame, Transport};
 use crate::engineio::{Error, HandshakePacket, Packet, PacketId};
 
 /// The engine.io session: transport, heartbeat state and callbacks. Clones share all state.
@@ -101,12 +101,13 @@ impl Socket {
         Ok(())
     }
 
-    /// A polling body joins packets with 0x1e; a websocket frame is a single packet.
-    fn parse_payload(bytes: Bytes, is_polling: bool) -> Result<Vec<Packet>> {
-        let batch = if is_polling {
-            Batch::try_from(bytes)?
-        } else {
-            Batch::from(Packet::try_from(bytes)?)
+    /// A polling body joins packets with 0x1e; a websocket text frame is one packet; a
+    /// websocket binary frame is the data of one binary message.
+    fn parse_payload(frame: Frame, is_polling: bool) -> Result<Vec<Packet>> {
+        let batch = match frame {
+            Frame::Text(bytes) if is_polling => Batch::try_from(bytes)?,
+            Frame::Text(bytes) => Batch::from(Packet::try_from(bytes)?),
+            Frame::Binary(data) => Batch::from(Packet::new(PacketId::MessageBinary, data)),
         };
         Ok(batch.into_iter().collect())
     }
@@ -117,7 +118,7 @@ impl Socket {
     ) -> Pin<Box<dyn Stream<Item = Result<Packet>> + 'static + Send>> {
         let is_polling = transport.kind().is_polling();
         let packets = transport.flat_map(move |payload| {
-            let packets = match payload.and_then(|bytes| Self::parse_payload(bytes, is_polling)) {
+            let packets = match payload.and_then(|frame| Self::parse_payload(frame, is_polling)) {
                 Ok(packets) => packets.into_iter().map(Ok).collect(),
                 Err(err) => vec![Err(err)],
             };
@@ -167,6 +168,31 @@ impl Socket {
         if let Err(error) = self.transport.emit(data, is_binary).await {
             Callbacks::fire(&self.callbacks.on_error, error.to_string());
             return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Sends several packets: one POST per `maxPayload`-sized batch over polling (like
+    /// engine.io-client's write buffer), one frame each over websocket.
+    pub(crate) async fn emit_all(&self, packets: Vec<Packet>) -> Result<()> {
+        if !self.transport.kind().is_polling() || packets.len() == 1 {
+            for packet in packets {
+                self.emit(packet).await?;
+            }
+            return Ok(());
+        }
+        if !self.connected.load(Ordering::Acquire) {
+            return Err(Error::NotConnected);
+        }
+        let max = self.handshake.max_payload.unwrap_or(1_000_000) as usize;
+        for chunk in split_by_payload(packets, max) {
+            let body = Bytes::try_from(Batch(chunk))?;
+            tracing::trace!(bytes = body.len(), "engine.io -> batch");
+            let _guard = self.writer.lock().await;
+            if let Err(error) = self.transport.emit(body, false).await {
+                Callbacks::fire(&self.callbacks.on_error, error.to_string());
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -226,6 +252,31 @@ impl Socket {
     }
 }
 
+/// engine.io-client `_getWritablePackets`: split before the packet that pushes the encoded size
+/// over `max_payload` (base64 counts 4/3 for binary); a single oversized packet goes alone.
+fn split_by_payload(packets: Vec<Packet>, max_payload: usize) -> Vec<Vec<Packet>> {
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut size = 1;
+    for packet in packets {
+        let len = if packet.packet_id == PacketId::MessageBinary {
+            packet.data.len().div_ceil(3) * 4
+        } else {
+            packet.data.len()
+        };
+        if !current.is_empty() && size + len > max_payload {
+            chunks.push(std::mem::take(&mut current));
+            size = 1;
+        }
+        size += len + 2;
+        current.push(packet);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 impl Debug for Socket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Socket")
@@ -234,5 +285,25 @@ impl Debug for Socket {
             .field("connected", &self.connected)
             .field("handshake", &self.handshake)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batches_split_at_max_payload() {
+        let p = |n: usize| Packet::new(PacketId::Message, Bytes::from(vec![b'x'; n]));
+        let sizes = |chunks: Vec<Vec<Packet>>| chunks.iter().map(Vec::len).collect::<Vec<_>>();
+        assert_eq!(sizes(split_by_payload(vec![p(10), p(10), p(10)], 100)), [3]);
+        assert_eq!(
+            sizes(split_by_payload(vec![p(40), p(40), p(40)], 100)),
+            [2, 1]
+        );
+        // an oversized packet still goes, alone
+        assert_eq!(sizes(split_by_payload(vec![p(500), p(1)], 100)), [1, 1]);
+        let bin = Packet::new(PacketId::MessageBinary, Bytes::from(vec![0u8; 60]));
+        assert_eq!(sizes(split_by_payload(vec![bin.clone(), bin], 100)), [1, 1]);
     }
 }

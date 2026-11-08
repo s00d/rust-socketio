@@ -44,6 +44,9 @@ pub enum Error {
         "the server answered CONNECT without a sid: it looks like a Socket.IO v2 server, which a v4 client cannot use"
     )]
     IncompatibleServer,
+    /// The auth payload is not a JSON object (socket.io requires one), or `auth_with` panicked.
+    #[error("invalid auth: {0}")]
+    InvalidAuth(&'static str),
     /// `emit` while not connected, without `buffer_while_disconnected`.
     #[error("not connected: the emit was dropped (enable buffer_while_disconnected to queue it)")]
     NotConnected,

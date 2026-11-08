@@ -1,8 +1,9 @@
 use std::{pin::Pin, sync::Arc};
 
 use crate::engineio::error::Result;
-use futures_util::{FutureExt, Stream, StreamExt, ready};
-use tokio::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
+
+use futures_util::{Stream, StreamExt};
 
 /// A generator is an internal type that represents a [`Send`] [`futures_util::Stream`]
 /// that yields a certain type `T` whenever it's polled.
@@ -22,8 +23,12 @@ impl<T> Stream for StreamGenerator<T> {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        let mut lock = ready!(Box::pin(self.inner.lock()).poll_unpin(cx));
-        lock.poll_next_unpin(cx)
+        // A std mutex held only for this synchronous poll: no lock future that could be dropped
+        // with its waker registration. Polled by one task at a time (see engineio::Client).
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .poll_next_unpin(cx)
     }
 }
 

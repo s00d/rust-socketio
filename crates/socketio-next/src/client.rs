@@ -84,6 +84,7 @@ pub(crate) async fn connect(config: Config, handlers: Handlers) -> Result<Client
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (state_tx, state_rx) = watch::channel(ConnectionState::Connecting { attempt: 0 });
+    let panic_state = state_tx.clone();
     let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = oneshot::channel();
     let shared = Arc::new(Shared::default());
@@ -114,7 +115,23 @@ pub(crate) async fn connect(config: Config, handlers: Handlers) -> Result<Client
         dispatch_tx,
         shared,
     );
-    let actor = tokio::spawn(actor.run(ready_tx));
+    let panic_shared = Arc::clone(&inner.shared);
+    // A bug in the connection task must not leave the state at `Connected` forever.
+    let actor = tokio::spawn(async move {
+        if AssertUnwindSafe(actor.run(ready_tx))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            tracing::error!("the socket.io connection task panicked; the client is closed");
+            panic_shared.connected.store(false, Ordering::Release);
+            panic_shared.closed.store(true, Ordering::Release);
+            panic_state.send_replace(ConnectionState::Closed {
+                reason: crate::DisconnectReason::TransportError,
+                error: None,
+            });
+        }
+    });
     *inner.actor.lock().unwrap_or_else(PoisonError::into_inner) = Some(actor);
     *inner
         .dispatcher
@@ -134,7 +151,7 @@ fn resolve(config: &Config) -> Result<(url::Url, String)> {
     let mut url = url::Url::parse(&config.address)?;
     let url_nsp = match url.path() {
         "" | "/" => None,
-        path => Some(path.to_owned()),
+        path => Some(percent_decode(path)),
     };
     let nsp = config
         .namespace
@@ -148,8 +165,31 @@ fn resolve(config: &Config) -> Result<(url::Url, String)> {
     Ok((url, nsp))
 }
 
+/// `%XX` escapes of a URL path back to UTF-8 (the namespace is compared as text).
+fn percent_decode(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Runs handlers one at a time, in order. Holds only a weak reference, so it never keeps the
 /// client alive.
+///
+/// ponytail: the queue is unbounded (like socket.io-client's event emitter); a server that
+/// floods events faster than slow handlers finish grows memory. Add a bound if that matters.
 async fn dispatch(mut rx: mpsc::UnboundedReceiver<Dispatch>, inner: Weak<Inner>) {
     while let Some(item) = rx.recv().await {
         let Some(strong) = inner.upgrade() else {
@@ -359,9 +399,11 @@ impl Client {
 
     /// Leaves the namespace (DISCONNECT packet), closes the connection and stops reconnecting.
     ///
-    /// Bounded: the goodbye packets get 1 s on a dead link. When it returns no handler starts
-    /// any more; handlers still running get up to 5 s to finish. Safe to call from inside a
-    /// handler (it then does not wait for the handlers).
+    /// Bounded: the goodbye (queued packets, DISCONNECT, engine.io close) gets at most 2 s on a
+    /// dead link. Events already received are still handled; handlers get up to 5 s in total,
+    /// then the event task is stopped. When it returns no handler starts any more. Safe to call
+    /// from inside a handler (it then does not wait for the handlers; the event task ends after
+    /// the running handler).
     pub async fn disconnect(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         if self
@@ -388,8 +430,18 @@ impl Client {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
-            if let Some(dispatcher) = dispatcher {
-                let _ = tokio::time::timeout(HANDLER_DRAIN, dispatcher).await;
+            if let Some(mut dispatcher) = dispatcher {
+                if tokio::time::timeout(HANDLER_DRAIN, &mut dispatcher)
+                    .await
+                    .is_err()
+                {
+                    // a handler is stuck: stop the event task so nothing else starts
+                    tracing::warn!(
+                        "handlers still running after {HANDLER_DRAIN:?}; event task stopped"
+                    );
+                    dispatcher.abort();
+                    let _ = dispatcher.await;
+                }
             }
         }
         self.inner.shared.muted.store(true, Ordering::Release);
@@ -401,5 +453,15 @@ impl Drop for Inner {
     fn drop(&mut self) {
         // The actor stops when `_shutdown` drops right after this; nothing may run any more.
         self.shared.muted.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn percent_decode_paths() {
+        assert_eq!(super::percent_decode("/%C3%A4dmin"), "/ädmin");
+        assert_eq!(super::percent_decode("/a%2"), "/a%2");
+        assert_eq!(super::percent_decode("/plain"), "/plain");
     }
 }

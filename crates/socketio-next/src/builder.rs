@@ -190,7 +190,8 @@ impl ClientBuilder {
     }
 
     /// The CONNECT payload (socket.io-client `auth` object), read by the server as
-    /// `socket.handshake.auth`.
+    /// `socket.handshake.auth`. Must be a JSON object (`connect()` fails with
+    /// [`Error::InvalidAuth`] otherwise).
     pub fn auth(mut self, auth: impl Into<Value>) -> Self {
         self.config.auth = Some(auth.into());
         self
@@ -324,6 +325,9 @@ impl ClientBuilder {
     /// Connects and joins the namespace. Resolves once the server answered CONNECT; fails with
     /// the error of this first attempt (no retry: reconnects start after a connection existed).
     pub async fn connect(mut self) -> Result<Client> {
+        if self.config.auth.as_ref().is_some_and(|a| !a.is_object()) {
+            return Err(Error::InvalidAuth("the auth payload must be a JSON object"));
+        }
         for (key, value) in std::mem::take(&mut self.raw_headers) {
             let name = HeaderName::try_from(key.as_str())
                 .map_err(|_| Error::InvalidHeader(format!("bad header name {key:?}")))?;

@@ -11,8 +11,8 @@ use crate::engineio::{HandshakePacket, Packet, TransportKind};
 
 /// An engine.io client: a [`Stream`] of received packets plus `emit`.
 ///
-/// Clones share one session: a packet is read by whichever clone polls first. There is no need
-/// to put it behind an `Arc`.
+/// Clones share one session (no need for an `Arc`): emit from any clone, but read the stream
+/// from one task at a time; two tasks polling concurrently would steal each other's wakeups.
 #[derive(Clone)]
 pub struct Client {
     socket: InnerSocket,
@@ -46,6 +46,12 @@ impl Client {
     /// Sends one packet.
     pub async fn emit(&self, packet: Packet) -> Result<()> {
         self.socket.emit(packet).await
+    }
+
+    /// Sends several packets in order: batched into as few polling requests as `maxPayload`
+    /// allows, or one websocket frame each.
+    pub async fn emit_all(&self, packets: Vec<Packet>) -> Result<()> {
+        self.socket.emit_all(packets).await
     }
 
     /// Whether the session is open.

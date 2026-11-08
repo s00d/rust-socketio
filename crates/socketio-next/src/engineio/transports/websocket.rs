@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{FutureExt, SinkExt, Stream, StreamExt, ready};
 use http::HeaderMap;
@@ -16,6 +16,7 @@ use url::Url;
 
 use crate::engineio::error::Result;
 use crate::engineio::tls::{self, TlsConfig};
+use crate::engineio::transport::Frame;
 use crate::engineio::{Error, Packet, PacketId};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -145,23 +146,18 @@ impl WebsocketTransport {
     }
 }
 
-/// A text frame is an encoded engine.io packet; a binary frame is the raw data of a binary
-/// message, so it gets the `4` message prefix. Control frames carry nothing for engine.io.
-fn frame_to_packet_bytes(message: Message) -> Option<Bytes> {
+/// A text frame is an encoded engine.io packet; a binary frame is the raw data of one binary
+/// message. Control frames carry nothing for engine.io.
+fn frame_to_packet_bytes(message: Message) -> Option<Frame> {
     match message {
-        Message::Text(text) => Some(Bytes::from(text)),
-        Message::Binary(data) => {
-            let mut msg = BytesMut::with_capacity(data.len() + 1);
-            msg.put_u8(b'4');
-            msg.put(data);
-            Some(msg.freeze())
-        }
+        Message::Text(text) => Some(Frame::Text(Bytes::from(text))),
+        Message::Binary(data) => Some(Frame::Binary(data)),
         _ => None,
     }
 }
 
 impl Stream for WebsocketTransport {
-    type Item = Result<Bytes>;
+    type Item = Result<Frame>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -187,7 +183,9 @@ impl Debug for WebsocketTransport {
                 &self
                     .base_url
                     .try_read()
-                    .map_or("Currently not available".to_owned(), |url| url.to_string()),
+                    .map_or("Currently not available".to_owned(), |url| {
+                        crate::redact::url(&url, true)
+                    }),
             )
             .finish()
     }
@@ -210,11 +208,16 @@ mod test {
     fn frames_map_to_packets() {
         assert_eq!(
             frame_to_packet_bytes(Message::text("4hi")),
-            Some(Bytes::from_static(b"4hi"))
+            Some(Frame::Text(Bytes::from_static(b"4hi")))
         );
         assert_eq!(
             frame_to_packet_bytes(Message::binary(vec![1u8, 2])),
-            Some(Bytes::from_static(&[b'4', 1, 2]))
+            Some(Frame::Binary(Bytes::from_static(&[1, 2])))
+        );
+        // an empty binary message is valid
+        assert_eq!(
+            frame_to_packet_bytes(Message::binary(Vec::<u8>::new())),
+            Some(Frame::Binary(Bytes::new()))
         );
         assert_eq!(frame_to_packet_bytes(Message::Ping(Bytes::new())), None);
     }
@@ -253,11 +256,11 @@ mod test {
             format!("{:?}", transport),
             format!(
                 "AsyncWebsocketTransport {{ base_url: {:?} }}",
-                transport.base_url().await?.to_string()
+                crate::redact::url(&transport.base_url().await?, true)
             )
         );
         // The handshake frame, then the server's greeting message.
-        assert!(transport.next().await.unwrap()?.starts_with(b"0{"));
+        assert!(matches!(transport.next().await.unwrap()?, Frame::Text(t) if t.starts_with(b"0{")));
         transport.next().await.unwrap()?;
         Ok(())
     }
@@ -283,7 +286,7 @@ mod test {
             transport.base_url().await?.to_string(),
             "wss://127.0.0.1/?transport=websocket"
         );
-        assert!(transport.next().await.unwrap()?.starts_with(b"0{"));
+        assert!(matches!(transport.next().await.unwrap()?, Frame::Text(t) if t.starts_with(b"0{")));
         Ok(())
     }
 

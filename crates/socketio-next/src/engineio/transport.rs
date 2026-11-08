@@ -39,6 +39,23 @@ impl fmt::Display for TransportKind {
     }
 }
 
+/// One unit read from a transport: a polling body or a websocket text frame (encoded
+/// packets), or a websocket binary frame (raw data of one binary message).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Frame {
+    /// Encoded engine.io packet(s).
+    Text(Bytes),
+    /// The data of one binary message (websocket only).
+    Binary(Bytes),
+}
+
+impl From<Bytes> for Frame {
+    fn from(bytes: Bytes) -> Self {
+        Frame::Text(bytes)
+    }
+}
+
 /// The transport of an engine.io session (enum dispatch, no boxed trait objects).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -96,11 +113,13 @@ impl Transport {
 }
 
 impl Stream for Transport {
-    type Item = Result<Bytes>;
+    type Item = Result<Frame>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.get_mut() {
-            Transport::Polling(t) => t.poll_next_unpin(cx),
+            Transport::Polling(t) => t
+                .poll_next_unpin(cx)
+                .map(|item| item.map(|r| r.map(Frame::Text))),
             Transport::Websocket(t) => t.poll_next_unpin(cx),
         }
     }

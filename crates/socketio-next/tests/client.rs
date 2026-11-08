@@ -1013,3 +1013,62 @@ async fn disconnect_is_bounded_on_a_dead_link() {
     assert!(client.state().is_closed());
     proxy.cut();
 }
+
+/// A proxy that blackholes websocket upgrades: `TransportType::Any` stays on polling within
+/// the connect timeout (engine.io-client keeps the polling session after a failed probe).
+#[tokio::test]
+async fn blackholed_websocket_falls_back_to_polling() {
+    let proxy = Proxy::start(&host_port(&server())).await;
+    proxy.block_websocket(true);
+    let started = std::time::Instant::now();
+    let client = connect(ClientBuilder::new(proxy.url()).timeout(Duration::from_secs(4))).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        client.link_info().transport,
+        Some(socketio_next::TransportKind::Polling)
+    );
+    let reply = client
+        .emit_with_ack("echo", "over polling", WAIT)
+        .await
+        .unwrap();
+    assert_eq!(reply.arg::<String>(0).unwrap(), "over polling");
+    client.disconnect().await.unwrap();
+    proxy.cut();
+}
+
+/// Untrusted input in user hands: a huge ack timeout, a non-object auth.
+#[tokio::test]
+async fn input_edge_cases_do_not_break_the_client() {
+    let client = connect(ClientBuilder::new(server())).await;
+    let reply = client
+        .emit_with_ack("echo", 1, Duration::MAX)
+        .await
+        .unwrap();
+    assert_eq!(reply.arg::<i64>(0).unwrap(), 1);
+    assert!(client.connected());
+    client.disconnect().await.unwrap();
+    let err = ClientBuilder::new(server())
+        .auth(json!("token"))
+        .connect()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidAuth(_)), "{err:?}");
+}
+
+/// A panicking packet inspector is contained.
+#[tokio::test]
+async fn panicking_inspector_is_contained() {
+    let client = connect(ClientBuilder::new(server()).inspect_packets(|_, packet| {
+        if packet.data.as_deref() == Some(r#"["echo","boom"]"#) {
+            panic!("inspector bug");
+        }
+    }))
+    .await;
+    let reply = client.emit_with_ack("echo", "boom", WAIT).await.unwrap();
+    assert_eq!(reply.arg::<String>(0).unwrap(), "boom");
+    client.disconnect().await.unwrap();
+}

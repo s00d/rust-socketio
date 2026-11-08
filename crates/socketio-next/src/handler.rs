@@ -56,9 +56,16 @@ where
             let f = Arc::clone(&f);
             async move {
                 let result = tokio::task::spawn_blocking(move || {
+                    /// Clears the flag even when the handler panics.
+                    struct Reset;
+                    impl Drop for Reset {
+                        fn drop(&mut self) {
+                            crate::client::IN_HANDLER_THREAD.with(|flag| flag.set(false));
+                        }
+                    }
                     crate::client::IN_HANDLER_THREAD.with(|flag| flag.set(true));
+                    let _reset = Reset;
                     f(arg, client);
-                    crate::client::IN_HANDLER_THREAD.with(|flag| flag.set(false));
                 })
                 .await;
                 if let Err(err) = result {

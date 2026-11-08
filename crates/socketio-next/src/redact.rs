@@ -7,10 +7,18 @@ const PLAIN_KEYS: [&str; 5] = ["EIO", "transport", "sid", "t", "b64"];
 
 /// `url` for logs: every query value except the engine.io ones replaced by `***`.
 pub(crate) fn url(url: &Url, enabled: bool) -> String {
-    if !enabled || url.query().is_none() {
+    if !enabled {
         return url.to_string();
     }
     let mut out = url.clone();
+    // user:password@ never shows
+    if !out.username().is_empty() || out.password().is_some() {
+        let _ = out.set_username("***");
+        let _ = out.set_password(None);
+    }
+    if url.query().is_none() {
+        return out.to_string();
+    }
     let pairs: Vec<(String, String)> = url
         .query_pairs()
         .map(|(k, v)| {
@@ -44,5 +52,7 @@ mod tests {
         assert!(url(&u, false).contains("SECRET"));
         let plain = Url::parse("http://h/").unwrap();
         assert_eq!(url(&plain, true), "http://h/");
+        let userinfo = Url::parse("http://me:pw@h/").unwrap();
+        assert_eq!(url(&userinfo, true), "http://***@h/");
     }
 }

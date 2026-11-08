@@ -65,14 +65,14 @@ impl Event {
 /// Answers one server callback. Clones share the "already sent" flag.
 #[derive(Debug, Clone)]
 pub struct AckSender {
-    id: i32,
+    id: u64,
     nsp: Arc<str>,
     cmd: mpsc::UnboundedSender<Command>,
     sent: Arc<AtomicBool>,
 }
 
 impl AckSender {
-    pub(crate) fn new(id: i32, nsp: Arc<str>, cmd: mpsc::UnboundedSender<Command>) -> Self {
+    pub(crate) fn new(id: u64, nsp: Arc<str>, cmd: mpsc::UnboundedSender<Command>) -> Self {
         AckSender {
             id,
             nsp,
@@ -82,7 +82,7 @@ impl AckSender {
     }
 
     /// The ack id the server chose.
-    pub fn id(&self) -> i32 {
+    pub fn id(&self) -> u64 {
         self.id
     }
 
