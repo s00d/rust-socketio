@@ -259,16 +259,12 @@ impl Actor {
     async fn connect_attempt(&mut self, attempt: u32) -> Step<Result<Conn>> {
         self.set_state(ConnectionState::Connecting { attempt });
         self.shared.link().last_attempt_at = Some(Instant::now());
-        let auth = match &self.config.auth_fn {
-            Some(auth_fn) => Some(auth_fn().await),
-            None => self.config.auth.clone(),
-        };
-        let auth = connect_payload(auth, self.pid.as_deref(), self.offset.as_deref());
         let fut = attempt_connect(
             Arc::clone(&self.config),
             self.url.clone(),
             Arc::clone(&self.nsp),
-            auth,
+            self.pid.clone(),
+            self.offset.clone(),
         );
         self.offline(fut).await
     }
@@ -711,14 +707,24 @@ fn connect_error(data: Option<&str>) -> Error {
 }
 
 /// Engine.io handshake + namespace CONNECT, bounded by the timeout.
+/// `auth_with` runs inside the bound too, so a hanging auth function cannot stall the loop.
 async fn attempt_connect(
     config: Arc<Config>,
     url: Url,
     nsp: Arc<str>,
-    auth: Option<Value>,
+    pid: Option<String>,
+    offset: Option<String>,
 ) -> Result<Conn> {
     let timeout = config.timeout;
-    tokio::time::timeout(timeout, attempt_connect_unbounded(config, url, nsp, auth))
+    let attempt = async move {
+        let auth = match &config.auth_fn {
+            Some(auth_fn) => Some(auth_fn().await),
+            None => config.auth.clone(),
+        };
+        let auth = connect_payload(auth, pid.as_deref(), offset.as_deref());
+        attempt_connect_unbounded(config, url, nsp, auth).await
+    };
+    tokio::time::timeout(timeout, attempt)
         .await
         .map_err(|_| Error::ConnectTimeout(timeout))?
 }
