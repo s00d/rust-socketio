@@ -924,7 +924,9 @@ mod tests {
         assert!(client.id().is_some());
         assert!(matches!(client.state(), ConnectionState::Connected { .. }));
         assert!(client.link_info().sid.is_some());
-        client.emit("echo", json!(1)).expect("emit right after connect");
+        client
+            .emit("echo", json!(1))
+            .expect("emit right after connect");
         client.disconnect().await.unwrap();
     }
 

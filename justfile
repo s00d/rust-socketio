@@ -39,10 +39,11 @@ test:
 # Tauri plugin: Rust tests (mock IPC, Node servers) and guest-js (typecheck, vitest, build, publint, attw)
 plugin: plugin-rust plugin-js
 
-# Tauri plugin: Rust tests and doctests; needs `just servers`
+# Tauri plugin: Rust tests and doctests (rustls, then native-tls); needs `just servers`
 plugin-rust:
     cargo test -p {{ plugin }} --all-targets {{ ci_flags }}
     cargo test -p {{ plugin }} --doc {{ ci_flags }}
+    cargo test -p {{ plugin }} --no-default-features --features native-tls --all-targets {{ ci_flags }}
 
 # Tauri plugin: guest-js typecheck, vitest, build + publint/attw/dist smoke; needs pnpm
 plugin-js:

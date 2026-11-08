@@ -45,7 +45,8 @@ serde_json = { workspace = true }
 socketio-next = { workspace = true }
 tauri = { version = "2", default-features = false }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
+url = { workspace = true }
 
 [build-dependencies]
 tauri-plugin = { version = "2", features = ["build"] }
@@ -54,3 +55,5 @@ tauri-plugin = { version = "2", features = ["build"] }
 socketio-next-testing = { workspace = true }
 tauri = { version = "2", default-features = false, features = ["test"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# parses the permission files to resolve a real ACL in tests/ipc.rs
+toml = "1"

@@ -28,8 +28,15 @@ mod core {
 
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_socketio::init())
+        .plugin(
+            // webview connects only to the test server; Rust's own clients are not limited
+            tauri_plugin_socketio::Builder::new()
+                .allow_url_prefix(URL)
+                .build(),
+        )
         .setup(|app| {
+            // synchronous, before any await: no page script can connect("core") first
+            app.socketio().reserve("core");
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 match core::start().await {

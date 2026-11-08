@@ -22,7 +22,8 @@ export type DisconnectReason =
 
 /** An error as the plugin sends it. */
 export interface ErrorData {
-  /** The variant name: `ConnectRejected`, `NotConnected`, `AckTimeout`, `AccessDenied`, ... */
+  /** The variant name: `ConnectRejected`, `NotConnected`, `AckTimeout`, `AccessDenied`,
+   * `Reserved`, `UrlNotAllowed`, `TooManySubscriptions`, `InvalidOptions`, ... */
   kind: string
   message: string
   /** `ConnectRejected`: the server's `err.data`; `HttpStatus`: `{ status }`. */
@@ -128,6 +129,11 @@ export interface ClientInfo {
 }
 
 /** Event arguments on the IPC: JSON plus the attachments that `{_placeholder, num}` stand for. */
+interface Subscribed {
+  subscription: number
+  state: ConnectionState
+}
+
 interface WireArgs {
   args: unknown[]
   binary?: number[][]
@@ -135,7 +141,7 @@ interface WireArgs {
 
 /** What a subscription's channel carries. */
 export type Message =
-  | { type: 'state'; state: ConnectionState }
+  | { type: 'state'; state: ConnectionState; snapshot?: boolean }
   | ({ type: 'event'; event: string; ackId?: number } & WireArgs)
 
 export type Listener = (...args: any[]) => void
@@ -211,8 +217,10 @@ function transportsOption(t: SocketOptions['transports']): string | undefined {
  * One registered client, seen from this webview: socket.io-client's `Socket` where it makes
  * sense. Events and state transitions arrive in order over a channel.
  *
- * Messages that arrive before {@link connect} / {@link attach} resolve are held until the next
- * task, so handlers added right after the `await` see the first events.
+ * When {@link connect} / {@link attach} resolve, the socket already has the current state
+ * (`connected`, `id`). Messages that arrived before are held until the next task, so handlers
+ * added right after the `await` see the first events; held states older than that snapshot
+ * are dropped.
  */
 export class Socket {
   /** The registry id. */
@@ -234,12 +242,18 @@ export class Socket {
   }
 
   /** @internal */
-  start(subscription: number): this {
+  start({ subscription, state }: Subscribed): this {
     this.subscription = subscription
+    this.current = state
     setTimeout(() => {
       const held = this.held ?? []
       this.held = null
-      for (const m of held) this.dispatch(m)
+      // the snapshot is the first state of this subscription: earlier ones are stale
+      const at = held.findIndex((m) => m.type === 'state' && m.snapshot)
+      held.forEach((m, i) => {
+        if (m.type === 'state' && i < at) return
+        this.dispatch(m)
+      })
     }, 0)
     return this
   }
@@ -372,14 +386,15 @@ export class Socket {
 
 /**
  * Connects a new client under `id` (fails with `AlreadyExists` when the id is taken, e.g.
- * after a page reload: {@link attach} to it or disconnect it first). Resolves once the server
+ * after a page reload: {@link attach} to it or disconnect it first; `Reserved` for an id Rust
+ * keeps; `UrlNotAllowed` outside the plugin's allow-list). Resolves once the server
  * accepted the namespace; rejects with the error of that first attempt (`ConnectRejected`
  * with the server's `data`, `ConnectTimeout`, ...).
  */
 export async function connect(id: string, options: SocketOptions): Promise<Socket> {
   const { events, transports, reconnectionAttempts, ...rest } = options
   const socket = new Socket(id)
-  const { subscription } = await call<{ subscription: number }>('connect', {
+  const subscribed = await call<Subscribed>('connect', {
     id,
     options: {
       ...rest,
@@ -389,15 +404,15 @@ export async function connect(id: string, options: SocketOptions): Promise<Socke
     events,
     channel: socket.channel
   })
-  return socket.start(subscription)
+  return socket.start(subscribed)
 }
 
 /** A {@link Socket} for a client that is registered already (by Rust or another webview).
  * The first state message is its current state. */
 export async function attach(id: string, options: AttachOptions = {}): Promise<Socket> {
   const socket = new Socket(id)
-  const subscription = await call<number>('subscribe', { id, events: options.events, channel: socket.channel })
-  return socket.start(subscription)
+  const subscribed = await call<Subscribed>('subscribe', { id, events: options.events, channel: socket.channel })
+  return socket.start(subscribed)
 }
 
 /** Every registered client. */

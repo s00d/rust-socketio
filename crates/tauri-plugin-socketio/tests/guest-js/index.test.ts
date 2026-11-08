@@ -10,6 +10,7 @@ const { SocketIoError, attach, connect, decodeArgs, encodeArgs, list } = api
 type Message = import('../../guest-js/index').Message
 
 type Call = { cmd: string; args: Record<string, unknown> }
+const connected = { status: 'connected', sid: 's0', recovered: false } as const
 let calls: Call[]
 let replies: Record<string, (args: Record<string, unknown>) => unknown>
 
@@ -30,8 +31,8 @@ function lastChannel(): Channel<Message> {
 beforeEach(() => {
   calls = []
   replies = {
-    'plugin:socketio|connect': () => ({ subscription: 7 }),
-    'plugin:socketio|subscribe': () => 9,
+    'plugin:socketio|connect': () => ({ subscription: 7, state: connected }),
+    'plugin:socketio|subscribe': () => ({ subscription: 9, state: connected }),
     'plugin:socketio|unsubscribe': () => true
   }
   mockIPC((cmd, args) => {
@@ -89,7 +90,9 @@ describe('connect', () => {
       reconnectionDelay: 100
     })
     expect(socket.clientId).toBe('main')
-    expect(socket.connected).toBe(false)
+    // the resolved socket already reflects the snapshot (finding 10)
+    expect(socket.connected).toBe(true)
+    expect(socket.id).toBe('s0')
   })
 
   it.each([
@@ -121,15 +124,18 @@ describe('connect', () => {
 })
 
 describe('Socket', () => {
-  it('holds early messages until handlers can be added, then dispatches in order', async () => {
+  it('holds early messages until handlers can be added, drops states older than the snapshot', async () => {
     replies['plugin:socketio|connect'] = (args) => {
       // Rust sends these before the invoke resolves
       const channel = args.channel as Channel<Message>
-      send(channel, { type: 'state', state: { status: 'connected', sid: 's1', recovered: false } }, 0)
+      send(channel, { type: 'state', state: { status: 'connecting', attempt: 0 } }, 0)
       send(channel, { type: 'event', event: 'hello', args: ['first'] }, 1)
-      return { subscription: 1 }
+      send(channel, { type: 'state', state: { status: 'connected', sid: 's1', recovered: false }, snapshot: true }, 2)
+      return { subscription: 1, state: { status: 'connected', sid: 's1', recovered: false } }
     }
     const socket = await connect('early', { url: 'http://x' })
+    expect(socket.connected).toBe(true)
+    expect(socket.id).toBe('s1')
     const seen: unknown[] = []
     socket.onAny((event, ...args) => seen.push(['any', event, ...args]))
     socket.on('hello', (...args) => seen.push(['hello', ...args]))
@@ -142,7 +148,13 @@ describe('Socket', () => {
     ])
     expect(states).toEqual(['connected'])
     expect(socket.connected).toBe(true)
-    expect(socket.id).toBe('s1')
+  })
+
+  it('attach resolves with the current state', async () => {
+    replies['plugin:socketio|subscribe'] = () => ({ subscription: 3, state: { status: 'reconnecting', attempt: 2, delay: 100 } })
+    const socket = await attach('core')
+    expect(socket.lastState).toEqual({ status: 'reconnecting', attempt: 2, delay: 100 })
+    expect(socket.connected).toBe(false)
   })
 
   it('on / once / off / offAny / onState unlisten', async () => {

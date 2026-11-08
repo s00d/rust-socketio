@@ -20,9 +20,23 @@ pub enum Error {
     /// ack or disconnect it.
     #[error("socket.io client `{0}` is read-only for the webview")]
     AccessDenied(String),
-    /// The server ack was answered already, expired, or belongs to another client.
-    #[error("no pending server ack {0} for this client (answered, expired or unknown)")]
+    /// The server ack was answered already, expired, or was not offered to this webview.
+    #[error("no pending server ack {0} for this webview (answered, expired or unknown)")]
     UnknownAck(u64),
+    /// Rust reserved this id ([`SocketIo::reserve`](crate::SocketIo::reserve)): the webview may
+    /// not connect a client under it.
+    #[error("the id `{0}` is reserved for a client registered from Rust")]
+    Reserved(String),
+    /// The URL is outside the plugin's allow-list ([`Builder::allow_url_prefix`](crate::Builder::allow_url_prefix)).
+    #[error("the server URL is not allowed by the socketio plugin configuration")]
+    UrlNotAllowed,
+    /// The webview has [`MAX_SUBSCRIPTIONS_PER_WEBVIEW`](crate::MAX_SUBSCRIPTIONS_PER_WEBVIEW)
+    /// subscriptions already.
+    #[error("too many socket.io subscriptions for this webview (at most {0})")]
+    TooManySubscriptions(usize),
+    /// A connect option or argument has the wrong type or value (the value itself is not shown).
+    #[error("invalid options: {0}")]
+    InvalidOptions(String),
 }
 
 /// Result alias of the plugin.
@@ -109,6 +123,10 @@ impl From<&Error> for ErrorPayload {
             Error::AlreadyExists(_) => "AlreadyExists",
             Error::AccessDenied(_) => "AccessDenied",
             Error::UnknownAck(_) => "UnknownAck",
+            Error::Reserved(_) => "Reserved",
+            Error::UrlNotAllowed => "UrlNotAllowed",
+            Error::TooManySubscriptions(_) => "TooManySubscriptions",
+            Error::InvalidOptions(_) => "InvalidOptions",
         };
         ErrorPayload {
             kind,

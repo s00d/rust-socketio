@@ -34,7 +34,7 @@ pub(crate) enum Transports {
 }
 
 /// The JS `connect` options (socket.io-client names; durations in milliseconds).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ConnectOptions {
     pub url: String,
@@ -57,7 +57,48 @@ pub(crate) struct ConnectOptions {
     pub buffer_while_disconnected: Option<bool>,
 }
 
+/// Query, header and auth values are secrets as often as not: only their keys are shown.
+impl std::fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectOptions")
+            .field("namespace", &self.namespace)
+            .field("path", &self.path)
+            .field("query_keys", &self.query.keys().collect::<Vec<_>>())
+            .field("header_keys", &self.headers.keys().collect::<Vec<_>>())
+            .field("auth", &self.auth.as_ref().map(|_| "***"))
+            .field("transports", &self.transports)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Serde's message without the values it quotes (a token passed where a number belongs).
+pub(crate) fn invalid(err: &serde_json::Error) -> crate::Error {
+    let text = err.to_string();
+    let mut out = String::with_capacity(text.len());
+    let mut quoted = false;
+    for c in text.chars() {
+        match c {
+            '"' if !quoted => {
+                quoted = true;
+                out.push_str("\"***");
+            }
+            '"' => {
+                quoted = false;
+                out.push('"');
+            }
+            _ if quoted => {}
+            c => out.push(c),
+        }
+    }
+    crate::Error::InvalidOptions(out)
+}
+
 impl ConnectOptions {
+    /// From the webview's JSON; a bad field is [`Error::InvalidOptions`](crate::Error).
+    pub(crate) fn parse(value: Value) -> crate::Result<Self> {
+        serde_json::from_value(value).map_err(|e| invalid(&e))
+    }
+
     pub(crate) fn into_builder(self) -> ClientBuilder {
         let ms = Duration::from_millis;
         let mut b = ClientBuilder::new(self.url).transport_type(match self.transports {
@@ -310,6 +351,15 @@ pub struct ClientInfo {
     pub state: State,
 }
 
+/// What `connect` and `subscribe` resolve with in JS.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Subscribed {
+    pub subscription: u64,
+    /// The snapshot also sent first on the channel.
+    pub state: State,
+}
+
 /// What a subscription's channel carries.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -318,6 +368,10 @@ pub enum Message {
     State {
         /// The new state.
         state: State,
+        /// The state at subscribe time (the subscription's first state message); state
+        /// messages queued before it are older.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        snapshot: bool,
     },
     /// An event from the server.
     Event {
@@ -398,6 +452,25 @@ mod tests {
             serde_json::to_value(m).unwrap(),
             json!({ "type": "event", "event": "e", "args": [1], "ackId": 7 })
         );
+    }
+
+    #[test]
+    fn options_errors_are_typed_and_hide_values() {
+        let err =
+            ConnectOptions::parse(json!({ "url": "http://x", "timeout": "s3cr3t" })).unwrap_err();
+        let crate::Error::InvalidOptions(text) = &err else {
+            panic!("{err:?}")
+        };
+        assert!(!text.contains("s3cr3t") && text.contains("u64"), "{text}");
+        assert!(ConnectOptions::parse(json!({ "url": "http://x", "timeout": 1.5 })).is_err());
+        let opts = ConnectOptions::parse(json!({
+            "url": "http://x?token=q", "auth": { "token": "a" }, "query": { "k": "qv" }, "headers": { "h": "hv" }
+        }))
+        .unwrap();
+        let dbg = format!("{opts:?}");
+        for secret in ["token=q", "\"a\"", "qv", "hv"] {
+            assert!(!dbg.contains(secret), "{dbg}");
+        }
     }
 
     #[test]

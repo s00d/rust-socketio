@@ -1,16 +1,19 @@
 //! The webview's commands (`plugin:socketio|<name>`). Clients registered as
 //! [`Access::ReadOnly`](crate::Access::ReadOnly) refuse `emit`, `emit_with_ack`, `ack` and
-//! `disconnect` whatever the capabilities allow.
+//! `disconnect` whatever the capabilities allow. `unsubscribe` and `ack` act only on what was
+//! given to the calling webview.
 
 use std::time::Duration;
 
-use serde::Serialize;
+use serde_json::Value;
 use tauri::ipc::Channel;
 use tauri::{Runtime, State, Webview};
 
-use crate::Result;
-use crate::models::{Args, ClientInfo, ConnectOptions, Link, Message, State as ConnState};
+use crate::models::{
+    Args, ClientInfo, ConnectOptions, Link, Message, State as ConnState, Subscribed,
+};
 use crate::registry::{SocketIo, SubscribeArgs, SubscriptionId};
+use crate::{Error, Result};
 
 fn sub_args<R: Runtime>(
     webview: &Webview<R>,
@@ -24,30 +27,36 @@ fn sub_args<R: Runtime>(
     }
 }
 
-/// What `connect` resolves with.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Connected {
-    subscription: SubscriptionId,
+/// A duration argument in ms: a finite number ≥ 0 (JSON turns `Infinity` into `null`).
+fn millis(value: &Value, what: &str) -> Result<Duration> {
+    value
+        .as_f64()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| Duration::from_millis(v as u64))
+        .ok_or_else(|| {
+            Error::InvalidOptions(format!("{what} must be a finite number of milliseconds"))
+        })
 }
 
-/// Connects a new client under `id` ([`Access::Full`](crate::Access::Full)); the channel
-/// subscription is attached before the connect, so no event after CONNECT is missed.
+/// Connects a new client under `id` ([`Access::Full`](crate::Access::Full)).
 #[tauri::command]
 pub(crate) async fn connect<R: Runtime>(
     webview: Webview<R>,
     io: State<'_, SocketIo>,
     id: String,
-    options: ConnectOptions,
+    options: Value,
     events: Option<Vec<String>>,
     channel: Channel<Message>,
-) -> Result<Connected> {
+) -> Result<Subscribed> {
+    let options = ConnectOptions::parse(options)?;
+    let url = options.url.clone();
     let sub = sub_args(&webview, events, channel);
-    let (_, subscription) = io
-        .connect_with(id, options.into_builder(), Some(sub))
+    let (subscription, state) = io
+        .connect_from_webview(id, &url, options.into_builder(), sub)
         .await?;
-    Ok(Connected {
-        subscription: subscription.unwrap_or_default(),
+    Ok(Subscribed {
+        subscription,
+        state,
     })
 }
 
@@ -68,19 +77,23 @@ pub(crate) async fn emit_with_ack(
     id: String,
     event: String,
     args: Args,
-    timeout: u64,
+    timeout: Value,
 ) -> Result<Args> {
+    let timeout = millis(&timeout, "timeout")?;
     let client = io.full(&id)?;
-    let reply = client
-        .emit_with_ack(event, args, Duration::from_millis(timeout))
-        .await?;
-    Ok(reply.into())
+    Ok(client.emit_with_ack(event, args, timeout).await?.into())
 }
 
-/// Answers a server ack forwarded with `ackId`.
+/// Answers a server ack forwarded to this webview with `ackId`.
 #[tauri::command]
-pub(crate) fn ack(io: State<'_, SocketIo>, id: String, ack_id: u64, args: Args) -> Result<()> {
-    io.ack(&id, ack_id, args.into())
+pub(crate) fn ack<R: Runtime>(
+    webview: Webview<R>,
+    io: State<'_, SocketIo>,
+    id: String,
+    ack_id: u64,
+    args: Args,
+) -> Result<()> {
+    io.ack(&id, ack_id, webview.label(), args.into())
 }
 
 /// Forwards an existing client (any access) to the channel.
@@ -91,17 +104,23 @@ pub(crate) fn subscribe<R: Runtime>(
     id: String,
     events: Option<Vec<String>>,
     channel: Channel<Message>,
-) -> Result<SubscriptionId> {
-    io.subscribe_with(&id, sub_args(&webview, events, channel))
+) -> Result<Subscribed> {
+    let (subscription, state) = io.subscribe_with(&id, sub_args(&webview, events, channel))?;
+    Ok(Subscribed {
+        subscription,
+        state,
+    })
 }
 
+/// Ends one of this webview's subscriptions.
 #[tauri::command]
-pub(crate) fn unsubscribe(
+pub(crate) fn unsubscribe<R: Runtime>(
+    webview: Webview<R>,
     io: State<'_, SocketIo>,
     id: String,
     subscription: SubscriptionId,
 ) -> bool {
-    io.unsubscribe(&id, subscription)
+    io.unsubscribe_from(&id, subscription, Some(webview.label()))
 }
 
 #[tauri::command]

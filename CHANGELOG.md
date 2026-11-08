@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named clients shared by Rust and the webviews; its own changelog is
   [crates/tauri-plugin-socketio/CHANGELOG.md](crates/tauri-plugin-socketio/CHANGELOG.md).
 
+### Fixed
+
+- `connect().await` could return before the client was connected: `connected()` false,
+  `state()` `Connecting`, `id()` None and `emit()` failing with `NotConnected` on a
+  multi-thread runtime or with the blocking client. The connected state is now set before
+  `connect()` returns and after every reconnect.
+
 ## [0.1.0] - 2026-11-08
 
 First release of `socketio-next`, the successor of the s00d/rust-socketio fork of

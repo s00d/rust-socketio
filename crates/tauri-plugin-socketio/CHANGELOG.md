@@ -20,8 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-subscription IPC channels (ordered, per webview) with an optional event filter; ended on
   unsubscribe, on a failed send, when the webview loads a new page or its window is destroyed,
   and when the client is removed.
-- Server acks answered from JS (`ackId`, bounded: 2 min, 1024 pending); not offered for
-  read-only clients.
+- Server acks answered from JS: one `ackId` per server ack for every subscribed webview,
+  answered once; 2 min TTL and a budget per webview; not offered for read-only clients or once a
+  disconnect started.
+- `SocketIo::reserve(id)`: ids Rust registers later cannot be taken by a page script.
+- `Builder::allow_url_prefix`: URL allow-list for webview connects (the CSP does not cover
+  these sockets); `init()` is `Builder::new().build()`.
+- Webview isolation: `unsubscribe` and `ack` act only on the caller's subscriptions and acks;
+  at most 64 subscriptions per webview.
+- `connect` / `attach` resolve with the current state (the socket is `connected` right away);
+  the channel starts with that snapshot (`snapshot: true`) and nothing older follows it.
+- One forwarding hub per client: ending a subscription drops its channel; a reload during a
+  JS `connect` leaves no subscription behind.
+- Typed `InvalidOptions` for wrong option types/values (values are not echoed); connect
+  options' `Debug` hides query, header and auth values.
 - Binary arguments both ways (`Uint8Array` ↔ socket.io attachments).
 - Permissions per command, `socketio:allow-read` (observe only) and `socketio:default`.
 - Features `rustls` (default) and `native-tls`, forwarded to socketio-next.
