@@ -155,6 +155,17 @@ pub(crate) fn check_scheme(url: &Url) -> Result<()> {
     }
 }
 
+/// Builds the reqwest client. reqwest panics when a crate elsewhere in the graph enabled its
+/// `rustls-no-provider` feature and no provider is installed (feature unification); that becomes
+/// [`Error::TlsProviderMissing`] instead of a panic in the caller's task.
+// ponytail: catch_unwind does not help under `panic = "abort"`; the README names the feature fix.
+pub(crate) fn build_reqwest(builder: reqwest::ClientBuilder) -> Result<reqwest::Client> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| builder.build())) {
+        Ok(client) => Ok(client?),
+        Err(_) => Err(Error::TlsProviderMissing),
+    }
+}
+
 /// Applies the TLS configuration to a reqwest client builder.
 macro_rules! apply_reqwest_tls {
     ($builder:expr, $config:expr) => {{
@@ -193,6 +204,18 @@ pub(crate) fn ws_connector(config: Option<&TlsConfig>) -> Option<tokio_tungsteni
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // reqwest's own builder with rustls compiled in and no provider installed: what a downstream
+    // build gets when another crate enables `rustls-no-provider` (nothing here installs a default).
+    #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+    #[test]
+    fn missing_provider_is_an_error_not_a_panic() {
+        assert!(matches!(
+            build_reqwest(reqwest::Client::builder()),
+            Err(Error::TlsProviderMissing)
+        ));
+        assert!(build_reqwest(apply_reqwest_tls!(reqwest::Client::builder(), None)).is_ok());
+    }
 
     #[test]
     fn scheme_check() {

@@ -59,7 +59,10 @@ async fn main() -> socketio_next::Result<()> {
 | `blocking` | no | `socketio_next::blocking`: the same client with blocking methods and plain-closure handlers. |
 
 Without `rustls` and `native-tls` (`default-features = false`) the crate builds without any TLS
-code; `https`/`wss` URLs then fail with `TlsNotEnabled`. With both, rustls is the default and a
+code; `https`/`wss` URLs then fail with `TlsNotEnabled`. If another crate in your build turns on
+reqwest 0.13's `rustls-no-provider` (for example `tauri-plugin-updater`), reqwest needs a rustls
+provider even for plain `http`: connecting then fails with `TlsProviderMissing`; enable `rustls`
+here (it hands reqwest a ring-based config, no global provider needed). With both, rustls is the default and a
 `native_tls::TlsConnector` passed to `tls_config` selects native-tls.
 
 ## The API in short
@@ -168,6 +171,7 @@ request (URL with query, headers) with the `log` crate at trace level; if you br
 | `ConnectRejected { message, data }` | The namespace middleware refused the auth (`next(new Error(message))`), or the namespace does not exist (`Invalid namespace`). The client does not retry. |
 | TLS: `invalid peer certificate` | A private CA: `tls_config(TlsConfig::with_root_certificates_pem(&pem)?)`; or build with `native-tls` to use the OS trust store. |
 | `TlsNotEnabled` | Built with `default-features = false`; enable `rustls` or `native-tls`. |
+| `TlsProviderMissing` | Another crate enabled reqwest's `rustls-no-provider`; enable `rustls` (see Cargo features). |
 | Large messages fail | The server's `maxHttpBufferSize` (engine.io `maxPayload`, see `link_info().max_payload`). |
 | Events with no handler | Handlers are matched by exact name; `on_any` sees everything. |
 

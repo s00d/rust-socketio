@@ -53,9 +53,15 @@ pub enum Error {
     Timeout(Duration),
     /// `https`/`wss` without a TLS feature.
     #[error(
-        "`{0}` needs TLS, but engineio-next was built without the `rustls` or `native-tls` feature"
+        "`{0}` needs TLS, but socketio-next was built without the `rustls` or `native-tls` feature"
     )]
     TlsNotEnabled(String),
+    /// Another crate in the build turned on reqwest's `rustls-no-provider` feature (e.g.
+    /// `tauri-plugin-updater`), so reqwest wants a rustls crypto provider that nobody installed.
+    #[error(
+        "reqwest was built with rustls by another crate but has no crypto provider: enable the `rustls` feature of socketio-next or install a rustls CryptoProvider before connecting"
+    )]
+    TlsProviderMissing,
     /// The TLS configuration could not be built (bad PEM, unsupported protocol versions).
     #[error("invalid TLS configuration: {0}")]
     InvalidTlsConfig(String),

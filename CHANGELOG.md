@@ -28,6 +28,8 @@ repository). See "Differences from rust_socketio" in the README for the migratio
 - TLS as a feature: `rustls` (default, ring + webpki roots), `native-tls`, or none; `TlsConfig`
   with `with_root_certificates_pem`.
 - `blocking` feature: the async client on a private runtime.
+- `TlsProviderMissing` instead of a reqwest panic when another crate enabled reqwest's
+  `rustls-no-provider` (found integrating with a Tauri app using `tauri-plugin-updater`).
 - tracing with spans per client and redacted query values; errors never carry URLs.
 - Differential tests against socket.io-client 4.8 (`ci/conformance`), Node test servers without
   Docker (`ci/servers.sh`), `justfile`, CI on Linux, macOS and Windows.

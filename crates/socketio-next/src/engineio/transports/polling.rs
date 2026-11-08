@@ -50,7 +50,7 @@ impl PollingTransport {
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }
-        let client = builder.build()?;
+        let client = tls::build_reqwest(builder)?;
 
         let mut url = base_url;
         url.query_pairs_mut().append_pair("transport", "polling");
