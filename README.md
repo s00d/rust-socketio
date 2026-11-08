@@ -145,7 +145,10 @@ auth from the proxy URL's user info. Both transports take the same decision (the
 uses the matcher reqwest uses for polling: `NO_PROXY` with domains, IPs, CIDR and `*`). Only
 `http://` proxies are spoken for the websocket: an `https://` or SOCKS proxy is a
 `ProxyFailed` error, never a silent direct connection. `no_proxy()` turns proxies off for
-both. Note that environment proxies apply to `ws://` too: a proxy that only allows `CONNECT`
+both. The environment is read once, when the client is built, and that decision holds for
+its life. If a crate in your build enables reqwest's `system-proxy` feature (macOS / Windows
+system settings), only polling sees those settings: call `proxy(..)` or `no_proxy()` to make
+both transports agree. Note that environment proxies apply to `ws://` too: a proxy that only allows `CONNECT`
 to port 443 then refuses the websocket, and with `TransportType::Any` the client stays on
 polling. Redirects are never followed (engine.io does not use them; a 3xx is an
 `HttpStatus` error).

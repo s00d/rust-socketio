@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the namespace); concurrent connects hold their id and subscription slot, so they cannot
   pass the per-webview cap; `reconnect` only for clients a webview connected; headers the
   webview may not set (`Host`, `Cookie`, `Sec-WebSocket-*`, `Proxy-*`, ...).
+- The URL allow-list compares the URL socketio-next really builds (dot segments resolved) and
+  refuses `..`, `%2e` and backslashes in `path`.
+- `State` and `Message` and their struct-like variants are `#[non_exhaustive]`.
 - Typed `InvalidOptions` for wrong option types/values (values are not echoed); connect
   options' `Debug` hides query, header and auth values.
 - Binary arguments both ways (`Uint8Array` ↔ socket.io attachments).

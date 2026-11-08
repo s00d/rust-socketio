@@ -278,13 +278,16 @@ impl From<Args> for Payload {
 /// delays in milliseconds.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum State {
     /// A connect attempt runs (`attempt` 0 is the first connect).
+    #[non_exhaustive]
     Connecting {
         /// 0, then 1, 2, ... per reconnect attempt.
         attempt: u32,
     },
     /// The namespace is joined.
+    #[non_exhaustive]
     Connected {
         /// `socket.id`.
         sid: String,
@@ -292,6 +295,7 @@ pub enum State {
         recovered: bool,
     },
     /// The connection was lost; a reconnect follows.
+    #[non_exhaustive]
     Disconnected {
         /// `"transport close"`, `"ping timeout"`, ...
         reason: String,
@@ -300,6 +304,7 @@ pub enum State {
         error: Option<ErrorPayload>,
     },
     /// Waiting `delay` ms before reconnect attempt `attempt`.
+    #[non_exhaustive]
     Reconnecting {
         /// 1, 2, ...
         attempt: u32,
@@ -310,6 +315,7 @@ pub enum State {
         error: Option<ErrorPayload>,
     },
     /// Final.
+    #[non_exhaustive]
     Closed {
         /// `"io client disconnect"`, `"connect rejected"`, `"reconnect failed"`, ...
         reason: String,
@@ -456,8 +462,10 @@ pub(crate) struct Subscribed {
 /// What a subscription's channel carries.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum Message {
     /// A state transition (the first message is the state at subscribe time).
+    #[non_exhaustive]
     State {
         /// The new state.
         state: State,
@@ -467,6 +475,7 @@ pub enum Message {
         snapshot: bool,
     },
     /// An event from the server.
+    #[non_exhaustive]
     Event {
         /// The event name.
         event: String,

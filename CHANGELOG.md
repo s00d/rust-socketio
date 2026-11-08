@@ -42,6 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closing at once, so an NTP step on a live link does not disconnect.
 - `HttpStatus.message` is at most 200 characters and drops words that look like URLs, paths,
   queries or credentials, for JSON messages too.
+- A refused websocket handshake (3xx, 4xx) is `HttpStatus { status }`; the response (with a
+  `Location` that may carry the query) is not kept in the error.
+- The scrubbing of `HttpStatus.message` keeps ordinary words ("Unauthorized") and removes
+  credential values in `name=value`, `name: value`, `name value` and `Bearer value` forms.
+- Environment proxies are read once, when the client is built; both transports use that
+  decision for the client's life.
+- `ClientBuilder::engine_url()`: the engine.io URL a connect will use (path normalized).
 - One reqwest client per socket.io client, shared by every transport and reconnect (it was
   two per connect attempt); only long-poll GETs are bounded by pingInterval + pingTimeout, so
   slow POST uploads are no longer cut.
@@ -52,6 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wake-up instead of after the remaining monotonic time.
 - The websocket reader could miss a wakeup when another task held the receiver (a lock
   future polled once and dropped); the receiver is now polled under a short std lock.
+- The wall-clock liveness probe over polling goes through the normal write lock (a POST
+  next to another one made engine.io close the session with "data request overlap").
 - `reconnect()` racing `disconnect()`: a disconnect always wins (no revived client, no hang).
 - The caller's `Cookie` header and the cookie jar are merged (`user; jar`) on polling and on
   the websocket handshake (`cookies` feature).

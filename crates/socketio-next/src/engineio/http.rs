@@ -32,6 +32,9 @@ pub(crate) enum ProxyMode {
 pub(crate) struct Http {
     pub(crate) client: reqwest::Client,
     mode: Arc<ProxyMode>,
+    /// `ProxyMode::Env`: the environment as it was when the client was built (reqwest read it
+    /// then too), so both transports decide alike for the client's life.
+    env: Option<Arc<Matcher>>,
     #[cfg(feature = "cookies")]
     jar: Arc<reqwest::cookie::Jar>,
 }
@@ -87,8 +90,10 @@ impl Http {
         {
             builder = builder.cookie_provider(Arc::clone(&jar));
         }
+        let env = matches!(mode, ProxyMode::Env).then(|| Arc::new(Matcher::from_env()));
         Ok(Http {
             client: tls::build_reqwest(builder)?,
+            env,
             mode: Arc::new(mode),
             #[cfg(feature = "cookies")]
             jar,
@@ -115,7 +120,10 @@ impl Http {
                     auth,
                 }))
             }
-            ProxyMode::Env => matcher_route(&Matcher::from_env(), url),
+            ProxyMode::Env => match &self.env {
+                Some(matcher) => matcher_route(matcher, url),
+                None => Ok(None),
+            },
         }
     }
 
@@ -349,6 +357,20 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!((explicit.host.as_str(), explicit.port), ("::1", 3128));
+    }
+
+    /// The environment is read once, with the client: later websocket connects use that
+    /// decision (a test cannot change the process environment: `set_var` is unsafe here, so
+    /// the captured matcher is swapped in instead).
+    #[test]
+    fn the_environment_is_read_once() {
+        let mut http = Http::new(None, ProxyMode::Env).unwrap();
+        http.env = Some(Arc::new(matcher("http://proxy:3128", "", "")));
+        let url = Url::parse("ws://example.org/").unwrap();
+        let route = http.ws_route(&url).unwrap().unwrap();
+        assert_eq!(route.host, "proxy");
+        // a clone (another transport of the same client) decides the same
+        assert_eq!(http.clone().ws_route(&url).unwrap(), Some(route));
     }
 
     #[test]

@@ -205,30 +205,34 @@ mod test {
 
     #[tokio::test]
     async fn polling_transport_base_url() -> Result<()> {
-        let url = crate::engineio::test::engine_io_server()?.to_string();
-        let transport = PollingTransport::new(Url::from_str(&url[..]).unwrap(), None, None)?;
-        assert_eq!(
-            transport.base_url().await?.to_string(),
-            url.clone() + "?transport=polling"
-        );
-        transport
-            .set_base_url(Url::parse("https://127.0.0.1")?)
-            .await?;
-        assert_eq!(
-            transport.base_url().await?.to_string(),
-            "https://127.0.0.1/?transport=polling"
-        );
-        assert_ne!(transport.base_url().await?.to_string(), url);
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_server()?.to_string();
+            let transport = PollingTransport::new(Url::from_str(&url[..]).unwrap(), None, None)?;
+            assert_eq!(
+                transport.base_url().await?.to_string(),
+                url.clone() + "?transport=polling"
+            );
+            transport
+                .set_base_url(Url::parse("https://127.0.0.1")?)
+                .await?;
+            assert_eq!(
+                transport.base_url().await?.to_string(),
+                "https://127.0.0.1/?transport=polling"
+            );
+            assert_ne!(transport.base_url().await?.to_string(), url);
 
-        transport
-            .set_base_url(Url::parse("http://127.0.0.1/?transport=polling")?)
-            .await?;
-        assert_eq!(
-            transport.base_url().await?.to_string(),
-            "http://127.0.0.1/?transport=polling"
-        );
-        assert_ne!(transport.base_url().await?.to_string(), url);
-        Ok(())
+            transport
+                .set_base_url(Url::parse("http://127.0.0.1/?transport=polling")?)
+                .await?;
+            assert_eq!(
+                transport.base_url().await?.to_string(),
+                "http://127.0.0.1/?transport=polling"
+            );
+            assert_ne!(transport.base_url().await?.to_string(), url);
+            Ok(())
+        })
+        .await
+        .expect("test `polling_transport_base_url` timed out")
     }
 
     /// Only the long-poll GET is bounded by the heartbeat; a POST (an upload) is not.
@@ -279,6 +283,7 @@ mod test {
     /// query (following it would send the tokens elsewhere).
     #[tokio::test]
     async fn redirects_are_not_followed() {
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
         let url = fixed_server(
             "HTTP/1.1 302 Found\r\nLocation: http://evil.example/?token=SECRET\r\nContent-Length: 46\r\nConnection: close\r\n\r\nRedirecting to http://evil.example/?token=SECRET",
         )
@@ -294,24 +299,31 @@ mod test {
             }
             other => panic!("{other:?}"),
         }
+    })
+    .await
+    .expect("test `redirects_are_not_followed` timed out")
     }
 
     #[tokio::test]
     async fn polling_transport_reports_http_error_status() {
-        let mut url = crate::engineio::test::engine_io_polling_server().unwrap();
-        url.set_path("/engine.io/");
-        url.query_pairs_mut()
-            .append_pair("EIO", "4")
-            .append_pair("sid", "unknown-session");
-        let mut transport = PollingTransport::new(url, None, None).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let mut url = crate::engineio::test::engine_io_polling_server().unwrap();
+            url.set_path("/engine.io/");
+            url.query_pairs_mut()
+                .append_pair("EIO", "4")
+                .append_pair("sid", "unknown-session");
+            let mut transport = PollingTransport::new(url, None, None).unwrap();
 
-        // engine.io answers an unknown sid with 400 and a JSON error body.
-        match transport.next().await {
-            Some(Err(Error::HttpStatus {
-                status: 400,
-                message: Some(message),
-            })) => assert_eq!(message, "Session ID unknown"),
-            other => panic!("expected IncompleteHttp(400), got {other:?}"),
-        }
+            // engine.io answers an unknown sid with 400 and a JSON error body.
+            match transport.next().await {
+                Some(Err(Error::HttpStatus {
+                    status: 400,
+                    message: Some(message),
+                })) => assert_eq!(message, "Session ID unknown"),
+                other => panic!("expected IncompleteHttp(400), got {other:?}"),
+            }
+        })
+        .await
+        .expect("test `polling_transport_reports_http_error_status` timed out")
     }
 }

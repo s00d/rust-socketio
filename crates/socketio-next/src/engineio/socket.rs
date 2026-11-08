@@ -271,12 +271,27 @@ impl Socket {
             tracing::debug!(sid = %self.handshake.sid, "wall clock past the ping deadline; probing the link");
             let socket = self.clone();
             tokio::spawn(async move {
-                if let Ok(true) = socket.transport.probe().await {
-                    socket.alive();
-                }
+                let _ = tokio::time::timeout(grace, socket.probe()).await;
             });
         }
         *check
+    }
+
+    /// A liveness probe. Polling: a noop through the normal, locked write path (two POSTs at
+    /// once make engine.io close the session with "data request overlap"); its answer proves
+    /// the session, so the link is alive. Websocket: a ping, whose pong arrives as a noop.
+    async fn probe(&self) {
+        if self.transport.kind().is_polling() {
+            if self
+                .emit(Packet::new(PacketId::Noop, Bytes::new()))
+                .await
+                .is_ok()
+            {
+                self.alive();
+            }
+        } else {
+            let _ = self.transport.ws_ping().await;
+        }
     }
 
     /// Moves the wall clock of the last ping back by `gap` (`forward`: a sleep or a forward
@@ -410,6 +425,39 @@ impl Debug for Socket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The polling probe waits for the writer lock like every other write: it never runs
+    /// next to another POST (engine.io answers an overlap with 400 and closes the session).
+    #[tokio::test]
+    async fn the_polling_probe_takes_the_writer_lock() {
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_server().unwrap();
+            let client = crate::engineio::ClientBuilder::new(url)
+                .build_polling()
+                .await
+                .unwrap();
+            client.connect().await.unwrap();
+            let socket = client.socket().clone();
+            let held = socket.writer.lock().await;
+            let probe = tokio::spawn({
+                let socket = socket.clone();
+                async move { socket.probe().await }
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !probe.is_finished(),
+                "the probe wrote while another write held the lock"
+            );
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(5), probe)
+                .await
+                .unwrap()
+                .unwrap();
+            client.disconnect().await.unwrap();
+        })
+        .await
+        .expect("test `the_polling_probe_takes_the_writer_lock` timed out")
+    }
 
     #[test]
     fn batches_split_at_max_payload() {

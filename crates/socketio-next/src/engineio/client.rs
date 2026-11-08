@@ -27,6 +27,11 @@ impl Client {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn socket(&self) -> &InnerSocket {
+        &self.socket
+    }
+
     /// Closes the session (same as [`disconnect`](Self::disconnect)).
     pub async fn close(&self) -> Result<()> {
         self.socket.disconnect().await
@@ -143,134 +148,169 @@ mod test {
     /// no answer and the link is declared dead after pingTimeout (20 s), not 45 s.
     #[tokio::test]
     async fn a_sleep_on_a_dead_link_is_a_ping_timeout_after_ping_timeout() -> Result<()> {
-        let tcp = socketio_next_testing::Proxy::start(&socketio_next_testing::host_port(
-            crate::engineio::test::engine_io_server()?.as_str(),
-        ))
-        .await;
-        let mut socket = builder(Url::parse(&tcp.url())?).build_polling().await?;
-        socket.connect().await?;
-        // the link is dead: open connections stall, new ones are refused
-        tcp.refuse(true);
-        tcp.freeze();
-        let started = std::time::Instant::now();
-        socket
-            .socket
-            .shift_wall_clock(std::time::Duration::from_secs(3600), true);
-        let err = watch(&mut socket, std::time::Duration::from_secs(30)).await;
-        assert!(
-            matches!(err, Some(crate::engineio::Error::PingTimeout)),
-            "{err:?}"
-        );
-        let took = started.elapsed();
-        assert!(
-            took >= std::time::Duration::from_secs(19),
-            "probed first: {took:?}"
-        );
-        assert!(took < std::time::Duration::from_secs(25), "{took:?}");
-        tcp.cut();
-        Ok(())
-    }
-
-    /// A forward clock step (NTP on a gateway without RTC) on a live link: the probe is
-    /// answered (a noop POST, or a websocket ping), nothing closes.
-    #[tokio::test]
-    async fn a_forward_clock_step_on_a_live_link_keeps_it() -> Result<()> {
-        let url = crate::engineio::test::engine_io_server()?;
-        for websocket in [false, true] {
-            let mut socket = if websocket {
-                builder(url.clone()).build_websocket().await?
-            } else {
-                builder(url.clone()).build_polling().await?
-            };
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let tcp = socketio_next_testing::Proxy::start(&socketio_next_testing::host_port(
+                crate::engineio::test::engine_io_server()?.as_str(),
+            ))
+            .await;
+            let mut socket = builder(Url::parse(&tcp.url())?).build_polling().await?;
             socket.connect().await?;
+            // the link is dead: open connections stall, new ones are refused
+            tcp.refuse(true);
+            tcp.freeze();
+            let started = std::time::Instant::now();
             socket
                 .socket
                 .shift_wall_clock(std::time::Duration::from_secs(3600), true);
-            let err = watch(&mut socket, std::time::Duration::from_secs(3)).await;
-            assert!(err.is_none(), "websocket={websocket}: {err:?}");
-            assert!(socket.is_connected());
-            socket.disconnect().await?;
-        }
-        Ok(())
+            let err = watch(&mut socket, std::time::Duration::from_secs(30)).await;
+            assert!(
+                matches!(err, Some(crate::engineio::Error::PingTimeout)),
+                "{err:?}"
+            );
+            let took = started.elapsed();
+            assert!(
+                took >= std::time::Duration::from_secs(19),
+                "probed first: {took:?}"
+            );
+            assert!(took < std::time::Duration::from_secs(25), "{took:?}");
+            tcp.cut();
+            Ok(())
+        })
+        .await
+        .expect("test `a_sleep_on_a_dead_link_is_a_ping_timeout_after_ping_timeout` timed out")
+    }
+
+    /// A forward clock step (NTP on a gateway without RTC) on a live link: the probe is
+    /// answered (a noop POST, or a websocket ping), nothing closes. On the fast-ping server
+    /// (pingInterval 300 ms, pingTimeout 200 ms), stepped right after a ping: the next ping is
+    /// ~300 ms away, so without the probe the 200 ms grace would end the link.
+    #[tokio::test]
+    async fn a_forward_clock_step_on_a_live_link_keeps_it() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let mut url = Url::parse(&socketio_next_testing::fast_ping_server())?;
+            url.set_path("/socket.io/");
+            for websocket in [false, true] {
+                let mut socket = if websocket {
+                    builder(url.clone()).build_websocket().await?
+                } else {
+                    builder(url.clone()).build_polling().await?
+                };
+                socket.connect().await?;
+                // a ping arrived: the clock is stepped right after it
+                loop {
+                    let packet =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                            .await
+                            .expect("a ping")
+                            .expect("open")?;
+                    if packet.packet_id == crate::engineio::PacketId::Ping {
+                        break;
+                    }
+                }
+                socket
+                    .socket
+                    .shift_wall_clock(std::time::Duration::from_secs(3600), true);
+                // longer than pingTimeout (200), shorter than pingInterval (300)
+                let err = watch(&mut socket, std::time::Duration::from_millis(260)).await;
+                assert!(err.is_none(), "websocket={websocket}: {err:?}");
+                assert!(socket.is_connected());
+                socket.disconnect().await?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("test `a_forward_clock_step_on_a_live_link_keeps_it` timed out")
     }
 
     /// A backward step changes nothing.
     #[tokio::test]
     async fn a_backward_clock_step_has_no_effect() -> Result<()> {
-        let url = crate::engineio::test::engine_io_server()?;
-        let mut socket = builder(url).build_polling().await?;
-        socket.connect().await?;
-        socket
-            .socket
-            .shift_wall_clock(std::time::Duration::from_secs(3600), false);
-        assert!(
-            watch(&mut socket, std::time::Duration::from_secs(1))
-                .await
-                .is_none()
-        );
-        socket.disconnect().await?;
-        Ok(())
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_server()?;
+            let mut socket = builder(url).build_polling().await?;
+            socket.connect().await?;
+            socket
+                .socket
+                .shift_wall_clock(std::time::Duration::from_secs(3600), false);
+            assert!(
+                watch(&mut socket, std::time::Duration::from_secs(1))
+                    .await
+                    .is_none()
+            );
+            socket.disconnect().await?;
+            Ok(())
+        })
+        .await
+        .expect("test `a_backward_clock_step_has_no_effect` timed out")
     }
 
     #[tokio::test]
     async fn test_client_cloneable() -> Result<()> {
-        let url = crate::engineio::test::engine_io_server()?;
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_server()?;
 
-        let mut sut = builder(url).build().await?;
-        let mut cloned = sut.clone();
+            let mut sut = builder(url).build().await?;
+            let mut cloned = sut.clone();
 
-        sut.connect().await?;
+            sut.connect().await?;
 
-        // when the underlying socket is connected, the
-        // state should also change on the cloned one
-        assert!(sut.is_connected());
-        assert!(cloned.is_connected());
+            // when the underlying socket is connected, the
+            // state should also change on the cloned one
+            assert!(sut.is_connected());
+            assert!(cloned.is_connected());
 
-        // both clients should reflect the same messages.
-        assert_eq!(
-            sut.next().await.unwrap()?,
-            Packet::new(PacketId::Message, "hello client")
-        );
+            // both clients should reflect the same messages.
+            assert_eq!(
+                sut.next().await.unwrap()?,
+                Packet::new(PacketId::Message, "hello client")
+            );
 
-        sut.emit(Packet::new(PacketId::Message, "respond")).await?;
+            sut.emit(Packet::new(PacketId::Message, "respond")).await?;
 
-        assert_eq!(
-            cloned.next().await.unwrap()?,
-            Packet::new(PacketId::Message, "Roger Roger")
-        );
+            assert_eq!(
+                cloned.next().await.unwrap()?,
+                Packet::new(PacketId::Message, "Roger Roger")
+            );
 
-        cloned.disconnect().await?;
+            cloned.disconnect().await?;
 
-        // when the underlying socket is disconnected, the
-        // state should also change on the cloned one
-        assert!(!sut.is_connected());
-        assert!(!cloned.is_connected());
+            // when the underlying socket is disconnected, the
+            // state should also change on the cloned one
+            assert!(!sut.is_connected());
+            assert!(!cloned.is_connected());
 
-        Ok(())
+            Ok(())
+        })
+        .await
+        .expect("test `test_client_cloneable` timed out")
     }
 
     /// A polling response bigger than one HTTP body chunk must still be decoded as one payload.
     #[tokio::test]
     async fn test_polling_large_message() -> Result<()> {
-        let url = crate::engineio::test::engine_io_polling_server()?;
-        let mut socket = builder(url).build_polling().await?;
-        socket.connect().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_polling_server()?;
+            let mut socket = builder(url).build_polling().await?;
+            socket.connect().await?;
 
-        assert_eq!(
-            socket.next().await.unwrap()?,
-            Packet::new(PacketId::Message, "hello client")
-        );
+            assert_eq!(
+                socket.next().await.unwrap()?,
+                Packet::new(PacketId::Message, "hello client")
+            );
 
-        socket
-            .emit(Packet::new(PacketId::Message, "respond_large"))
-            .await?;
+            socket
+                .emit(Packet::new(PacketId::Message, "respond_large"))
+                .await?;
 
-        assert_eq!(
-            socket.next().await.unwrap()?,
-            Packet::new(PacketId::Message, "x".repeat(64 * 1024))
-        );
+            assert_eq!(
+                socket.next().await.unwrap()?,
+                Packet::new(PacketId::Message, "x".repeat(64 * 1024))
+            );
 
-        socket.disconnect().await
+            socket.disconnect().await
+        })
+        .await
+        .expect("test `test_polling_large_message` timed out")
     }
 
     /// A peer that accepts TCP but never answers (blackholed proxy, half-open link) must not hang
@@ -292,20 +332,24 @@ mod test {
     /// After disconnect() the packet stream ends instead of polling a closed session.
     #[tokio::test]
     async fn test_stream_ends_after_disconnect() {
-        for url in [
-            crate::engineio::test::engine_io_polling_server().unwrap(),
-            crate::engineio::test::engine_io_server().unwrap(),
-        ] {
-            let mut socket = builder(url).build().await.unwrap();
-            socket.connect().await.unwrap();
-            socket.disconnect().await.unwrap();
-            assert!(!socket.is_connected());
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            for url in [
+                crate::engineio::test::engine_io_polling_server().unwrap(),
+                crate::engineio::test::engine_io_server().unwrap(),
+            ] {
+                let mut socket = builder(url).build().await.unwrap();
+                socket.connect().await.unwrap();
+                socket.disconnect().await.unwrap();
+                assert!(!socket.is_connected());
 
-            let next = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
-                .await
-                .expect("stream still waiting after disconnect");
-            assert!(next.is_none(), "stream yielded {next:?} after disconnect");
-        }
+                let next = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                    .await
+                    .expect("stream still waiting after disconnect");
+                assert!(next.is_none(), "stream yielded {next:?} after disconnect");
+            }
+        })
+        .await
+        .expect("test `test_stream_ends_after_disconnect` timed out")
     }
 
     #[tokio::test(start_paused = true)]
@@ -324,29 +368,33 @@ mod test {
 
     #[tokio::test]
     async fn test_illegal_actions() -> Result<()> {
-        let url = crate::engineio::test::engine_io_server()?;
-        let mut sut = builder(url.clone()).build().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_server()?;
+            let mut sut = builder(url.clone()).build().await?;
 
-        assert!(
-            sut.emit(Packet::new(PacketId::Close, Bytes::new()))
-                .await
-                .is_err()
-        );
+            assert!(
+                sut.emit(Packet::new(PacketId::Close, Bytes::new()))
+                    .await
+                    .is_err()
+            );
 
-        sut.connect().await?;
+            sut.connect().await?;
 
-        assert!(sut.next().await.unwrap().is_ok());
+            assert!(sut.next().await.unwrap().is_ok());
 
-        assert!(
-            builder(Url::parse("fake://fake.fake").unwrap())
-                .build_websocket()
-                .await
-                .is_err()
-        );
+            assert!(
+                builder(Url::parse("fake://fake.fake").unwrap())
+                    .build_websocket()
+                    .await
+                    .is_err()
+            );
 
-        sut.disconnect().await?;
+            sut.disconnect().await?;
 
-        Ok(())
+            Ok(())
+        })
+        .await
+        .expect("test `test_illegal_actions` timed out")
     }
 
     use reqwest::header::HOST;
@@ -398,170 +446,202 @@ mod test {
 
     #[tokio::test]
     async fn test_connection_long() -> Result<()> {
-        // Long lived socket to receive pings
-        let url = crate::engineio::test::engine_io_server()?;
-        let mut socket = builder(url).build().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            // Long lived socket to receive pings
+            let url = crate::engineio::test::engine_io_server()?;
+            let mut socket = builder(url).build().await?;
 
-        socket.connect().await?;
+            socket.connect().await?;
 
-        // hello client
-        assert!(matches!(
-            socket.next().await.unwrap()?,
-            Packet {
-                packet_id: PacketId::Message,
-                ..
-            }
-        ));
-        // Ping
-        assert!(matches!(
-            socket.next().await.unwrap()?,
-            Packet {
-                packet_id: PacketId::Ping,
-                ..
-            }
-        ));
+            // hello client
+            assert!(matches!(
+                socket.next().await.unwrap()?,
+                Packet {
+                    packet_id: PacketId::Message,
+                    ..
+                }
+            ));
+            // Ping
+            assert!(matches!(
+                socket.next().await.unwrap()?,
+                Packet {
+                    packet_id: PacketId::Ping,
+                    ..
+                }
+            ));
 
-        socket.disconnect().await?;
+            socket.disconnect().await?;
 
-        assert!(!socket.is_connected());
+            assert!(!socket.is_connected());
 
-        Ok(())
+            Ok(())
+        })
+        .await
+        .expect("test `test_connection_long` timed out")
     }
 
     #[tokio::test]
     async fn test_connection_dynamic() -> Result<()> {
-        let url = crate::engineio::test::engine_io_server()?;
-        let socket = builder(url).build().await?;
-        test_connection(socket).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_server()?;
+            let socket = builder(url).build().await?;
+            test_connection(socket).await?;
 
-        let url = crate::engineio::test::engine_io_polling_server()?;
-        let socket = builder(url).build().await?;
-        test_connection(socket).await
+            let url = crate::engineio::test::engine_io_polling_server()?;
+            let socket = builder(url).build().await?;
+            test_connection(socket).await
+        })
+        .await
+        .expect("test `test_connection_dynamic` timed out")
     }
 
     #[tokio::test]
     async fn test_connection_fallback() -> Result<()> {
-        let url = crate::engineio::test::engine_io_server()?;
-        let socket = builder(url).build_with_fallback().await?;
-        test_connection(socket).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_server()?;
+            let socket = builder(url).build_with_fallback().await?;
+            test_connection(socket).await?;
 
-        let url = crate::engineio::test::engine_io_polling_server()?;
-        let socket = builder(url).build_with_fallback().await?;
-        test_connection(socket).await
+            let url = crate::engineio::test::engine_io_polling_server()?;
+            let socket = builder(url).build_with_fallback().await?;
+            test_connection(socket).await
+        })
+        .await
+        .expect("test `test_connection_fallback` timed out")
     }
 
     #[cfg(any(feature = "rustls", feature = "native-tls"))]
     #[tokio::test]
     async fn test_connection_dynamic_secure() -> Result<()> {
-        let url = crate::engineio::test::engine_io_server_secure()?;
-        let mut socket_builder = builder(url);
-        socket_builder = socket_builder.tls_config(crate::engineio::test::tls_config()?);
-        let socket = socket_builder.build().await?;
-        test_connection(socket).await
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_server_secure()?;
+            let mut socket_builder = builder(url);
+            socket_builder = socket_builder.tls_config(crate::engineio::test::tls_config()?);
+            let socket = socket_builder.build().await?;
+            test_connection(socket).await
+        })
+        .await
+        .expect("test `test_connection_dynamic_secure` timed out")
     }
 
     #[tokio::test]
     async fn test_connection_polling() -> Result<()> {
-        let url = crate::engineio::test::engine_io_server()?;
-        let socket = builder(url).build_polling().await?;
-        test_connection(socket).await
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_server()?;
+            let socket = builder(url).build_polling().await?;
+            test_connection(socket).await
+        })
+        .await
+        .expect("test `test_connection_polling` timed out")
     }
 
     #[cfg(any(feature = "rustls", feature = "native-tls"))]
     #[tokio::test]
     async fn test_connection_wss() -> Result<()> {
-        let url = crate::engineio::test::engine_io_polling_server()?;
-        assert!(builder(url).build_websocket_with_upgrade().await.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_polling_server()?;
+            assert!(builder(url).build_websocket_with_upgrade().await.is_err());
 
-        let host =
-            std::env::var("ENGINE_IO_SECURE_HOST").unwrap_or_else(|_| "localhost".to_owned());
-        let mut url = crate::engineio::test::engine_io_server_secure()?;
+            let host =
+                std::env::var("ENGINE_IO_SECURE_HOST").unwrap_or_else(|_| "localhost".to_owned());
+            let mut url = crate::engineio::test::engine_io_server_secure()?;
 
-        let mut headers = HeaderMap::default();
-        headers.insert(HOST, host.parse().unwrap());
-        let mut builder = builder(url.clone());
+            let mut headers = HeaderMap::default();
+            headers.insert(HOST, host.parse().unwrap());
+            let mut builder = builder(url.clone());
 
-        builder = builder.tls_config(crate::engineio::test::tls_config()?);
-        builder = builder.headers(headers.clone());
-        let socket = builder.clone().build_websocket_with_upgrade().await?;
+            builder = builder.tls_config(crate::engineio::test::tls_config()?);
+            builder = builder.headers(headers.clone());
+            let socket = builder.clone().build_websocket_with_upgrade().await?;
 
-        test_connection(socket).await?;
+            test_connection(socket).await?;
 
-        let socket = builder.build_websocket().await?;
+            let socket = builder.build_websocket().await?;
 
-        test_connection(socket).await?;
+            test_connection(socket).await?;
 
-        url.set_scheme("wss").unwrap();
+            url.set_scheme("wss").unwrap();
 
-        let builder = self::builder(url)
-            .tls_config(crate::engineio::test::tls_config()?)
-            .headers(headers);
-        let socket = builder.clone().build_websocket().await?;
+            let builder = self::builder(url)
+                .tls_config(crate::engineio::test::tls_config()?)
+                .headers(headers);
+            let socket = builder.clone().build_websocket().await?;
 
-        test_connection(socket).await?;
+            test_connection(socket).await?;
 
-        assert!(builder.build_websocket_with_upgrade().await.is_err());
+            assert!(builder.build_websocket_with_upgrade().await.is_err());
 
-        Ok(())
+            Ok(())
+        })
+        .await
+        .expect("test `test_connection_wss` timed out")
     }
 
     #[tokio::test]
     async fn test_connection_ws() -> Result<()> {
-        let url = crate::engineio::test::engine_io_polling_server()?;
-        assert!(builder(url.clone()).build_websocket().await.is_err());
-        assert!(builder(url).build_websocket_with_upgrade().await.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_polling_server()?;
+            assert!(builder(url.clone()).build_websocket().await.is_err());
+            assert!(builder(url).build_websocket_with_upgrade().await.is_err());
 
-        let mut url = crate::engineio::test::engine_io_server()?;
+            let mut url = crate::engineio::test::engine_io_server()?;
 
-        let builder = builder(url.clone());
-        let socket = builder.clone().build_websocket().await?;
-        test_connection(socket).await?;
+            let builder = builder(url.clone());
+            let socket = builder.clone().build_websocket().await?;
+            test_connection(socket).await?;
 
-        let socket = builder.build_websocket_with_upgrade().await?;
-        test_connection(socket).await?;
+            let socket = builder.build_websocket_with_upgrade().await?;
+            test_connection(socket).await?;
 
-        url.set_scheme("ws").unwrap();
+            url.set_scheme("ws").unwrap();
 
-        let builder = self::builder(url);
-        let socket = builder.clone().build_websocket().await?;
+            let builder = self::builder(url);
+            let socket = builder.clone().build_websocket().await?;
 
-        test_connection(socket).await?;
+            test_connection(socket).await?;
 
-        assert!(builder.build_websocket_with_upgrade().await.is_err());
+            assert!(builder.build_websocket_with_upgrade().await.is_err());
 
-        Ok(())
+            Ok(())
+        })
+        .await
+        .expect("test `test_connection_ws` timed out")
     }
 
     #[tokio::test]
     async fn test_open_invariants() -> Result<()> {
-        let url = crate::engineio::test::engine_io_server()?;
-        let illegal_url = "this is illegal";
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let url = crate::engineio::test::engine_io_server()?;
+            let illegal_url = "this is illegal";
 
-        assert!(Url::parse(illegal_url).is_err());
+            assert!(Url::parse(illegal_url).is_err());
 
-        let invalid_protocol = "file:///tmp/foo";
-        assert!(
-            builder(Url::parse(invalid_protocol).unwrap())
-                .build()
+            let invalid_protocol = "file:///tmp/foo";
+            assert!(
+                builder(Url::parse(invalid_protocol).unwrap())
+                    .build()
+                    .await
+                    .is_err()
+            );
+
+            let sut = builder(url.clone()).build().await?;
+            let _error = sut
+                .emit(Packet::new(PacketId::Close, Bytes::new()))
                 .await
-                .is_err()
-        );
+                .expect_err("error");
+            assert!(matches!(_error, Error::NotConnected));
 
-        let sut = builder(url.clone()).build().await?;
-        let _error = sut
-            .emit(Packet::new(PacketId::Close, Bytes::new()))
-            .await
-            .expect_err("error");
-        assert!(matches!(_error, Error::NotConnected));
+            // test missing match arm in socket constructor
+            let mut headers = HeaderMap::default();
+            let host =
+                std::env::var("ENGINE_IO_SECURE_HOST").unwrap_or_else(|_| "localhost".to_owned());
+            headers.insert(HOST, host.parse().unwrap());
 
-        // test missing match arm in socket constructor
-        let mut headers = HeaderMap::default();
-        let host =
-            std::env::var("ENGINE_IO_SECURE_HOST").unwrap_or_else(|_| "localhost".to_owned());
-        headers.insert(HOST, host.parse().unwrap());
-
-        let _ = builder(url.clone()).build().await?;
-        let _ = builder(url).headers(headers).build().await?;
-        Ok(())
+            let _ = builder(url.clone()).build().await?;
+            let _ = builder(url).headers(headers).build().await?;
+            Ok(())
+        })
+        .await
+        .expect("test `test_open_invariants` timed out")
     }
 }

@@ -1010,50 +1010,58 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn link_counts_packets_bytes_and_sessions() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let client = crate::ClientBuilder::new(socketio_next_testing::conformance_server())
-            .reconnection_delay(Duration::from_millis(20))
-            .randomization_factor(0.0)
-            .on("echo-back", move |_e: crate::Event, _c: crate::Client| {
-                let _ = tx.send(());
-                std::future::ready(())
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let client = crate::ClientBuilder::new(socketio_next_testing::conformance_server())
+                .reconnection_delay(Duration::from_millis(20))
+                .randomization_factor(0.0)
+                .on("echo-back", move |_e: crate::Event, _c: crate::Client| {
+                    let _ = tx.send(());
+                    std::future::ready(())
+                })
+                .connect()
+                .await
+                .unwrap();
+            let before = client.link_info();
+            assert_eq!(before.sessions, 1);
+            client.emit("echo", vec![json!(1), json!("abc")]).unwrap();
+            rx.recv().await.unwrap();
+            let after = client.link_info();
+            assert!(after.packets_out > before.packets_out, "{after:?}");
+            assert!(after.bytes_out >= before.bytes_out + 9, "{after:?}");
+            assert!(after.packets_in > before.packets_in && after.bytes_in > before.bytes_in);
+            client.emit("drop", ()).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while client.link_info().sessions < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             })
-            .connect()
             .await
-            .unwrap();
-        let before = client.link_info();
-        assert_eq!(before.sessions, 1);
-        client.emit("echo", vec![json!(1), json!("abc")]).unwrap();
-        rx.recv().await.unwrap();
-        let after = client.link_info();
-        assert!(after.packets_out > before.packets_out, "{after:?}");
-        assert!(after.bytes_out >= before.bytes_out + 9, "{after:?}");
-        assert!(after.packets_in > before.packets_in && after.bytes_in > before.bytes_in);
-        client.emit("drop", ()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while client.link_info().sessions < 2 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            .expect("a second session after the drop");
+            client.disconnect().await.unwrap();
         })
         .await
-        .expect("a second session after the drop");
-        client.disconnect().await.unwrap();
+        .expect("test `link_counts_packets_bytes_and_sessions` timed out")
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_returns_a_connected_client() {
-        let client = crate::ClientBuilder::new(socketio_next_testing::socket_io_server())
-            .connect()
-            .await
-            .unwrap();
-        assert!(client.connected());
-        assert!(client.id().is_some());
-        assert!(matches!(client.state(), ConnectionState::Connected { .. }));
-        assert!(client.link_info().sid.is_some());
-        client
-            .emit("echo", json!(1))
-            .expect("emit right after connect");
-        client.disconnect().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let client = crate::ClientBuilder::new(socketio_next_testing::socket_io_server())
+                .connect()
+                .await
+                .unwrap();
+            assert!(client.connected());
+            assert!(client.id().is_some());
+            assert!(matches!(client.state(), ConnectionState::Connected { .. }));
+            assert!(client.link_info().sid.is_some());
+            client
+                .emit("echo", json!(1))
+                .expect("emit right after connect");
+            client.disconnect().await.unwrap();
+        })
+        .await
+        .expect("test `connect_returns_a_connected_client` timed out")
     }
 
     #[test]

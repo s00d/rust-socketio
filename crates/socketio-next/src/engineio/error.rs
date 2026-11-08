@@ -91,7 +91,15 @@ impl From<reqwest::Error> for Error {
 
 impl From<tungstenite::Error> for Error {
     fn from(err: tungstenite::Error) -> Self {
-        Error::Websocket(Arc::new(err))
+        match err {
+            // a refused handshake (3xx, 4xx): its response may carry a `Location` with the
+            // query; only the status is kept
+            tungstenite::Error::Http(response) => Error::HttpStatus {
+                status: response.status().as_u16(),
+                message: None,
+            },
+            err => Error::Websocket(Arc::new(err)),
+        }
     }
 }
 
@@ -109,29 +117,93 @@ pub(crate) fn body_message(body: &[u8]) -> Option<String> {
         .ok()
         .and_then(|json| json.get("message")?.as_str().map(str::to_owned))
         .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
-    let text = raw
-        .split_whitespace()
-        .map(scrub)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let text = scrub(&raw);
     let text: String = text.chars().take(200).collect();
     (!text.is_empty()).then_some(text)
 }
 
-/// `<url>` for URLs, `<redacted>` for paths, queries and anything naming a credential.
-fn scrub(word: &str) -> &str {
-    let lower = word.to_ascii_lowercase();
-    let query_like = (lower.contains('?') || lower.contains('&')) && lower.contains('=');
-    let credential = ["token", "key", "secret", "password", "auth"]
-        .iter()
-        .any(|w| lower.contains(w));
-    if word.contains("://") {
-        "<url>"
-    } else if word.starts_with('/') || word.starts_with('?') || query_like || credential {
-        "<redacted>"
-    } else {
-        word
+/// Words that name a credential on their own (`password: x`, `token x`): the next word is a
+/// secret. Ambiguous ones ("session", "key", "auth") only count in a `name=value` word.
+const CREDENTIAL_NAMES: &[&str] = &[
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "x-api-key",
+    "secret",
+    "client_secret",
+    "password",
+    "passwd",
+    "pwd",
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "jwt",
+    "bearer",
+    "basic",
+];
+
+/// Credential names that may appear as part of a `name=value` key (`apiKey=`, `x_token=`).
+const CREDENTIAL_PARTS: &[&str] = &[
+    "token", "key", "secret", "password", "passwd", "auth", "session", "jwt",
+];
+
+fn is_credential_name(word: &str) -> bool {
+    let name = word
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .to_ascii_lowercase();
+    CREDENTIAL_NAMES.contains(&name.as_str())
+}
+
+/// `<url>` for URLs, `<redacted>` for paths, queries and the values of credentials
+/// (`name=value`, `name: value`, `name value`, `Bearer value`); other words stay
+/// ("Unauthorized", "Forbidden").
+fn scrub(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut redact_next = 0usize;
+    for word in words {
+        if redact_next > 0 {
+            redact_next -= 1;
+            out.push("<redacted>".into());
+            // `Authorization: Bearer xyz`: the scheme is followed by the secret
+            if is_credential_name(word)
+                && matches!(word.to_ascii_lowercase().as_str(), "bearer" | "basic")
+            {
+                redact_next = 1;
+            }
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        if word.contains("://") {
+            out.push("<url>".into());
+        } else if word.starts_with('/')
+            || word.starts_with('?')
+            || ((lower.contains('?') || lower.contains('&')) && lower.contains('='))
+        {
+            // a path or a query
+            out.push("<redacted>".into());
+        } else if let Some((name, _)) = word.split_once(['=', ':']).filter(|(_, v)| !v.is_empty()) {
+            // `name=value` / `name:value` in one word
+            let lname = name.to_ascii_lowercase();
+            if is_credential_name(name) || CREDENTIAL_PARTS.iter().any(|p| lname.contains(p)) {
+                out.push(format!("{name}=<redacted>"));
+            } else {
+                out.push(word.to_owned());
+            }
+        } else if is_credential_name(word) {
+            // `password: hunter2`, `token abc`, `Bearer eyJ...`
+            out.push(word.to_owned());
+            redact_next = 1;
+        } else {
+            out.push(word.to_owned());
+        }
     }
+    out.join(" ")
 }
 
 /// Result alias of this crate.
@@ -151,15 +223,33 @@ mod tests {
             body_message(b"<h1>Forbidden</h1> see https://proxy/x?token=s").as_deref(),
             Some("<h1>Forbidden</h1> see <url>")
         );
-        // an echoed request line, in a text body and in the JSON message
+        // an echoed request line, in a text body and in the JSON message, and credential
+        // values in every usual form
         for body in [
             &b"Cannot GET /socket.io/?EIO=4&token=SECRET"[..],
             br#"{"code":3,"message":"Bad request ?sid=x&token=SECRET"}"#,
             b"denied: apiKey=SECRET",
             b"x a&b=SECRET",
+            b"Authorization: Bearer SECRET",
+            b"password: SECRET please",
+            b"token SECRET",
+            b"bad credentials (password=SECRET)",
+            b"Proxy-Authorization: Basic SECRET",
         ] {
             let message = body_message(body).unwrap();
             assert!(!message.contains("SECRET"), "{message}");
+        }
+        // ordinary words stay
+        for (body, kept) in [
+            (&b"Unauthorized"[..], "Unauthorized"),
+            (
+                b"Forbidden: authentication required",
+                "Forbidden: authentication required",
+            ),
+            (br#"{"message":"Session ID unknown"}"#, "Session ID unknown"),
+            (b"Bad handshake method", "Bad handshake method"),
+        ] {
+            assert_eq!(body_message(body).as_deref(), Some(kept));
         }
         let long_json = format!(r#"{{"message":"{}"}}"#, "a".repeat(500));
         assert_eq!(body_message(long_json.as_bytes()).unwrap().len(), 200);
@@ -186,17 +276,21 @@ mod tests {
 
     #[tokio::test]
     async fn http_errors_drop_the_url() {
-        // nothing listens on port 9 of localhost
-        let client = crate::engineio::tls::apply_reqwest_tls!(reqwest::Client::builder(), None)
-            .build()
-            .unwrap();
-        let err = client
-            .get("http://127.0.0.1:9/engine.io/?token=SECRET")
-            .send()
-            .await
-            .unwrap_err();
-        let err = Error::from(err);
-        let text = format!("{err} {err:?}");
-        assert!(!text.contains("SECRET"), "{text}");
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            // nothing listens on port 9 of localhost
+            let client = crate::engineio::tls::apply_reqwest_tls!(reqwest::Client::builder(), None)
+                .build()
+                .unwrap();
+            let err = client
+                .get("http://127.0.0.1:9/engine.io/?token=SECRET")
+                .send()
+                .await
+                .unwrap_err();
+            let err = Error::from(err);
+            let text = format!("{err} {err:?}");
+            assert!(!text.contains("SECRET"), "{text}");
+        })
+        .await
+        .expect("test `http_errors_drop_the_url` timed out")
     }
 }

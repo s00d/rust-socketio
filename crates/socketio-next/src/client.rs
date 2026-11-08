@@ -176,7 +176,7 @@ fn start(inner: &Arc<Inner>) -> oneshot::Receiver<Result<()>> {
 
 /// The engine.io URL and the namespace: like socket.io-client, the URL path is the namespace
 /// unless one is set explicitly; the engine.io path comes from the builder.
-fn resolve(config: &Config) -> Result<(url::Url, String)> {
+pub(crate) fn resolve(config: &Config) -> Result<(url::Url, String)> {
     let mut url = url::Url::parse(&config.address)?;
     let url_nsp = match url.path() {
         "" | "/" => None,
@@ -313,7 +313,7 @@ impl Client {
             }
         }
         #[cfg(test)]
-        tests::reconnect_pause().await;
+        tests::reconnect_pause(&self.inner.nsp).await;
         let ready = {
             let lifecycle = self.lifecycle();
             // a disconnect() since this call began wins: the client stays closed
@@ -564,15 +564,18 @@ mod tests {
     use std::sync::OnceLock;
     use tokio::sync::Notify;
 
-    /// (reached, go): `reconnect()` waits at the point between its awaits and the start.
-    type Pause = (Arc<Notify>, Arc<Notify>);
+    /// (namespace, reached, go): `reconnect()` of a client of that namespace (only: other
+    /// tests reconnect in parallel) waits between its awaits and the start.
+    type Pause = (String, Arc<Notify>, Arc<Notify>);
     static PAUSE: OnceLock<Mutex<Option<Pause>>> = OnceLock::new();
 
-    pub(super) async fn reconnect_pause() {
+    pub(super) async fn reconnect_pause(nsp: &str) {
         let pause = PAUSE.get_or_init(Mutex::default).lock().unwrap().clone();
-        if let Some((reached, go)) = pause {
-            reached.notify_one();
-            go.notified().await;
+        if let Some((target, reached, go)) = pause {
+            if target == nsp {
+                reached.notify_one();
+                go.notified().await;
+            }
         }
     }
 
@@ -587,54 +590,62 @@ mod tests {
     /// stay closed (it was revived before).
     #[tokio::test(flavor = "multi_thread")]
     async fn disconnect_during_reconnect_wins() {
-        let client = closed_client(socketio_next_testing::socket_io_server()).await;
-        let (reached, go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-        *PAUSE.get_or_init(Mutex::default).lock().unwrap() =
-            Some((Arc::clone(&reached), Arc::clone(&go)));
-        let reconnecting = {
-            let client = client.clone();
-            tokio::spawn(async move { client.reconnect().await })
-        };
-        reached.notified().await;
-        *PAUSE.get().unwrap().lock().unwrap() = None;
-        client.disconnect().await.unwrap();
-        go.notify_one();
-        let result = tokio::time::timeout(Duration::from_secs(5), reconnecting)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(result, Err(Error::Closed)), "{result:?}");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(client.state().is_closed() && !client.connected());
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let client = closed_client(socketio_next_testing::socket_io_server()).await;
+            let (reached, go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+            *PAUSE.get_or_init(Mutex::default).lock().unwrap() =
+                Some(("/".into(), Arc::clone(&reached), Arc::clone(&go)));
+            let reconnecting = {
+                let client = client.clone();
+                tokio::spawn(async move { client.reconnect().await })
+            };
+            reached.notified().await;
+            *PAUSE.get().unwrap().lock().unwrap() = None;
+            client.disconnect().await.unwrap();
+            go.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(5), reconnecting)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(result, Err(Error::Closed)), "{result:?}");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(client.state().is_closed() && !client.connected());
+        })
+        .await
+        .expect("test `disconnect_during_reconnect_wins` timed out")
     }
 
     /// Case B: `disconnect()` while the restarted connection task is connecting (a namespace
     /// that answers CONNECT after 200 ms) returns promptly and leaves the client closed.
     #[tokio::test(flavor = "multi_thread")]
     async fn disconnect_during_a_reconnect_attempt_returns() {
-        let client = closed_client(format!(
-            "{}/slow",
-            socketio_next_testing::socket_io_server()
-        ))
-        .await;
-        let reconnecting = {
-            let client = client.clone();
-            tokio::spawn(async move { client.reconnect().await })
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        tokio::time::timeout(Duration::from_secs(5), client.disconnect())
-            .await
-            .expect("disconnect did not hang")
-            .unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), reconnecting)
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            client.state().is_closed() && !client.connected(),
-            "{:?}",
-            client.state()
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let client = closed_client(format!(
+                "{}/slow",
+                socketio_next_testing::socket_io_server()
+            ))
+            .await;
+            let reconnecting = {
+                let client = client.clone();
+                tokio::spawn(async move { client.reconnect().await })
+            };
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+                .await
+                .expect("disconnect did not hang")
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), reconnecting)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                client.state().is_closed() && !client.connected(),
+                "{:?}",
+                client.state()
+            );
+        })
+        .await
+        .expect("test `disconnect_during_a_reconnect_attempt_returns` timed out")
     }
 
     #[test]

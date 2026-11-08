@@ -194,7 +194,7 @@ impl SocketIo {
         let webview = sub.as_ref().and_then(|s| s.webview.clone());
         // The id and (for a webview) one subscription slot are held while connecting, so
         // concurrent connects can neither share an id nor exceed the cap.
-        let _pending = {
+        let pending = {
             let clients = lock(&self.inner.clients);
             let mut pending = lock(&self.inner.pending);
             if clients.contains_key(&id) || pending.ids.contains(&id) {
@@ -231,6 +231,8 @@ impl SocketIo {
             })
             .connect()
             .await?;
+        #[cfg(test)]
+        let id_for_test = id.clone();
         {
             let mut clients = lock(&self.inner.clients);
             if clients.contains_key(&id) {
@@ -246,7 +248,12 @@ impl SocketIo {
                     dynamic,
                 },
             );
+            // registered: the client and its subscription count from here, the pending id
+            // and slot do not any more
+            drop(pending);
         }
+        #[cfg(test)]
+        tests::after_insert(&id_for_test).await;
         let Some(sub_id) = sub_id else {
             return Ok((client, None));
         };
@@ -415,15 +422,28 @@ impl SocketIo {
         if self.inner.allowed.is_empty() {
             return true;
         }
-        let Ok(url) = url::Url::parse(url) else {
+        // dot segments and backslashes are refused outright: they mean something else to the
+        // URL parser (and to some servers) than to a prefix comparison
+        if let Some(path) = engine_path {
+            let lower = path.to_ascii_lowercase();
+            if path.contains("..") || lower.contains("%2e") || path.contains('\\') {
+                return false;
+            }
+        }
+        // the URL the connection really uses, built by socketio-next itself
+        let mut builder = ClientBuilder::new(url);
+        if let Some(path) = engine_path {
+            builder = builder.path(path);
+        }
+        let Ok(engine) = builder.engine_url() else {
             return false;
         };
-        let path = normalize_engine_path(engine_path.unwrap_or("/socket.io/"));
+        let path = engine.path();
         self.inner.allowed.iter().any(|p| {
             let base = p.path().trim_end_matches('/');
-            p.scheme() == url.scheme()
-                && p.host_str() == url.host_str()
-                && p.port_or_known_default() == url.port_or_known_default()
+            p.scheme() == engine.scheme()
+                && p.host_str() == engine.host_str()
+                && p.port_or_known_default() == engine.port_or_known_default()
                 && (base.is_empty() || path.strip_prefix(base).is_some_and(|r| r.starts_with('/')))
         })
     }
@@ -531,18 +551,6 @@ impl SocketIo {
     fn hub(&self, id: &str) -> Arc<Hub> {
         Arc::clone(&lock(&self.inner.clients)[id].hub)
     }
-}
-
-/// Like socketio-next's `path()`: a leading and a trailing `/`.
-fn normalize_engine_path(path: &str) -> String {
-    let mut path = path.to_owned();
-    if !path.starts_with('/') {
-        path.insert(0, '/');
-    }
-    if !path.ends_with('/') {
-        path.push('/');
-    }
-    path
 }
 
 /// Ids and subscription slots held by connects in flight.
@@ -816,6 +824,64 @@ impl HubState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+    use tokio::sync::Notify;
+
+    /// (client id, reached, go): the connect of that id (only: other tests run in parallel)
+    /// waits right after it registered its client.
+    type Pause = (String, Arc<Notify>, Arc<Notify>);
+    static PAUSE: OnceLock<Mutex<Option<Pause>>> = OnceLock::new();
+
+    pub(super) async fn after_insert(id: &str) {
+        let pause = lock(PAUSE.get_or_init(Mutex::default)).clone();
+        if let Some((target, reached, go)) = pause {
+            if target == id {
+                reached.notify_one();
+                go.notified().await;
+            }
+        }
+    }
+
+    /// Once the client is registered, its pending id and slot are given back (they counted
+    /// twice against the cap while the connect settled).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registered_connect_holds_no_pending_slot() {
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let io = SocketIo::default();
+            let (reached, go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+            *lock(PAUSE.get_or_init(Mutex::default)) =
+                Some(("p".into(), Arc::clone(&reached), Arc::clone(&go)));
+            let (ch, _rx) = channel();
+            let connecting = {
+                let io = io.clone();
+                tokio::spawn(async move {
+                    let url = conformance_server();
+                    let builder = ClientBuilder::new(url.clone());
+                    io.connect_from_webview(
+                        "p".into(),
+                        &url,
+                        None,
+                        builder,
+                        Default::default(),
+                        sub(ch, "w"),
+                    )
+                    .await
+                })
+            };
+            reached.notified().await;
+            *lock(PAUSE.get().unwrap()) = None;
+            {
+                let pending = lock(&io.inner.pending);
+                assert!(pending.ids.is_empty(), "the id is still pending");
+                assert_eq!(pending.slots.get("w").copied().unwrap_or_default(), 0);
+            }
+            go.notify_one();
+            connecting.await.unwrap().unwrap();
+            io.remove("p").unwrap().disconnect().await.unwrap();
+        })
+        .await
+        .expect("test `a_registered_connect_holds_no_pending_slot` timed out")
+    }
     use socketio_next_testing::{conformance_server, socket_io_server};
     use tauri::ipc::InvokeResponseBody;
 
@@ -867,60 +933,68 @@ mod tests {
     /// Finding 7: once a disconnect started, server acks are no longer offered or kept.
     #[tokio::test(flavor = "multi_thread")]
     async fn no_acks_are_minted_after_stop_acks() {
-        let (client, mut events) = asking_client().await;
-        let hub = Hub::new(true);
-        let (ch, rx) = channel();
-        lock(&hub.state).subs.insert(1, sub(ch, "w").into_sub());
-        client.emit("ask", ()).unwrap();
-        let q = question(&mut events).await;
-        hub.stop_acks();
-        hub.event(q);
-        let m = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(m["event"], "question");
-        assert!(m.get("ackId").is_none(), "{m}");
-        assert!(lock(&hub.state).acks.is_empty());
-        client.disconnect().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let (client, mut events) = asking_client().await;
+            let hub = Hub::new(true);
+            let (ch, rx) = channel();
+            lock(&hub.state).subs.insert(1, sub(ch, "w").into_sub());
+            client.emit("ask", ()).unwrap();
+            let q = question(&mut events).await;
+            hub.stop_acks();
+            hub.event(q);
+            let m = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(m["event"], "question");
+            assert!(m.get("ackId").is_none(), "{m}");
+            assert!(lock(&hub.state).acks.is_empty());
+            client.disconnect().await.unwrap();
+        })
+        .await
+        .expect("test `no_acks_are_minted_after_stop_acks` timed out")
     }
 
     /// Finding 3: a webview's flood of acks forgets only its own oldest offers.
     #[tokio::test(flavor = "multi_thread")]
     async fn ack_budget_is_per_webview() {
-        let (client, mut events) = asking_client().await;
-        let hub = Hub::new(true);
-        let (greedy, _g) = channel();
-        let (polite, polite_rx) = channel();
-        lock(&hub.state)
-            .subs
-            .insert(1, sub(greedy, "greedy").into_sub());
-        // the polite webview gets the first question only
-        lock(&hub.state)
-            .subs
-            .insert(2, sub(polite, "polite").into_sub());
-        client.emit("ask", ()).unwrap();
-        hub.event(question(&mut events).await);
-        let first = polite_rx.recv_timeout(Duration::from_secs(5)).unwrap()["ackId"]
-            .as_u64()
-            .unwrap();
-        hub.remove_sub(2, None);
-        let q = question_with_ack(&client, &mut events).await;
-        for _ in 0..MAX_PENDING_ACKS_PER_WEBVIEW + 10 {
-            hub.event(q.clone());
-        }
-        let greedy_count = lock(&hub.state)
-            .acks
-            .values()
-            .filter(|a| a.webviews.iter().any(|w| w == "greedy"))
-            .count();
-        assert_eq!(greedy_count, MAX_PENDING_ACKS_PER_WEBVIEW);
-        assert!(
-            hub.take_ack(first, "greedy").is_none(),
-            "greedy's own oldest went"
-        );
-        assert!(
-            hub.take_ack(first, "polite").is_some(),
-            "the polite webview kept its ack"
-        );
-        client.disconnect().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let (client, mut events) = asking_client().await;
+            let hub = Hub::new(true);
+            let (greedy, _g) = channel();
+            let (polite, polite_rx) = channel();
+            lock(&hub.state)
+                .subs
+                .insert(1, sub(greedy, "greedy").into_sub());
+            // the polite webview gets the first question only
+            lock(&hub.state)
+                .subs
+                .insert(2, sub(polite, "polite").into_sub());
+            client.emit("ask", ()).unwrap();
+            hub.event(question(&mut events).await);
+            let first = polite_rx.recv_timeout(Duration::from_secs(5)).unwrap()["ackId"]
+                .as_u64()
+                .unwrap();
+            hub.remove_sub(2, None);
+            let q = question_with_ack(&client, &mut events).await;
+            for _ in 0..MAX_PENDING_ACKS_PER_WEBVIEW + 10 {
+                hub.event(q.clone());
+            }
+            let greedy_count = lock(&hub.state)
+                .acks
+                .values()
+                .filter(|a| a.webviews.iter().any(|w| w == "greedy"))
+                .count();
+            assert_eq!(greedy_count, MAX_PENDING_ACKS_PER_WEBVIEW);
+            assert!(
+                hub.take_ack(first, "greedy").is_none(),
+                "greedy's own oldest went"
+            );
+            assert!(
+                hub.take_ack(first, "polite").is_some(),
+                "the polite webview kept its ack"
+            );
+            client.disconnect().await.unwrap();
+        })
+        .await
+        .expect("test `ack_budget_is_per_webview` timed out")
     }
 
     async fn question_with_ack(
@@ -934,21 +1008,25 @@ mod tests {
     /// Finding 8: one server ack, one ack id for every subscription, answered once.
     #[tokio::test(flavor = "multi_thread")]
     async fn one_ack_id_per_server_ack() {
-        let (client, mut events) = asking_client().await;
-        let hub = Hub::new(true);
-        let (a, a_rx) = channel();
-        let (b, b_rx) = channel();
-        lock(&hub.state).subs.insert(1, sub(a, "w1").into_sub());
-        lock(&hub.state).subs.insert(2, sub(b, "w2").into_sub());
-        hub.event(question_with_ack(&client, &mut events).await);
-        let ida = a_rx.recv_timeout(Duration::from_secs(5)).unwrap()["ackId"].clone();
-        let idb = b_rx.recv_timeout(Duration::from_secs(5)).unwrap()["ackId"].clone();
-        assert_eq!(ida, idb);
-        let id = ida.as_u64().unwrap();
-        assert!(hub.take_ack(id, "w3").is_none(), "not offered to w3");
-        assert!(hub.take_ack(id, "w2").is_some());
-        assert!(hub.take_ack(id, "w1").is_none(), "answered once");
-        client.disconnect().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let (client, mut events) = asking_client().await;
+            let hub = Hub::new(true);
+            let (a, a_rx) = channel();
+            let (b, b_rx) = channel();
+            lock(&hub.state).subs.insert(1, sub(a, "w1").into_sub());
+            lock(&hub.state).subs.insert(2, sub(b, "w2").into_sub());
+            hub.event(question_with_ack(&client, &mut events).await);
+            let ida = a_rx.recv_timeout(Duration::from_secs(5)).unwrap()["ackId"].clone();
+            let idb = b_rx.recv_timeout(Duration::from_secs(5)).unwrap()["ackId"].clone();
+            assert_eq!(ida, idb);
+            let id = ida.as_u64().unwrap();
+            assert!(hub.take_ack(id, "w3").is_none(), "not offered to w3");
+            assert!(hub.take_ack(id, "w2").is_some());
+            assert!(hub.take_ack(id, "w1").is_none(), "answered once");
+            client.disconnect().await.unwrap();
+        })
+        .await
+        .expect("test `one_ack_id_per_server_ack` timed out")
     }
 
     /// Finding 5: the snapshot is the first state message and nothing older follows it, even
@@ -995,75 +1073,87 @@ mod tests {
     /// The real `snapshot_to` with the client fallback and the last forwarded state.
     #[tokio::test(flavor = "multi_thread")]
     async fn snapshot_uses_the_last_forwarded_state() {
-        let client = ClientBuilder::new(socket_io_server())
-            .connect()
-            .await
-            .unwrap();
-        let hub = Hub::new(true);
-        let (ch, rx) = channel();
-        lock(&hub.state).subs.insert(1, sub(ch, "w").into_sub());
-        assert!(
-            matches!(hub.snapshot_to(1, &client), State::Connected { .. }),
-            "fallback"
-        );
-        hub.forward_state(State::Disconnected {
-            reason: "transport close".into(),
-            error: None,
-        });
-        let (ch2, rx2) = channel();
-        lock(&hub.state).subs.insert(2, sub(ch2, "w").into_sub());
-        assert!(matches!(
-            hub.snapshot_to(2, &client),
-            State::Disconnected { .. }
-        ));
-        assert_eq!(rx2.recv().unwrap()["snapshot"], true);
-        assert_eq!(rx.recv().unwrap()["state"]["status"], "connected");
-        client.disconnect().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let client = ClientBuilder::new(socket_io_server())
+                .connect()
+                .await
+                .unwrap();
+            let hub = Hub::new(true);
+            let (ch, rx) = channel();
+            lock(&hub.state).subs.insert(1, sub(ch, "w").into_sub());
+            assert!(
+                matches!(hub.snapshot_to(1, &client), State::Connected { .. }),
+                "fallback"
+            );
+            hub.forward_state(State::Disconnected {
+                reason: "transport close".into(),
+                error: None,
+            });
+            let (ch2, rx2) = channel();
+            lock(&hub.state).subs.insert(2, sub(ch2, "w").into_sub());
+            assert!(matches!(
+                hub.snapshot_to(2, &client),
+                State::Disconnected { .. }
+            ));
+            assert_eq!(rx2.recv().unwrap()["snapshot"], true);
+            assert_eq!(rx.recv().unwrap()["state"]["status"], "connected");
+            client.disconnect().await.unwrap();
+        })
+        .await
+        .expect("test `snapshot_uses_the_last_forwarded_state` timed out")
     }
 
     /// Finding 4: a page reload while its connect is in flight leaves no subscription.
     #[tokio::test(flavor = "multi_thread")]
     async fn reload_during_connect_attaches_nothing() {
-        let io = SocketIo::default();
-        let (ch, _rx) = channel();
-        let connecting = {
-            let io = io.clone();
-            tokio::spawn(async move {
-                // /slow answers CONNECT after 200 ms
-                let url = format!("{}/slow", socket_io_server());
-                let builder = ClientBuilder::new(url.clone());
-                io.connect_from_webview(
-                    "slow".into(),
-                    &url,
-                    None,
-                    builder,
-                    Default::default(),
-                    sub(ch, "w"),
-                )
-                .await
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        io.drop_webview("w");
-        connecting.await.unwrap().unwrap();
-        assert_eq!(io.hub("slow").count("w"), 0);
-        io.remove("slow").unwrap().disconnect().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let io = SocketIo::default();
+            let (ch, _rx) = channel();
+            let connecting = {
+                let io = io.clone();
+                tokio::spawn(async move {
+                    // /slow answers CONNECT after 200 ms
+                    let url = format!("{}/slow", socket_io_server());
+                    let builder = ClientBuilder::new(url.clone());
+                    io.connect_from_webview(
+                        "slow".into(),
+                        &url,
+                        None,
+                        builder,
+                        Default::default(),
+                        sub(ch, "w"),
+                    )
+                    .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            io.drop_webview("w");
+            connecting.await.unwrap().unwrap();
+            assert_eq!(io.hub("slow").count("w"), 0);
+            io.remove("slow").unwrap().disconnect().await.unwrap();
+        })
+        .await
+        .expect("test `reload_during_connect_attaches_nothing` timed out")
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reloaded_webview_loses_its_subscriptions_and_acks() {
-        let io = SocketIo::default();
-        io.connect("c", ClientBuilder::new(conformance_server()))
-            .await
-            .unwrap();
-        let (a, _) = channel();
-        let (b, _) = channel();
-        let (sa, _) = io.subscribe_with("c", sub(a, "a")).unwrap();
-        let (sb, _) = io.subscribe_with("c", sub(b, "b")).unwrap();
-        io.drop_webview("a");
-        assert!(!io.unsubscribe("c", sa));
-        assert!(io.unsubscribe("c", sb));
-        io.remove("c").unwrap().disconnect().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(90), async move {
+            let io = SocketIo::default();
+            io.connect("c", ClientBuilder::new(conformance_server()))
+                .await
+                .unwrap();
+            let (a, _) = channel();
+            let (b, _) = channel();
+            let (sa, _) = io.subscribe_with("c", sub(a, "a")).unwrap();
+            let (sb, _) = io.subscribe_with("c", sub(b, "b")).unwrap();
+            io.drop_webview("a");
+            assert!(!io.unsubscribe("c", sa));
+            assert!(io.unsubscribe("c", sb));
+            io.remove("c").unwrap().disconnect().await.unwrap();
+        })
+        .await
+        .expect("test `a_reloaded_webview_loses_its_subscriptions_and_acks` timed out")
     }
 
     #[test]
@@ -1091,6 +1181,16 @@ mod tests {
         assert!(!ok("wss://rt.example.com/v1/chat", Some("/v10/")));
         assert!(!ok("not a url", None));
         assert!(SocketIo::default().url_allowed("http://anything", Some("/x/")));
+        // dot segments and backslashes cannot climb out of the prefix
+        for path in [
+            "/v1/../admin/",
+            "/v1/%2e%2e/admin/",
+            "/v1/%2E%2E/admin/",
+            "/v1/..\\admin/",
+            "/v1/.%2e/admin/",
+        ] {
+            assert!(!ok("wss://rt.example.com", Some(path)), "{path}");
+        }
     }
 
     #[test]
