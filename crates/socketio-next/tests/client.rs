@@ -1072,3 +1072,41 @@ async fn panicking_inspector_is_contained() {
     assert_eq!(reply.arg::<String>(0).unwrap(), "boom");
     client.disconnect().await.unwrap();
 }
+
+/// `auth_with` returning a non-object on a reconnect closes the client (no endless loop).
+#[tokio::test]
+async fn bad_auth_on_reconnect_is_final() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (builder, mut states) = states(
+        ClientBuilder::new(server())
+            .reconnect_on_disconnect(true)
+            .reconnection_delay(Duration::from_millis(20))
+            .auth_with({
+                let calls = Arc::clone(&calls);
+                move || {
+                    let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                    async move {
+                        if first {
+                            json!({"ok": true})
+                        } else {
+                            json!("not an object")
+                        }
+                    }
+                }
+            }),
+    );
+    let client = connect(builder).await;
+    client.emit("server_disconnect", ()).unwrap();
+    let closed = next_state(&mut states, ConnectionState::is_closed).await;
+    assert!(
+        matches!(
+            closed,
+            ConnectionState::Closed {
+                reason: DisconnectReason::ConnectRejected,
+                error: Some(Error::InvalidAuth(_))
+            }
+        ),
+        "{closed:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}

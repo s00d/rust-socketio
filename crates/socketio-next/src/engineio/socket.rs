@@ -88,12 +88,22 @@ impl Socket {
                     .last_ping
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Instant::now();
-                self.emit(Packet::new(PacketId::Pong, Bytes::new())).await?;
+                // Answered off the read path: a write stuck on a dead link (holding the writer
+                // lock) must not keep the stream, and so the heartbeat check, from running.
+                let socket = self.clone();
+                tokio::spawn(async move {
+                    let _ = socket.emit(Packet::new(PacketId::Pong, Bytes::new())).await;
+                });
             }
-            // Only the client sends these.
-            PacketId::Pong | PacketId::Open => {
+            PacketId::Pong => {
                 return Err(crate::protocol::Error::InvalidPacket(
-                    "the server sent a client-only packet (open/pong)",
+                    "unexpected pong from the server (the client answers pings, not the server)",
+                )
+                .into());
+            }
+            PacketId::Open => {
+                return Err(crate::protocol::Error::InvalidPacket(
+                    "unexpected second open packet in an established session",
                 )
                 .into());
             }
@@ -182,7 +192,9 @@ impl Socket {
             return Ok(());
         }
         if !self.connected.load(Ordering::Acquire) {
-            return Err(Error::NotConnected);
+            let error = Error::NotConnected;
+            Callbacks::fire(&self.callbacks.on_error, error.to_string());
+            return Err(error);
         }
         let max = self.handshake.max_payload.unwrap_or(1_000_000) as usize;
         for chunk in split_by_payload(packets, max) {

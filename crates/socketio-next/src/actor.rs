@@ -239,7 +239,9 @@ impl Actor {
                     tracing::warn!(attempt, error = %err, "reconnect attempt failed");
                     if matches!(
                         err,
-                        Error::ConnectRejected { .. } | Error::IncompatibleServer
+                        Error::ConnectRejected { .. }
+                            | Error::IncompatibleServer
+                            | Error::InvalidAuth(_)
                     ) {
                         self.close(DisconnectReason::ConnectRejected, Some(err));
                         return None;

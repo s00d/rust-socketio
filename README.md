@@ -152,6 +152,10 @@ packets use `inspect_packets`.
 RUST_LOG=socketio_next=debug cargo run
 ```
 
+Only `socketio_next` targets are redacted. tungstenite logs the full websocket handshake
+request (URL with query, headers) with the `log` crate at trace level; if you bridge `log` into
+`tracing`, keep `tungstenite=info` or higher when the query carries secrets.
+
 ### Troubleshooting
 
 | Symptom | Check |
