@@ -4,6 +4,7 @@
 //        (GET /log?tag=<tag> returns them); the Node client and the Rust client run the same
 //        scenario and the logs must match.
 // :4211  the same events with connection state recovery enabled.
+// :4212  the same events with pingInterval 300 ms, pingTimeout 200 ms.
 const http = require("http");
 const { Server } = require("socket.io");
 
@@ -81,3 +82,5 @@ function serve(port, opts) {
 
 serve(4210, {});
 serve(4211, { connectionStateRecovery: { maxDisconnectionDuration: 60000 } });
+// fast heartbeat for ping-timeout tests (pingInterval + pingTimeout = 500 ms)
+serve(4212, { pingInterval: 300, pingTimeout: 200 });

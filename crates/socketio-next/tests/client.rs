@@ -963,3 +963,53 @@ async fn logs_redact_query_values() {
         "secret in the logs:\n{logs}"
     );
 }
+
+/// A blackholed link (TCP open, nothing gets through) is detected by the heartbeat:
+/// Disconnected(ping timeout), and `last_ping_at` showed the pings before.
+#[tokio::test]
+async fn ping_timeout_on_a_blackholed_link() {
+    let proxy = Proxy::start(&host_port(&fast_ping_server())).await;
+    let (builder, mut states) = states(
+        ClientBuilder::new(proxy.url())
+            .transport_type(TransportType::Websocket)
+            .reconnection(false),
+    );
+    let client = connect(builder).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(client.link_info().last_ping_at.is_some(), "no ping seen");
+    assert_eq!(
+        client.link_info().ping_interval,
+        Some(Duration::from_millis(300))
+    );
+    proxy.freeze();
+    let closed = next_state(&mut states, ConnectionState::is_closed).await;
+    assert!(
+        matches!(
+            closed,
+            ConnectionState::Closed {
+                reason: DisconnectReason::PingTimeout,
+                ..
+            }
+        ),
+        "{closed:?}"
+    );
+    proxy.cut();
+}
+
+/// `disconnect()` on a dead link returns promptly (goodbye packets are bounded).
+#[tokio::test]
+async fn disconnect_is_bounded_on_a_dead_link() {
+    let proxy = Proxy::start(&host_port(&server())).await;
+    let client =
+        connect(ClientBuilder::new(proxy.url()).transport_type(TransportType::Polling)).await;
+    proxy.freeze();
+    let started = std::time::Instant::now();
+    client.disconnect().await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(client.state().is_closed());
+    proxy.cut();
+}

@@ -2,7 +2,7 @@
 //! the test CA, a TCP proxy that can cut connections, and the differential harness that runs a
 //! scenario with the Node client.
 //!
-//! Servers: `just servers` (ci/: ports 4200-4206; ci/conformance: 4210-4211). Every URL can
+//! Servers: `just servers` (ci/: ports 4200-4206; ci/conformance: 4210-4212). Every URL can
 //! be overridden with an environment variable of the same name in upper case.
 
 use std::path::PathBuf;
@@ -52,6 +52,11 @@ pub fn recovery_server() -> String {
     env_or("RECOVERY_SERVER", "http://localhost:4211")
 }
 
+/// socket.io 4.8 server with a 300 ms / 200 ms heartbeat (`ci/conformance/server.js`).
+pub fn fast_ping_server() -> String {
+    env_or("FAST_PING_SERVER", "http://localhost:4212")
+}
+
 /// The test CA (`ci/cert/ca.crt`, `CA_CERT_PATH` overrides).
 pub fn ca_cert_pem() -> Vec<u8> {
     let path = std::env::var("CA_CERT_PATH")
@@ -70,6 +75,7 @@ pub struct Proxy {
 #[derive(Debug, Default)]
 struct ProxyState {
     cut: Notify,
+    freeze: Notify,
     refuse: AtomicBool,
     accepted: AtomicUsize,
     open: AtomicUsize,
@@ -101,9 +107,13 @@ impl Proxy {
                     };
                     state.open.fetch_add(1, Ordering::SeqCst);
                     let cut = state.cut.notified();
+                    let freeze = state.freeze.notified();
+                    tokio::pin!(cut);
                     tokio::select! {
                         _ = copy_bidirectional(&mut inbound, &mut outbound) => {}
-                        _ = cut => {}
+                        _ = &mut cut => {}
+                        // a half-dead link: the sockets stay open, nothing gets through
+                        _ = freeze => cut.await,
                     }
                     state.open.fetch_sub(1, Ordering::SeqCst);
                 });
@@ -120,6 +130,12 @@ impl Proxy {
     /// Drops every open connection.
     pub fn cut(&self) {
         self.state.cut.notify_waiters();
+    }
+
+    /// Stops forwarding on every open connection but keeps the sockets open (a blackholed
+    /// link), until [`cut`](Self::cut).
+    pub fn freeze(&self) {
+        self.state.freeze.notify_waiters();
     }
 
     /// Refuse (true) or accept (false) new connections.

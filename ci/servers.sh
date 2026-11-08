@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Starts / stops the Node test servers in the background (no Docker):
 #   ci/servers.sh start   ports 4200-4206 (ci/, socket.io 4.0 / engine.io 6.4) and
-#                         4210-4211 (ci/conformance, socket.io 4.8); logs in ci/logs/
+#                         4210-4212 (ci/conformance, socket.io 4.8); logs in ci/logs/
 #   ci/servers.sh stop
 # Needs `npm ci` in ci/ and ci/conformance, and ci/cert (./keygen.sh) for the TLS server.
 set -euo pipefail
@@ -20,7 +20,7 @@ start)
     node "${s}" > "logs/${name}.log" 2>&1 &
     echo $! > "logs/${name}.pid"
   done
-  node wait-ports.js 4200 4201 4202 4203 4204 4205 4206 4210 4211
+  node wait-ports.js 4200 4201 4202 4203 4204 4205 4206 4210 4211 4212
   ;;
 stop)
   for pid in logs/*.pid; do

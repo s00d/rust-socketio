@@ -15,6 +15,7 @@ Logs go to `ci/logs/`.
 | 4206 | `socket-io-restart-url-auth.js` | checks a `timestamp` query parameter |
 | 4210 | `conformance/server.js` | socket.io 4.8, records each client's packets (`GET /log?tag=`) |
 | 4211 | `conformance/server.js` | the same with connection state recovery |
+| 4212 | `conformance/server.js` | the same with pingInterval 300 ms / pingTimeout 200 ms |
 
 `conformance/client.js` is the Node side of the differential tests (socket.io-client 4.8).
 
