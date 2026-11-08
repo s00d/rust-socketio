@@ -140,7 +140,11 @@ impl Actor {
         async move {
             let mut conn = match self.connect_attempt(0).await {
                 Step::Done(Ok(conn)) => {
+                    // connected, sid and the Connected state are set before connect() returns
+                    self.on_connected(&conn);
                     let _ = ready.send(Ok(()));
+                    #[cfg(test)]
+                    tests::after_ready().await;
                     conn
                 }
                 Step::Done(Err(err)) => {
@@ -187,7 +191,10 @@ impl Actor {
                         }
                         self.set_state(ConnectionState::Disconnected { reason });
                         match self.reconnect().await {
-                            Some(new_conn) => conn = new_conn,
+                            Some(new_conn) => {
+                                self.on_connected(&new_conn);
+                                conn = new_conn;
+                            }
                             None => return,
                         }
                     }
@@ -296,7 +303,6 @@ impl Actor {
 
     /// Serves one connection until it ends.
     async fn serve(&mut self, conn: &mut Conn) -> Outcome {
-        self.on_connected(conn);
         let mut partial: Option<(Packet, Vec<Bytes>)> = None;
         loop {
             let ack_deadline = self.next_ack_deadline();
@@ -901,6 +907,26 @@ async fn writer_task(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Test builds pause the connection task right after it signalled `connect()`: whatever
+    /// `connect()` promises must be true by then, not a few polls later.
+    pub(super) async fn after_ready() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_returns_a_connected_client() {
+        let client = crate::ClientBuilder::new(socketio_next_testing::socket_io_server())
+            .connect()
+            .await
+            .unwrap();
+        assert!(client.connected());
+        assert!(client.id().is_some());
+        assert!(matches!(client.state(), ConnectionState::Connected { .. }));
+        assert!(client.link_info().sid.is_some());
+        client.emit("echo", json!(1)).expect("emit right after connect");
+        client.disconnect().await.unwrap();
+    }
 
     #[test]
     fn connect_payload_merges_recovery_fields() {
