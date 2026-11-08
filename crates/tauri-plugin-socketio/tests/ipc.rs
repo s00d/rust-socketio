@@ -963,7 +963,9 @@ fn a_ca_option_trusts_a_private_ca() {
     let pem =
         std::fs::read_to_string(socketio_next_testing::repo_root().join("ci/cert/ca.crt")).unwrap();
     let options = |ca: Option<&str>| {
-        let mut o = json!({ "url": "https://localhost:4202", "path": "/engine.io/", "transports": "polling", "timeout": 1500 });
+        // a generous bound: both outcomes come fast, but a loaded CI runner (other tests open
+        // ~70 connections at once) made a 1.5 s handshake time out (seen on Linux)
+        let mut o = json!({ "url": "https://localhost:4202", "path": "/engine.io/", "transports": "polling", "timeout": 10000 });
         if let Some(ca) = ca {
             o["ca"] = json!(ca);
         }

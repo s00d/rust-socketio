@@ -1334,7 +1334,7 @@ async fn tls_config_trusts_a_private_ca() {
         .tls_config(tls)
         .path("/engine.io/")
         .transport_type(TransportType::Polling)
-        .timeout(Duration::from_millis(1500))
+        .timeout(Duration::from_secs(10))
         .connect()
         .await;
     assert!(matches!(result, Err(Error::Protocol(_))), "{result:?}");
@@ -1348,7 +1348,7 @@ async fn without_the_ca_tls_fails() {
     let result = ClientBuilder::new("https://localhost:4202")
         .path("/engine.io/")
         .transport_type(TransportType::Polling)
-        .timeout(Duration::from_millis(1500))
+        .timeout(Duration::from_secs(10))
         .connect()
         .await;
     assert!(matches!(result, Err(Error::Engine(_))), "{result:?}");
