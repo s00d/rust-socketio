@@ -11,12 +11,15 @@ use common::*;
 use serde_json::{Value, json};
 use socketio_next::{Client, ClientBuilder, Event, Payload, TransportType};
 
+/// A tag no other test (or earlier run) uses: the clock alone repeats across parallel tests.
 fn tag(name: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("{name}-{}-{nanos}", std::process::id())
+    format!("{name}-{}-{nanos}-{n}", std::process::id())
 }
 
 fn builder(tag: &str, polling: bool) -> ClientBuilder {
