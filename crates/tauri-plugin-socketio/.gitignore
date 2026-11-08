@@ -1,0 +1,7 @@
+node_modules/
+dist-js/
+examples/tauri-app/node_modules/
+examples/tauri-app/dist/
+examples/tauri-app/src-tauri/target/
+examples/tauri-app/src-tauri/gen/
+examples/tauri-app/src-tauri/Cargo.lock

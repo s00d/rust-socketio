@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-emit-with-ack"
+description = "Enables the emit_with_ack command without any pre-configured scope."
+commands.allow = ["emit_with_ack"]
+
+[[permission]]
+identifier = "deny-emit-with-ack"
+description = "Denies the emit_with_ack command without any pre-configured scope."
+commands.deny = ["emit_with_ack"]

@@ -1,0 +1,56 @@
+[package]
+name = "tauri-plugin-socketio"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors = ["Pavel Kuzmin"]
+description = "Tauri 2 plugin: named Socket.IO v4 clients (socketio-next) shared by Rust and the webview"
+documentation = "https://docs.rs/tauri-plugin-socketio"
+readme = "README.md"
+keywords = ["tauri", "tauri-plugin", "socketio", "websocket", "realtime"]
+categories = ["network-programming", "web-programming::websocket", "gui"]
+# tauri-plugin's build script hands the permission files to the app through `links`.
+links = "tauri-plugin-socketio"
+include = [
+    "/src/**",
+    "/permissions/**",
+    "/build.rs",
+    "/windows-test-manifest.xml",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["rustls"]
+## TLS through rustls (ring, webpki roots): socketio-next's `rustls`. Keep it on when another
+## crate enables reqwest's `rustls-no-provider` (tauri-plugin-updater does).
+rustls = ["socketio-next/rustls"]
+## TLS through the platform library: socketio-next's `native-tls`.
+native-tls = ["socketio-next/native-tls"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+socketio-next = { workspace = true }
+tauri = { version = "2", default-features = false }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[dev-dependencies]
+socketio-next-testing = { workspace = true }
+tauri = { version = "2", default-features = false, features = ["test"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -2,8 +2,11 @@
 members = [
     "crates/socketio-next",
     "crates/socketio-next-testing",
+    "crates/tauri-plugin-socketio",
     "examples",
 ]
+# The Tauri example app is built on its own (it has its own lockfile): `just plugin-example`.
+exclude = ["crates/tauri-plugin-socketio/examples/tauri-app"]
 # "2", not edition 2024's "3": the lockfile is for development and CI and takes the newest
 # releases (security fixes included). MSRV is checked by `just msrv` with a lockfile resolved
 # for the rust-version, as a downstream project would.

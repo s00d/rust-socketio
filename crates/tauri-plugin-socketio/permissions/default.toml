@@ -1,0 +1,33 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = """
+Every command: connect, attach, emit (with or without ack), answer server acks, disconnect.
+Clients that Rust registered as read-only still refuse emit, ack and disconnect.
+"""
+permissions = [
+  "allow-connect",
+  "allow-disconnect",
+  "allow-emit",
+  "allow-emit-with-ack",
+  "allow-ack",
+  "allow-subscribe",
+  "allow-unsubscribe",
+  "allow-list",
+  "allow-state",
+  "allow-link-info",
+]
+
+[[set]]
+identifier = "allow-read"
+description = """
+Observe only: list the clients, attach to one (events and state over a channel), detach,
+read its state and link info. No connect, emit, ack or disconnect.
+"""
+permissions = [
+  "allow-list",
+  "allow-subscribe",
+  "allow-unsubscribe",
+  "allow-state",
+  "allow-link-info",
+]
