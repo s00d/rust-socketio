@@ -426,7 +426,13 @@ impl SocketIo {
         // URL parser (and to some servers) than to a prefix comparison
         if let Some(path) = engine_path {
             let lower = path.to_ascii_lowercase();
-            if path.contains("..") || lower.contains("%2e") || path.contains('\\') {
+            if path.contains("..")
+                || lower.contains("%2e")
+                || lower.contains("%25")
+                || lower.contains("%u")
+                || path.contains('\\')
+                || path.chars().any(char::is_control)
+            {
                 return false;
             }
         }
@@ -1188,9 +1194,23 @@ mod tests {
             "/v1/%2E%2E/admin/",
             "/v1/..\\admin/",
             "/v1/.%2e/admin/",
+            // the URL parser drops tabs and newlines: these are `..` once parsed
+            "/v1/.\n./admin/",
+            "/v1/\t../admin/",
+            "/v1/%252e%252e/admin/",
+            "/v1/%u002e%u002e/admin/",
         ] {
-            assert!(!ok("wss://rt.example.com", Some(path)), "{path}");
+            assert!(!ok("wss://rt.example.com", Some(path)), "{path:?}");
         }
+        // a plain path inside the prefix passes the textual checks and the resolution
+        assert!(ok("wss://rt.example.com", Some("/v1/./socket.io/")));
+        // only the resolved URL gets this right: `/v1/./socket.io/` is `/v1/socket.io/`,
+        // inside a prefix of exactly that path (the raw text is not)
+        let deep = SocketIo::with_allowed(vec![
+            url::Url::parse("wss://rt.example.com/v1/socket.io/").unwrap(),
+        ]);
+        assert!(deep.url_allowed("wss://rt.example.com", Some("/v1/./socket.io/")));
+        assert!(!deep.url_allowed("wss://rt.example.com", Some("/v1/./other/")));
     }
 
     #[test]

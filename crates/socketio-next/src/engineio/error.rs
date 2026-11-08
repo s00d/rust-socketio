@@ -29,8 +29,8 @@ pub enum Error {
     HttpStatus {
         /// The HTTP status code.
         status: u16,
-        /// What the body says: engine.io's `{"code":..,"message":..}` message, or the start of
-        /// a text body (at most 200 characters, URLs replaced by `<url>`).
+        /// engine.io's error message when the body is its `{"code": n, "message": ".."}` JSON
+        /// (at most 200 characters, URLs and queries removed); `None` for any other body.
         message: Option<String>,
     },
     /// The HTTP proxy refused or broke the `CONNECT` tunnel (never shows the proxy URL).
@@ -109,101 +109,34 @@ impl From<std::str::Utf8Error> for Error {
     }
 }
 
-/// The message of a non-200 polling body (read up to 4 KiB): engine.io's JSON `message`, else
-/// the text. Either way at most 200 characters, and words that may carry a secret are replaced
-/// (a proxy or server page may echo the request line with its query).
+/// The message of a non-200 polling body (read up to 4 KiB). Only engine.io's own error
+/// JSON counts: an object with a numeric `code` and a string `message`; that message, at most
+/// 200 characters, with URL-, path- and query-like words removed. Any other body (an HTML
+/// page, text, other JSON) is `None`: it may echo the request, a header or a token in forms no
+/// filter can know.
 pub(crate) fn body_message(body: &[u8]) -> Option<String> {
-    let raw = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|json| json.get("message")?.as_str().map(str::to_owned))
-        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
-    let text = scrub(&raw);
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    json.get("code")?.as_u64()?;
+    let message = json.get("message")?.as_str()?;
+    let text = message
+        .split_whitespace()
+        .map(|word| {
+            let lower = word.to_ascii_lowercase();
+            if word.contains("://") {
+                "<url>"
+            } else if word.starts_with('/')
+                || word.starts_with('?')
+                || ((lower.contains('?') || lower.contains('&')) && lower.contains('='))
+            {
+                "<redacted>"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let text: String = text.chars().take(200).collect();
     (!text.is_empty()).then_some(text)
-}
-
-/// Words that name a credential on their own (`password: x`, `token x`): the next word is a
-/// secret. Ambiguous ones ("session", "key", "auth") only count in a `name=value` word.
-const CREDENTIAL_NAMES: &[&str] = &[
-    "token",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "apikey",
-    "api_key",
-    "api-key",
-    "x-api-key",
-    "secret",
-    "client_secret",
-    "password",
-    "passwd",
-    "pwd",
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "set-cookie",
-    "jwt",
-    "bearer",
-    "basic",
-];
-
-/// Credential names that may appear as part of a `name=value` key (`apiKey=`, `x_token=`).
-const CREDENTIAL_PARTS: &[&str] = &[
-    "token", "key", "secret", "password", "passwd", "auth", "session", "jwt",
-];
-
-fn is_credential_name(word: &str) -> bool {
-    let name = word
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
-        .to_ascii_lowercase();
-    CREDENTIAL_NAMES.contains(&name.as_str())
-}
-
-/// `<url>` for URLs, `<redacted>` for paths, queries and the values of credentials
-/// (`name=value`, `name: value`, `name value`, `Bearer value`); other words stay
-/// ("Unauthorized", "Forbidden").
-fn scrub(text: &str) -> String {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let mut out: Vec<String> = Vec::with_capacity(words.len());
-    let mut redact_next = 0usize;
-    for word in words {
-        if redact_next > 0 {
-            redact_next -= 1;
-            out.push("<redacted>".into());
-            // `Authorization: Bearer xyz`: the scheme is followed by the secret
-            if is_credential_name(word)
-                && matches!(word.to_ascii_lowercase().as_str(), "bearer" | "basic")
-            {
-                redact_next = 1;
-            }
-            continue;
-        }
-        let lower = word.to_ascii_lowercase();
-        if word.contains("://") {
-            out.push("<url>".into());
-        } else if word.starts_with('/')
-            || word.starts_with('?')
-            || ((lower.contains('?') || lower.contains('&')) && lower.contains('='))
-        {
-            // a path or a query
-            out.push("<redacted>".into());
-        } else if let Some((name, _)) = word.split_once(['=', ':']).filter(|(_, v)| !v.is_empty()) {
-            // `name=value` / `name:value` in one word
-            let lname = name.to_ascii_lowercase();
-            if is_credential_name(name) || CREDENTIAL_PARTS.iter().any(|p| lname.contains(p)) {
-                out.push(format!("{name}=<redacted>"));
-            } else {
-                out.push(word.to_owned());
-            }
-        } else if is_credential_name(word) {
-            // `password: hunter2`, `token abc`, `Bearer eyJ...`
-            out.push(word.to_owned());
-            redact_next = 1;
-        } else {
-            out.push(word.to_owned());
-        }
-    }
-    out.join(" ")
 }
 
 /// Result alias of this crate.
@@ -215,47 +148,49 @@ mod tests {
 
     #[test]
     fn body_messages() {
-        assert_eq!(
-            body_message(br#"{"code":1,"message":"Session ID unknown"}"#).as_deref(),
-            Some("Session ID unknown")
-        );
-        assert_eq!(
-            body_message(b"<h1>Forbidden</h1> see https://proxy/x?token=s").as_deref(),
-            Some("<h1>Forbidden</h1> see <url>")
-        );
-        // an echoed request line, in a text body and in the JSON message, and credential
-        // values in every usual form
-        for body in [
-            &b"Cannot GET /socket.io/?EIO=4&token=SECRET"[..],
-            br#"{"code":3,"message":"Bad request ?sid=x&token=SECRET"}"#,
-            b"denied: apiKey=SECRET",
-            b"x a&b=SECRET",
-            b"Authorization: Bearer SECRET",
-            b"password: SECRET please",
-            b"token SECRET",
-            b"bad credentials (password=SECRET)",
-            b"Proxy-Authorization: Basic SECRET",
-        ] {
-            let message = body_message(body).unwrap();
-            assert!(!message.contains("SECRET"), "{message}");
-        }
-        // ordinary words stay
+        // engine.io's error JSON: its message is kept (URLs and queries in it removed)
         for (body, kept) in [
-            (&b"Unauthorized"[..], "Unauthorized"),
             (
-                b"Forbidden: authentication required",
-                "Forbidden: authentication required",
+                &br#"{"code":1,"message":"Session ID unknown"}"#[..],
+                "Session ID unknown",
             ),
-            (br#"{"message":"Session ID unknown"}"#, "Session ID unknown"),
-            (b"Bad handshake method", "Bad handshake method"),
+            (br#"{"code":4,"message":"Forbidden"}"#, "Forbidden"),
+            (br#"{"code":4,"message":"token expired"}"#, "token expired"),
+            (
+                br#"{"code":4,"message":"denied by middleware: try again later"}"#,
+                "denied by middleware: try again later",
+            ),
+            (
+                br#"{"code":3,"message":"Bad request ?sid=x&token=S see https://h/?t=S"}"#,
+                "Bad request <redacted> see <url>",
+            ),
         ] {
-            assert_eq!(body_message(body).as_deref(), Some(kept));
+            assert_eq!(body_message(body).as_deref(), Some(kept), "{body:?}");
         }
-        let long_json = format!(r#"{{"message":"{}"}}"#, "a".repeat(500));
-        assert_eq!(body_message(long_json.as_bytes()).unwrap().len(), 200);
-        assert_eq!(body_message(b"  "), None);
-        let long = body_message(&[b'a'; 500]).unwrap();
-        assert_eq!(long.len(), 200);
+        let long = format!(r#"{{"code":1,"message":"{}"}}"#, "a".repeat(500));
+        assert_eq!(body_message(long.as_bytes()).unwrap().len(), 200);
+        // anything else says nothing: no filter knows every way a body can carry a secret
+        for body in [
+            &b"X-Auth-Token: S"[..],
+            b"access-token: S",
+            b"Authorization: Token S",
+            b"Authorization: ApiKey S",
+            b"Authorization: Digest username=\"u\", response=\"S\"",
+            br#"{"error":"denied","token":"S"}"#,
+            br#"{"message":"no code here","token":"S"}"#,
+            br#"{"code":"1","message":"string code"}"#,
+            b"token%3DS",
+            b"token = S",
+            b"password : S",
+            b"Cookie: a=b; sid=S",
+            b"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.S",
+            b"<b>password</b> S",
+            b"Cannot GET /socket.io/?EIO=4&token=S",
+            b"<h1>Forbidden</h1>",
+            b"  ",
+        ] {
+            assert_eq!(body_message(body), None, "{body:?}");
+        }
         let e = Error::HttpStatus {
             status: 400,
             message: Some("Session ID unknown".into()),

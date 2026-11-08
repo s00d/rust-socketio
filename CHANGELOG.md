@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `platform-verifier` feature: rustls with the OS trust store (not on Android).
 - `engineio::Error::WebsocketClosed { code, reason }` from close frames (also during the
   upgrade probe), a `TransportClose`; `ConnectionState::Disconnected` carries the error.
-- `HttpStatus` has the body's message (`message`, at most 4 KiB read, URLs removed).
+- `HttpStatus` has engine.io's error message (`message`) when the body is its
+  `{"code", "message"}` JSON (at most 4 KiB read, 200 characters kept, URLs and queries
+  removed); any other body (HTML, text, other JSON) gives `None`, since it may echo the
+  request, a header or a token.
 - `LinkInfo`: `packets_in` / `packets_out`, `bytes_in` / `bytes_out`, `sessions`.
 
 ### Changed
@@ -40,12 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redirects are not followed (a 3xx is an `HttpStatus` error without the target).
 - The wall-clock check of the heartbeat probes the link and waits pingTimeout instead of
   closing at once, so an NTP step on a live link does not disconnect.
-- `HttpStatus.message` is at most 200 characters and drops words that look like URLs, paths,
-  queries or credentials, for JSON messages too.
 - A refused websocket handshake (3xx, 4xx) is `HttpStatus { status }`; the response (with a
   `Location` that may carry the query) is not kept in the error.
-- The scrubbing of `HttpStatus.message` keeps ordinary words ("Unauthorized") and removes
-  credential values in `name=value`, `name: value`, `name value` and `Bearer value` forms.
 - Environment proxies are read once, when the client is built; both transports use that
   decision for the client's life.
 - `ClientBuilder::engine_url()`: the engine.io URL a connect will use (path normalized).

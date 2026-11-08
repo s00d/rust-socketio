@@ -168,8 +168,8 @@ Dropping the last `Client` closes the connection too.
 
 **Errors.** One typed, `non_exhaustive`, cloneable `Error`: `ConnectRejected { message, data }`
 (the server's `connect_error`), `ConnectTimeout`, `IncompatibleServer`, `Engine(engineio::Error)`
-(`HttpStatus { status, message }` with the body's engine.io message or the start of a text
-body, `WebsocketClosed { code, reason }`, `ProxyFailed`, `Timeout`, `PingTimeout`,
+(`HttpStatus { status, message }`, `message` being engine.io's `{"code", "message"}` error
+text and `None` for any other body, `WebsocketClosed { code, reason }`, `ProxyFailed`, `Timeout`, `PingTimeout`,
 `UpgradeUnavailable`, `InvalidHandshake`, `TlsNotEnabled`, ...), `NotConnected`, `Closed`,
 `AckTimeout`, `Disconnected`, `ReservedEvent`.
 Messages never contain URLs or query values.

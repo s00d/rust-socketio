@@ -409,8 +409,6 @@ impl ClientBuilder {
         self
     }
 
-    /// Connects and joins the namespace. Resolves once the server answered CONNECT; fails with
-    /// the error of this first attempt (no retry: reconnects start after a connection existed).
     /// The engine.io URL `connect()` will use (before `connect_params_with`): the address with
     /// its path replaced by [`path`](Self::path) (the URL's path is the namespace) and the
     /// query added, normalized the way the connection normalizes it (`/v1/../x/` is `/x/`).
@@ -419,6 +417,8 @@ impl ClientBuilder {
         Ok(crate::client::resolve(&self.config)?.0)
     }
 
+    /// Connects and joins the namespace. Resolves once the server answered CONNECT; fails with
+    /// the error of this first attempt (no retry: reconnects start after a connection existed).
     pub async fn connect(mut self) -> Result<Client> {
         if self.config.auth.as_ref().is_some_and(|a| !a.is_object()) {
             return Err(Error::InvalidAuth("the auth payload must be a JSON object"));
