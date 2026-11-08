@@ -1,11 +1,11 @@
 use std::fmt::Debug;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{FutureExt, SinkExt, Stream, StreamExt, ready};
+use futures_util::{SinkExt, Stream, StreamExt, ready};
 use http::HeaderMap;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
@@ -26,7 +26,9 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Clone)]
 pub struct WebsocketTransport {
     sender: Arc<Mutex<SplitSink<WsStream, Message>>>,
-    receiver: Arc<Mutex<SplitStream<WsStream>>>,
+    /// A std mutex held only for one synchronous poll: a tokio lock future polled once per
+    /// `poll_next` and dropped while Pending would lose its waker (the reader would hang).
+    receiver: Arc<StdMutex<SplitStream<WsStream>>>,
     base_url: Arc<RwLock<Url>>,
     secure: bool,
 }
@@ -72,7 +74,7 @@ impl WebsocketTransport {
 
         Ok(WebsocketTransport {
             sender: Arc::new(Mutex::new(sender)),
-            receiver: Arc::new(Mutex::new(receiver)),
+            receiver: Arc::new(StdMutex::new(receiver)),
             base_url: Arc::new(RwLock::new(url)),
             secure,
         })
@@ -80,7 +82,6 @@ impl WebsocketTransport {
 
     /// Upgrade probe: `2probe`, expect `3probe`, then `5` (engine.io protocol v4).
     pub(crate) async fn upgrade(&self) -> Result<()> {
-        let mut receiver = self.receiver.lock().await;
         let mut sender = self.sender.lock().await;
 
         sender
@@ -89,11 +90,16 @@ impl WebsocketTransport {
 
         // Skip control frames; the first data frame must be the probe answer.
         let answer = loop {
-            match receiver.next().await.ok_or(Error::UpgradeFailed(
+            match self.next_message().await.ok_or(Error::UpgradeFailed(
                 "the connection closed during the probe",
             ))?? {
                 Message::Text(text) => break Bytes::from(text),
                 Message::Binary(data) => break data,
+                Message::Close(frame) => {
+                    return Err(closed(frame).unwrap_or(Error::UpgradeFailed(
+                        "the server closed the websocket during the probe",
+                    )));
+                }
                 _ => continue,
             }
         };
@@ -106,6 +112,22 @@ impl WebsocketTransport {
             .await?;
 
         Ok(())
+    }
+
+    fn poll_message(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>> {
+        self.receiver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .poll_next_unpin(cx)
+    }
+
+    async fn next_message(
+        &self,
+    ) -> Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> {
+        futures_util::future::poll_fn(|cx| self.poll_message(cx)).await
     }
 
     pub(crate) async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
@@ -146,6 +168,14 @@ impl WebsocketTransport {
     }
 }
 
+/// A close frame with a code is an error that says why; without one the stream just ends.
+fn closed(frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>) -> Option<Error> {
+    frame.map(|f| Error::WebsocketClosed {
+        code: u16::from(f.code),
+        reason: f.reason.to_string(),
+    })
+}
+
 /// A text frame is an encoded engine.io packet; a binary frame is the raw data of one binary
 /// message. Control frames carry nothing for engine.io.
 fn frame_to_packet_bytes(message: Message) -> Option<Frame> {
@@ -161,8 +191,8 @@ impl Stream for WebsocketTransport {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            let mut lock = ready!(Box::pin(self.receiver.lock()).poll_unpin(cx));
-            match ready!(lock.poll_next_unpin(cx)) {
+            match ready!(self.poll_message(cx)) {
+                Some(Ok(Message::Close(frame))) => return Poll::Ready(closed(frame).map(Err)),
                 Some(Ok(message)) => {
                     if let Some(frame) = frame_to_packet_bytes(message) {
                         return Poll::Ready(Some(Ok(frame)));
@@ -196,6 +226,7 @@ mod test {
     use super::*;
     use crate::engineio::ENGINE_IO_VERSION;
     use std::str::FromStr;
+    use std::time::Duration;
 
     async fn new() -> Result<WebsocketTransport> {
         let url = crate::engineio::test::engine_io_server()?.to_string()
@@ -220,6 +251,82 @@ mod test {
             Some(Frame::Binary(Bytes::new()))
         );
         assert_eq!(frame_to_packet_bytes(Message::Ping(Bytes::new())), None);
+    }
+
+    /// A one-shot websocket server on localhost that runs `serve` on the accepted socket.
+    async fn ws_server<F, Fut>(serve: F) -> Url
+    where
+        F: FnOnce(WebSocketStream<TcpStream>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            serve(tokio_tungstenite::accept_async(tcp).await.unwrap()).await;
+        });
+        Url::parse(&format!("http://{addr}/engine.io/?EIO=4")).unwrap()
+    }
+
+    fn close_frame() -> Message {
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+        Message::Close(Some(CloseFrame {
+            code: CloseCode::from(4001),
+            reason: "kicked".into(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_close_frame_is_an_error_with_code_and_reason() {
+        let url = ws_server(|mut ws| async move {
+            ws.send(close_frame()).await.unwrap();
+            let _ = ws.next().await;
+        })
+        .await;
+        let mut transport = WebsocketTransport::new(url, None, None).await.unwrap();
+        match transport.next().await {
+            Some(Err(Error::WebsocketClosed { code: 4001, reason })) => {
+                assert_eq!(reason, "kicked")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_close_frame_during_the_probe_says_why() {
+        let url = ws_server(|mut ws| async move {
+            let _ = ws.next().await; // 2probe
+            ws.send(close_frame()).await.unwrap();
+            let _ = ws.next().await;
+        })
+        .await;
+        let transport = WebsocketTransport::new(url, None, None).await.unwrap();
+        assert!(matches!(
+            transport.upgrade().await,
+            Err(Error::WebsocketClosed { code: 4001, .. })
+        ));
+    }
+
+    /// Item: the reader must be woken after another holder released the receiver (a tokio
+    /// lock future polled once and dropped lost its waker).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reader_is_not_lost_behind_a_held_receiver() {
+        let url = ws_server(|mut ws| async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ws.send(Message::text("4hello")).await.unwrap();
+            let _ = ws.next().await;
+        })
+        .await;
+        let mut transport = WebsocketTransport::new(url, None, None).await.unwrap();
+        let receiver = Arc::clone(&transport.receiver);
+        let holder = std::thread::spawn(move || {
+            let _guard = receiver.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let frame = tokio::time::timeout(Duration::from_secs(5), transport.next()).await;
+        holder.join().unwrap();
+        assert!(matches!(frame, Ok(Some(Ok(Frame::Text(_))))), "{frame:?}");
     }
 
     #[tokio::test]

@@ -34,10 +34,16 @@ fn in_handler() -> bool {
 const HANDLER_DRAIN: Duration = Duration::from_secs(5);
 
 pub(crate) struct Inner {
-    cmd: mpsc::UnboundedSender<Command>,
-    /// Dropped with the last handle: tells the actor to stop.
-    _shutdown: oneshot::Sender<()>,
+    /// The running actor's command queue (replaced by `reconnect()`).
+    cmd: Mutex<mpsc::UnboundedSender<Command>>,
+    /// Dropped with the last handle (or replaced): tells the actor to stop.
+    _shutdown: Mutex<oneshot::Sender<()>>,
     state: watch::Receiver<ConnectionState>,
+    state_tx: watch::Sender<ConnectionState>,
+    config: Config,
+    url: url::Url,
+    /// One `reconnect()` at a time.
+    restart: tokio::sync::Mutex<()>,
     handlers: Mutex<Handlers>,
     shared: Arc<Shared>,
     nsp: Arc<str>,
@@ -81,41 +87,65 @@ impl fmt::Debug for Client {
 }
 
 pub(crate) async fn connect(config: Config, handlers: Handlers) -> Result<Client> {
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (cmd_tx, _) = mpsc::unbounded_channel();
+    let (shutdown_tx, _) = oneshot::channel();
     let (state_tx, state_rx) = watch::channel(ConnectionState::Connecting { attempt: 0 });
-    let panic_state = state_tx.clone();
-    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel();
-    let (ready_tx, ready_rx) = oneshot::channel();
-    let shared = Arc::new(Shared::default());
     let (url, nsp) = resolve(&config)?;
-    let nsp: Arc<str> = nsp.into();
-
     let inner = Arc::new(Inner {
-        cmd: cmd_tx.clone(),
-        _shutdown: shutdown_tx,
+        cmd: Mutex::new(cmd_tx),
+        _shutdown: Mutex::new(shutdown_tx),
         state: state_rx,
+        state_tx,
         handlers: Mutex::new(handlers),
-        shared: Arc::clone(&shared),
-        nsp: Arc::clone(&nsp),
+        shared: Arc::new(Shared::default()),
+        nsp: nsp.into(),
         buffer_while_disconnected: config.buffer_while_disconnected,
+        config,
+        url,
+        restart: tokio::sync::Mutex::new(()),
         actor: Mutex::default(),
         dispatcher: Mutex::default(),
     });
+    let ready = start(&inner);
+    match ready.await {
+        Ok(Ok(())) => Ok(Client { inner }),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(Error::Closed),
+    }
+}
 
-    let dispatcher = tokio::spawn(dispatch(dispatch_rx, Arc::downgrade(&inner)));
+/// Spawns the event task and the connection task for `inner`; the receiver resolves with the
+/// first connect attempt.
+fn start(inner: &Arc<Inner>) -> oneshot::Receiver<Result<()>> {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    inner
+        .state_tx
+        .send_replace(ConnectionState::Connecting { attempt: 0 });
+    let shared = Arc::clone(&inner.shared);
+    shared.closed.store(false, Ordering::Release);
+    shared.muted.store(false, Ordering::Release);
+    *inner.cmd.lock().unwrap_or_else(PoisonError::into_inner) = cmd_tx.clone();
+    *inner
+        ._shutdown
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = shutdown_tx;
+
+    let dispatcher = tokio::spawn(dispatch(dispatch_rx, Arc::downgrade(inner)));
+    let panic_state = inner.state_tx.clone();
     let actor = Actor::new(
-        config,
-        url,
-        nsp,
+        inner.config.clone(),
+        inner.url.clone(),
+        Arc::clone(&inner.nsp),
         cmd_rx,
         cmd_tx,
         shutdown_rx,
-        state_tx,
+        inner.state_tx.clone(),
         dispatch_tx,
-        shared,
+        Arc::clone(&shared),
     );
-    let panic_shared = Arc::clone(&inner.shared);
     // A bug in the connection task must not leave the state at `Connected` forever.
     let actor = tokio::spawn(async move {
         if AssertUnwindSafe(actor.run(ready_tx))
@@ -124,8 +154,8 @@ pub(crate) async fn connect(config: Config, handlers: Handlers) -> Result<Client
             .is_err()
         {
             tracing::error!("the socket.io connection task panicked; the client is closed");
-            panic_shared.connected.store(false, Ordering::Release);
-            panic_shared.closed.store(true, Ordering::Release);
+            shared.connected.store(false, Ordering::Release);
+            shared.closed.store(true, Ordering::Release);
             panic_state.send_replace(ConnectionState::Closed {
                 reason: crate::DisconnectReason::TransportError,
                 error: None,
@@ -137,12 +167,7 @@ pub(crate) async fn connect(config: Config, handlers: Handlers) -> Result<Client
         .dispatcher
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = Some(dispatcher);
-
-    match ready_rx.await {
-        Ok(Ok(())) => Ok(Client { inner }),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(Error::Closed),
-    }
+    ready_rx
 }
 
 /// The engine.io URL and the namespace: like socket.io-client, the URL path is the namespace
@@ -237,6 +262,57 @@ async fn run(fut: futures_util::future::BoxFuture<'static, ()>) {
 }
 
 impl Client {
+    fn cmd(&self) -> mpsc::UnboundedSender<Command> {
+        self.inner
+            .cmd
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Connects again after the client closed (a `ConnectRejected`, `ReconnectFailed`, a
+    /// server disconnect without `reconnect_on_disconnect`, or `disconnect()`), with the same
+    /// handlers and options; `auth_with` and `connect_params_with` run again, so a new token
+    /// can be handed in first. Resolves like `connect()`: once the server accepted the
+    /// namespace, or with the error of that attempt (the client then stays closed). A no-op
+    /// while the client is not closed. Must not be called from one of its handlers.
+    pub async fn reconnect(&self) -> Result<()> {
+        let _guard = self.inner.restart.lock().await;
+        if !self.state().is_closed() {
+            return Ok(());
+        }
+        // the previous tasks end on their own once closed; wait so none outlives the restart
+        let actor = self
+            .inner
+            .actor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(actor) = actor {
+            let _ = actor.await;
+        }
+        let dispatcher = self
+            .inner
+            .dispatcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(dispatcher) = dispatcher {
+            if tokio::time::timeout(HANDLER_DRAIN, &mut Box::pin(dispatcher))
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "handlers still running after {HANDLER_DRAIN:?}; reconnecting anyway"
+                );
+            }
+        }
+        match start(&self.inner).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Closed),
+        }
+    }
+
     fn handlers(&self) -> std::sync::MutexGuard<'_, Handlers> {
         self.inner
             .handlers
@@ -271,8 +347,7 @@ impl Client {
     pub fn emit(&self, event: impl AsRef<str>, data: impl Into<Payload>) -> Result<()> {
         let packet = self.event_packet(event.as_ref(), data.into())?;
         self.check_open()?;
-        self.inner
-            .cmd
+        self.cmd()
             .send(Command::Emit { packet, ack: None })
             .map_err(|_| Error::Closed)
     }
@@ -290,8 +365,7 @@ impl Client {
         let packet = self.event_packet(event.as_ref(), data.into())?;
         self.check_open()?;
         let (tx, rx) = oneshot::channel();
-        self.inner
-            .cmd
+        self.cmd()
             .send(Command::Emit {
                 packet,
                 ack: Some((tx, timeout)),
@@ -406,12 +480,7 @@ impl Client {
     /// the running handler).
     pub async fn disconnect(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        if self
-            .inner
-            .cmd
-            .send(Command::Disconnect { done: tx })
-            .is_ok()
-        {
+        if self.cmd().send(Command::Disconnect { done: tx }).is_ok() {
             let _ = rx.await;
         }
         let actor = self

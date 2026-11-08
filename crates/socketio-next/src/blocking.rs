@@ -295,6 +295,11 @@ impl Client {
         self.handle.block_on(self.inner.disconnect())
     }
 
+    /// See [`crate::Client::reconnect`]; blocks until the attempt ends.
+    pub fn reconnect(&self) -> Result<()> {
+        self.handle.block_on(self.inner.reconnect())
+    }
+
     /// Adds a handler for `event`.
     pub fn on<F>(&self, event: impl Into<String>, handler: F) -> ListenerId
     where

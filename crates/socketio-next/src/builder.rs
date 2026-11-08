@@ -27,6 +27,46 @@ pub enum Direction {
     Outgoing,
 }
 
+pub(crate) type ParamsFn = Arc<dyn Fn() -> BoxFuture<'static, ConnectParams> + Send + Sync>;
+
+/// Query parameters and headers computed for one connect attempt
+/// ([`ClientBuilder::connect_params_with`]). A key given here replaces the builder's value of
+/// the same key for that attempt.
+#[derive(Clone, Default)]
+pub struct ConnectParams {
+    pub(crate) query: Vec<(String, String)>,
+    pub(crate) headers: Vec<(String, String)>,
+}
+
+impl fmt::Debug for ConnectParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let keys = |v: &[(String, String)]| v.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+        f.debug_struct("ConnectParams")
+            .field("query_keys", &keys(&self.query))
+            .field("header_keys", &keys(&self.headers))
+            .finish()
+    }
+}
+
+impl ConnectParams {
+    /// No parameters.
+    pub fn new() -> Self {
+        ConnectParams::default()
+    }
+
+    /// A query parameter for this attempt.
+    pub fn query(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.query.push((key.into(), value.into()));
+        self
+    }
+
+    /// An HTTP header for this attempt.
+    pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((key.into(), value.into()));
+        self
+    }
+}
+
 pub(crate) type Inspector = Arc<dyn Fn(Direction, &Packet) + Send + Sync>;
 
 /// Everything the connection actor needs; fixed at `connect()`.
@@ -39,6 +79,7 @@ pub(crate) struct Config {
     pub(crate) headers: HeaderMap,
     pub(crate) auth: Option<Value>,
     pub(crate) auth_fn: Option<AuthFn>,
+    pub(crate) params_fn: Option<ParamsFn>,
     #[cfg_attr(not(any(feature = "rustls", feature = "native-tls")), allow(dead_code))]
     pub(crate) tls_config: Option<TlsConfig>,
     pub(crate) transport: TransportType,
@@ -133,6 +174,7 @@ impl ClientBuilder {
                 headers: HeaderMap::new(),
                 auth: None,
                 auth_fn: None,
+                params_fn: None,
                 tls_config: None,
                 transport: TransportType::Any,
                 timeout: Duration::from_secs(20),
@@ -205,6 +247,18 @@ impl ClientBuilder {
         Fut: Future<Output = Value> + Send + 'static,
     {
         self.config.auth_fn = Some(Arc::new(move || auth().boxed()));
+        self
+    }
+
+    /// Computes query parameters and headers before every connect and reconnect, e.g. a
+    /// signed timestamp or a fresh bearer token in `Authorization`. Runs inside the attempt's
+    /// timeout; a panic fails the attempt. Values replace the builder's ones of the same key.
+    pub fn connect_params_with<F, Fut>(mut self, params: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ConnectParams> + Send + 'static,
+    {
+        self.config.params_fn = Some(Arc::new(move || params().boxed()));
         self
     }
 

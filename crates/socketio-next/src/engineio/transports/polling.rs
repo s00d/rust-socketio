@@ -75,7 +75,7 @@ impl PollingTransport {
             // payload: report it instead of handing it to the decoder.
             let status = response.status().as_u16();
             if status != 200 {
-                return Err(Error::HttpStatus { status });
+                return Err(http_status(response).await);
             }
             // One polling response is one engine.io payload. Read the whole body: yielding
             // the chunks of `bytes_stream()` one by one hands partial payloads to the decoder.
@@ -109,17 +109,9 @@ impl PollingTransport {
         };
 
         let address = crate::engineio::util::with_timestamp(self.base_url().await?);
-        let status = self
-            .client
-            .post(address)
-            .body(data_to_send)
-            .send()
-            .await?
-            .status()
-            .as_u16();
-
-        if status != 200 {
-            return Err(Error::HttpStatus { status });
+        let response = self.client.post(address).body(data_to_send).send().await?;
+        if response.status().as_u16() != 200 {
+            return Err(http_status(response).await);
         }
         Ok(())
     }
@@ -138,6 +130,23 @@ impl PollingTransport {
         }
         *self.base_url.write().await = url;
         Ok(())
+    }
+}
+
+/// `HttpStatus` with what the body says (at most 4 KiB of it is read).
+async fn http_status(mut response: reqwest::Response) -> Error {
+    let status = response.status().as_u16();
+    let mut body = Vec::new();
+    while body.len() < 4096 {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    body.truncate(4096);
+    Error::HttpStatus {
+        status,
+        message: crate::engineio::error::body_message(&body),
     }
 }
 
@@ -209,7 +218,10 @@ mod test {
 
         // engine.io answers an unknown sid with 400 and a JSON error body.
         match transport.next().await {
-            Some(Err(Error::HttpStatus { status: 400 })) => {}
+            Some(Err(Error::HttpStatus {
+                status: 400,
+                message: Some(message),
+            })) => assert_eq!(message, "Session ID unknown"),
             other => panic!("expected IncompleteHttp(400), got {other:?}"),
         }
     }

@@ -189,7 +189,7 @@ impl Actor {
                             self.close(reason, error);
                             return;
                         }
-                        self.set_state(ConnectionState::Disconnected { reason });
+                        self.set_state(ConnectionState::Disconnected { reason, error });
                         match self.reconnect().await {
                             Some(new_conn) => {
                                 self.on_connected(&new_conn);
@@ -330,12 +330,7 @@ impl Actor {
                     match item {
                         None => return Outcome::Lost(DisconnectReason::TransportClose, None),
                         Some(Err(err)) => {
-                            let reason = match err {
-                                engineio::Error::PingTimeout => DisconnectReason::PingTimeout,
-                                engineio::Error::Protocol(_) => DisconnectReason::ParseError,
-                                _ => DisconnectReason::TransportError,
-                            };
-                            return Outcome::Lost(reason, Some(err.into()));
+                            return Outcome::Lost(lost_reason(&err), Some(err.into()));
                         }
                         Some(Ok(packet)) => {
                             self.shared.link().last_packet_at = Some(now);
@@ -344,6 +339,11 @@ impl Actor {
                                     self.shared.link().last_ping_at = Some(now);
                                 }
                                 EnginePacketId::Message | EnginePacketId::MessageBinary => {
+                                    {
+                                        let mut link = self.shared.link();
+                                        link.packets_in += 1;
+                                        link.bytes_in += packet.data.len() as u64;
+                                    }
                                     let binary = packet.packet_id == EnginePacketId::MessageBinary;
                                     if let Some(outcome) =
                                         self.on_message(packet.data, binary, &mut partial)
@@ -380,6 +380,7 @@ impl Actor {
             link.max_payload = handshake.max_payload;
             link.connected_at = Some(Instant::now());
             link.reconnect_attempts = 0;
+            link.sessions += 1;
         }
         self.shared.connected.store(true, Ordering::Release);
         tracing::info!(
@@ -625,10 +626,14 @@ impl Actor {
         let Some(writer) = &conn.writer_tx else {
             return;
         };
-        let _ = writer.send(engineio::Packet::new(
-            EnginePacketId::Message,
-            Bytes::from(&packet),
-        ));
+        let text = Bytes::from(&packet);
+        {
+            let mut link = self.shared.link();
+            let attachments = packet.attachments.iter().flatten();
+            link.packets_out += 1 + attachments.clone().count() as u64;
+            link.bytes_out += text.len() as u64 + attachments.map(|a| a.len() as u64).sum::<u64>();
+        }
+        let _ = writer.send(engineio::Packet::new(EnginePacketId::Message, text));
         for attachment in packet.attachments.into_iter().flatten() {
             let _ = writer.send(engineio::Packet::new(
                 EnginePacketId::MessageBinary,
@@ -750,6 +755,17 @@ fn connect_error(data: Option<&str>) -> Error {
     }
 }
 
+/// Why a connection ended, from the engine.io error that ended it.
+fn lost_reason(err: &engineio::Error) -> DisconnectReason {
+    match err {
+        engineio::Error::PingTimeout => DisconnectReason::PingTimeout,
+        engineio::Error::Protocol(_) => DisconnectReason::ParseError,
+        // a close frame is a deliberate close by the server or a proxy, with a reason
+        engineio::Error::WebsocketClosed { .. } => DisconnectReason::TransportClose,
+        _ => DisconnectReason::TransportError,
+    }
+}
+
 /// Engine.io handshake + namespace CONNECT, bounded by the timeout.
 /// `auth_with` runs inside the bound too, so a hanging auth function cannot stall the loop.
 async fn attempt_connect(
@@ -777,23 +793,64 @@ async fn attempt_connect(
             return Err(Error::InvalidAuth("the auth payload must be a JSON object"));
         }
         let auth = connect_payload(auth, pid.as_deref(), offset.as_deref());
-        attempt_connect_unbounded(config, url, nsp, auth).await
+        let (url, headers) = match &config.params_fn {
+            Some(params_fn) => {
+                let params = std::panic::AssertUnwindSafe(params_fn())
+                    .catch_unwind()
+                    .await
+                    .map_err(|_| {
+                        Error::InvalidHeader("the connect_params_with function panicked".into())
+                    })?;
+                apply_params(url, &config.headers, params)?
+            }
+            None => (url, config.headers.clone()),
+        };
+        attempt_connect_unbounded(config, url, headers, nsp, auth).await
     };
     tokio::time::timeout(timeout, attempt)
         .await
         .map_err(|_| Error::ConnectTimeout(timeout))?
 }
 
+/// The URL and headers of one attempt: the builder's, with `params` replacing equal keys.
+fn apply_params(
+    mut url: Url,
+    headers: &http::HeaderMap,
+    params: crate::builder::ConnectParams,
+) -> Result<(Url, http::HeaderMap)> {
+    if !params.query.is_empty() {
+        let keep: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| !params.query.iter().any(|(pk, _)| pk == k))
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(keep)
+            .extend_pairs(&params.query);
+    }
+    let mut headers = headers.clone();
+    for (key, value) in params.headers {
+        let name = http::HeaderName::try_from(key.as_str())
+            .map_err(|_| Error::InvalidHeader(format!("bad header name {key:?}")))?;
+        let value = http::HeaderValue::try_from(value.as_str())
+            .map_err(|_| Error::InvalidHeader(format!("bad value for header {key:?}")))?;
+        headers.insert(name, value);
+    }
+    Ok((url, headers))
+}
+
 async fn attempt_connect_unbounded(
     config: Arc<Config>,
     url: Url,
+    headers: http::HeaderMap,
     nsp: Arc<str>,
     auth: Option<Value>,
 ) -> Result<Conn> {
     #[allow(unused_mut)]
     let mut builder = engineio::ClientBuilder::new(url)
         .timeout(config.timeout)
-        .headers(config.headers.clone());
+        .headers(headers);
     #[cfg(any(feature = "rustls", feature = "native-tls"))]
     if let Some(tls) = &config.tls_config {
         builder = builder.tls_config(tls.clone());
@@ -912,6 +969,72 @@ mod tests {
     /// `connect()` promises must be true by then, not a few polls later.
     pub(super) async fn after_ready() {
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    #[test]
+    fn params_replace_equal_keys() {
+        let url = Url::parse("http://h/socket.io/?token=old&x=1").unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("authorization", "Bearer old".parse().unwrap());
+        let params = crate::ConnectParams::new()
+            .query("token", "new")
+            .header("Authorization", "Bearer new");
+        let (url, headers) = apply_params(url, &headers, params).unwrap();
+        assert_eq!(url.query(), Some("x=1&token=new"));
+        assert_eq!(headers["authorization"], "Bearer new");
+        assert!(
+            apply_params(
+                Url::parse("http://h/").unwrap(),
+                &http::HeaderMap::new(),
+                crate::ConnectParams::new().header("bad header", "v")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_websocket_close_frame_is_a_transport_close() {
+        let closed = engineio::Error::WebsocketClosed {
+            code: 4001,
+            reason: "x".into(),
+        };
+        assert_eq!(lost_reason(&closed), DisconnectReason::TransportClose);
+        assert_eq!(
+            lost_reason(&engineio::Error::PingTimeout),
+            DisconnectReason::PingTimeout
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn link_counts_packets_bytes_and_sessions() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = crate::ClientBuilder::new(socketio_next_testing::conformance_server())
+            .reconnection_delay(Duration::from_millis(20))
+            .randomization_factor(0.0)
+            .on("echo-back", move |_e: crate::Event, _c: crate::Client| {
+                let _ = tx.send(());
+                std::future::ready(())
+            })
+            .connect()
+            .await
+            .unwrap();
+        let before = client.link_info();
+        assert_eq!(before.sessions, 1);
+        client.emit("echo", vec![json!(1), json!("abc")]).unwrap();
+        rx.recv().await.unwrap();
+        let after = client.link_info();
+        assert!(after.packets_out > before.packets_out, "{after:?}");
+        assert!(after.bytes_out >= before.bytes_out + 9, "{after:?}");
+        assert!(after.packets_in > before.packets_in && after.bytes_in > before.bytes_in);
+        client.emit("drop", ()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while client.link_info().sessions < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a second session after the drop");
+        client.disconnect().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

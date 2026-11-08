@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::protocol::engineio::Batch;
 use bytes::Bytes;
@@ -23,7 +23,9 @@ pub(crate) struct Socket {
     transport: Transport,
     callbacks: Callbacks,
     connected: Arc<AtomicBool>,
-    last_ping: Arc<Mutex<Instant>>,
+    /// The last ping (or the open), on the monotonic clock and on the wall clock: the
+    /// monotonic one stops while the machine sleeps, the wall clock does not.
+    last_ping: Arc<Mutex<(Instant, SystemTime)>>,
     handshake: Arc<HandshakePacket>,
 }
 
@@ -38,7 +40,7 @@ impl Socket {
             transport,
             callbacks,
             connected: Arc::new(AtomicBool::default()),
-            last_ping: Arc::new(Mutex::new(Instant::now())),
+            last_ping: Arc::new(Mutex::new((Instant::now(), SystemTime::now()))),
             handshake: Arc::new(handshake),
         }
     }
@@ -58,7 +60,7 @@ impl Socket {
         *self
             .last_ping
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Instant::now();
+            .unwrap_or_else(PoisonError::into_inner) = (Instant::now(), SystemTime::now());
         tracing::debug!(
             sid = %self.handshake.sid,
             transport = self.transport.kind().as_str(),
@@ -87,7 +89,7 @@ impl Socket {
                 *self
                     .last_ping
                     .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Instant::now();
+                    .unwrap_or_else(PoisonError::into_inner) = (Instant::now(), SystemTime::now());
                 // Answered off the read path: a write stuck on a dead link (holding the writer
                 // lock) must not keep the stream, and so the heartbeat check, from running.
                 let socket = self.clone();
@@ -214,21 +216,44 @@ impl Socket {
     }
 
     pub(crate) fn last_ping(&self) -> Instant {
-        *self
+        self.last_ping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
+    }
+
+    fn deadline(&self) -> Duration {
+        Duration::from_millis(
+            self.handshake
+                .ping_interval
+                .saturating_add(self.handshake.ping_timeout),
+        )
+    }
+
+    /// engine.io-client `_hasPingExpired`: the wall clock says the deadline passed (after a
+    /// system sleep, when the monotonic timer has not caught up).
+    fn wall_clock_expired(&self) -> bool {
+        let wall = self
             .last_ping
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .1;
+        wall.elapsed().is_ok_and(|gap| gap > self.deadline())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pretend_sleep(&self, gap: Duration) {
+        let mut last = self
+            .last_ping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        last.1 -= gap;
     }
 
     /// Time left until a ping must have arrived (pingInterval + pingTimeout after the last one).
     /// See <https://socket.io/docs/v4/how-it-works/#disconnection-detection>.
     fn time_to_next_ping(&self) -> Duration {
-        let deadline = Duration::from_millis(
-            self.handshake
-                .ping_interval
-                .saturating_add(self.handshake.ping_timeout),
-        );
-        deadline.saturating_sub(self.last_ping().elapsed())
+        self.deadline().saturating_sub(self.last_ping().elapsed())
     }
 
     fn handle_close(&self) {
@@ -246,11 +271,30 @@ impl Socket {
                 if !socket.is_connected() {
                     return None;
                 }
-                match tokio::time::timeout(socket.time_to_next_ping(), stream.next()).await {
-                    Ok(result) => result.map(|result| (result, (stream, socket))),
+                // Waits in slices so the wall clock is checked now and then: tokio's timer
+                // does not count the time the machine slept.
+                let outcome = {
+                    let next = stream.next();
+                    tokio::pin!(next);
+                    loop {
+                        let slice = socket.time_to_next_ping().min(WALL_CHECK);
+                        match tokio::time::timeout(slice, &mut next).await {
+                            Ok(result) => break Some(result),
+                            Err(_)
+                                if socket.time_to_next_ping().is_zero()
+                                    || socket.wall_clock_expired() =>
+                            {
+                                break None;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                };
+                match outcome {
+                    Some(result) => result.map(|result| (result, (stream, socket))),
                     // No ping in time: the link is dead. Be nice and disconnect properly; the
                     // reason stays the timeout even when the close packet cannot be sent.
-                    Err(_) => {
+                    None => {
                         tracing::warn!(sid = %socket.handshake.sid, "engine.io ping timeout");
                         let _ =
                             tokio::time::timeout(Duration::from_secs(1), socket.disconnect()).await;
@@ -263,6 +307,13 @@ impl Socket {
         .boxed()
     }
 }
+
+/// How often a waiting reader compares the wall clock with the heartbeat deadline.
+const WALL_CHECK: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(2)
+};
 
 /// engine.io-client `_getWritablePackets`: split before the packet that pushes the encoded size
 /// over `max_payload` (base64 counts 4/3 for binary); a single oversized packet goes alone.

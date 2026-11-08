@@ -122,6 +122,26 @@ mod test {
     /// As the documentation of the engine.io client states, the object needs to maintain it's internal
     /// state when cloned and the cloned object should reflect the same state throughout the lifetime
     /// of both objects (initial and cloned).
+    /// After a system sleep the monotonic timer still has most of pingInterval + pingTimeout
+    /// (45 s on this server) to go; the wall clock says the deadline passed long ago.
+    #[tokio::test]
+    async fn a_wall_clock_gap_is_a_ping_timeout() -> Result<()> {
+        let url = crate::engineio::test::engine_io_server()?;
+        let mut socket = builder(url).build_polling().await?;
+        socket.connect().await?;
+        socket
+            .socket
+            .pretend_sleep(std::time::Duration::from_secs(3600));
+        let deadline = std::time::Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout(deadline, socket.next()).await {
+                Ok(Some(Err(crate::engineio::Error::PingTimeout))) => return Ok(()),
+                Ok(Some(_)) => continue,
+                other => panic!("expected a ping timeout, got {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_client_cloneable() -> Result<()> {
         let url = crate::engineio::test::engine_io_server()?;

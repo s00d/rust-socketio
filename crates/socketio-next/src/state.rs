@@ -77,6 +77,8 @@ pub enum ConnectionState {
     Disconnected {
         /// Why.
         reason: DisconnectReason,
+        /// The error behind it (`WebsocketClosed { code, reason }`, `PingTimeout`, ...).
+        error: Option<Error>,
     },
     /// Waiting `delay` before reconnect attempt `attempt`.
     Reconnecting {
@@ -138,4 +140,14 @@ pub struct LinkInfo {
     pub pending_acks: usize,
     /// Emits queued while disconnected (`buffer_while_disconnected`).
     pub buffered_emits: usize,
+    /// Engine.io message packets sent (socket.io packets and their binary attachments).
+    pub packets_out: u64,
+    /// Engine.io message packets received.
+    pub packets_in: u64,
+    /// Bytes of those packets sent (encoded socket.io text plus raw attachments).
+    pub bytes_out: u64,
+    /// Bytes of those packets received.
+    pub bytes_in: u64,
+    /// Successful connects (the first one and every reconnect) of this client.
+    pub sessions: u32,
 }

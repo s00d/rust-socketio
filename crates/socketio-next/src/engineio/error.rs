@@ -24,10 +24,21 @@ pub enum Error {
     Http(#[source] Arc<reqwest::Error>),
     /// The server answered a polling request with a non-200 status (400 "Session ID unknown"
     /// after a server restart, 403 from a proxy, ...).
-    #[error("server answered HTTP {status}")]
+    #[error("server answered HTTP {status}{}", message.as_ref().map(|m| format!(": {m}")).unwrap_or_default())]
     HttpStatus {
         /// The HTTP status code.
         status: u16,
+        /// What the body says: engine.io's `{"code":..,"message":..}` message, or the start of
+        /// a text body (at most 200 characters, URLs replaced by `<url>`).
+        message: Option<String>,
+    },
+    /// The server closed the websocket with a close frame (code and reason as sent).
+    #[error("the server closed the websocket (code {code}{})", if reason.is_empty() { String::new() } else { format!(": {reason}") })]
+    WebsocketClosed {
+        /// The close code (1000 normal, 1001 going away, 4xxx application codes, ...).
+        code: u16,
+        /// The close reason, possibly empty.
+        reason: String,
     },
     /// The websocket failed to open or broke.
     #[error("websocket error: {0}")]
@@ -85,12 +96,61 @@ impl From<std::str::Utf8Error> for Error {
     }
 }
 
+/// The message of a non-200 polling body (read up to 4 KiB): engine.io's JSON `message`, else
+/// the text, shortened and without URLs (a proxy page may echo the request).
+pub(crate) fn body_message(body: &[u8]) -> Option<String> {
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(message) = json.get("message").and_then(|m| m.as_str()) {
+            return Some(message.to_owned());
+        }
+    }
+    let text = String::from_utf8_lossy(body);
+    let text: String = text
+        .split_whitespace()
+        .map(|w| if w.contains("://") { "<url>" } else { w })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text: String = text.chars().take(200).collect();
+    (!text.is_empty()).then_some(text)
+}
+
 /// Result alias of this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_messages() {
+        assert_eq!(
+            body_message(br#"{"code":1,"message":"Session ID unknown"}"#).as_deref(),
+            Some("Session ID unknown")
+        );
+        assert_eq!(
+            body_message(b"<h1>Forbidden</h1> see https://proxy/x?token=s").as_deref(),
+            Some("<h1>Forbidden</h1> see <url>")
+        );
+        assert_eq!(body_message(b"  "), None);
+        let long = body_message(&[b'a'; 500]).unwrap();
+        assert_eq!(long.len(), 200);
+        let e = Error::HttpStatus {
+            status: 400,
+            message: Some("Session ID unknown".into()),
+        };
+        assert_eq!(
+            e.to_string(),
+            "server answered HTTP 400: Session ID unknown"
+        );
+        let e = Error::WebsocketClosed {
+            code: 4001,
+            reason: "bye".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "the server closed the websocket (code 4001: bye)"
+        );
+    }
 
     #[tokio::test]
     async fn http_errors_drop_the_url() {

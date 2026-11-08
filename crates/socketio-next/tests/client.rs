@@ -11,7 +11,8 @@ use bytes::Bytes;
 use common::*;
 use serde_json::{Value, json};
 use socketio_next::{
-    Client, ClientBuilder, ConnectionState, DisconnectReason, Error, Event, Payload, TransportType,
+    Client, ClientBuilder, ConnectParams, ConnectionState, DisconnectReason, Error, Event, Payload,
+    TransportType,
 };
 
 fn server() -> String {
@@ -459,7 +460,8 @@ async fn server_disconnect_reconnects_when_asked() {
         matches!(
             s,
             ConnectionState::Disconnected {
-                reason: DisconnectReason::IoServerDisconnect
+                reason: DisconnectReason::IoServerDisconnect,
+                ..
             }
         )
     })
@@ -489,7 +491,8 @@ async fn transport_close_reconnects_with_state_transitions() {
         matches!(
             lost,
             ConnectionState::Disconnected {
-                reason: DisconnectReason::TransportClose | DisconnectReason::TransportError
+                reason: DisconnectReason::TransportClose | DisconnectReason::TransportError,
+                ..
             }
         ),
         "{lost:?}"
@@ -1109,4 +1112,120 @@ async fn bad_auth_on_reconnect_is_final() {
         "{closed:?}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+/// Query parameters and headers are computed again for every connect attempt (a token that
+/// expires, a signed timestamp): the reconnect after a cut sends the new values.
+#[tokio::test]
+async fn connect_params_are_recomputed_per_attempt() {
+    let proxy = Proxy::start(&host_port(&server())).await;
+    let n = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&n);
+    let client = connect(
+        ClientBuilder::new(proxy.url())
+            .transport_type(TransportType::Websocket)
+            .query("token", "static")
+            .reconnection_delay(Duration::from_millis(20))
+            .connect_params_with(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                async move { ConnectParams::new().query("token", format!("t{n}")) }
+            }),
+    )
+    .await;
+    let query = |client: Client| async move {
+        let reply = client
+            .emit_with_ack("handshake_query", (), WAIT)
+            .await
+            .unwrap();
+        reply.arg::<Value>(0).unwrap()["token"].clone()
+    };
+    assert_eq!(query(client.clone()).await, "t1");
+    proxy.cut();
+    client.wait_for(|s| !s.is_connected()).await;
+    client.wait_for(ConnectionState::is_connected).await;
+    assert_eq!(query(client.clone()).await, "t2");
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn connect_headers_are_recomputed_per_attempt() {
+    let proxy = Proxy::start(&host_port(&socket_io_restart_server())).await;
+    let n = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&n);
+    let (builder, mut events) = collect(
+        ClientBuilder::new(proxy.url())
+            .transport_type(TransportType::Websocket)
+            .header("message_back", "static")
+            .reconnection_delay(Duration::from_millis(20))
+            .connect_params_with(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                async move { ConnectParams::new().header("message_back", format!("h{n}")) }
+            }),
+    );
+    let client = connect(builder).await;
+    assert_eq!(
+        next_named(&mut events, "message")
+            .await
+            .arg::<String>(0)
+            .unwrap(),
+        "h1"
+    );
+    proxy.cut();
+    assert_eq!(
+        next_named(&mut events, "message")
+            .await
+            .arg::<String>(0)
+            .unwrap(),
+        "h2"
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_panicking_params_function_fails_the_attempt() {
+    let result = ClientBuilder::new(server())
+        .connect_params_with(|| async { panic!("boom") })
+        .connect()
+        .await;
+    assert!(matches!(result, Err(Error::InvalidHeader(_))), "{result:?}");
+}
+
+/// A closed client (here: the server disconnected it, which is final by default) connects
+/// again with `reconnect()`, keeping its handlers.
+#[tokio::test]
+async fn reconnect_after_closed_keeps_the_handlers() {
+    let (builder, mut events) = collect(ClientBuilder::new(server()));
+    let client = connect(builder).await;
+    client.emit("server_disconnect", ()).unwrap();
+    let closed = client.wait_for(ConnectionState::is_closed).await;
+    assert!(
+        matches!(
+            closed,
+            ConnectionState::Closed {
+                reason: DisconnectReason::IoServerDisconnect,
+                ..
+            }
+        ),
+        "{closed:?}"
+    );
+    assert!(matches!(client.emit("echo", 1), Err(Error::Closed)));
+    client.reconnect().await.unwrap();
+    assert!(client.connected());
+    client.emit("echo", json!("again")).unwrap();
+    let echo = next_named(&mut events, "echo-back").await;
+    assert_eq!(echo.arg::<String>(0).unwrap(), "again");
+    // a no-op while connected
+    client.reconnect().await.unwrap();
+    // after disconnect() too
+    client.disconnect().await.unwrap();
+    client.reconnect().await.unwrap();
+    client.emit("echo", json!("third")).unwrap();
+    assert_eq!(
+        next_named(&mut events, "echo-back")
+            .await
+            .arg::<String>(0)
+            .unwrap(),
+        "third"
+    );
+    client.disconnect().await.unwrap();
 }
