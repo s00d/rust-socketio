@@ -1,0 +1,62 @@
+[package]
+name = "socketio-next"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Socket.IO v4 / Engine.IO v4 client with socket.io-client 4.8 parity: async (tokio) and blocking, rustls or native-tls"
+documentation = "https://docs.rs/socketio-next"
+readme = "README.md"
+keywords = ["socketio", "engineio", "websocket", "client", "realtime"]
+categories = ["network-programming", "web-programming", "web-programming::websocket", "asynchronous"]
+include = ["/src/**", "/README.md", "/LICENSE", "/Cargo.toml"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+features = ["rustls", "native-tls", "blocking"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["rustls"]
+## Blocking client (`socketio_next::blocking`) on a private tokio runtime.
+blocking = ["tokio/rt-multi-thread"]
+## TLS through rustls: ring provider, Mozilla roots from webpki-roots unless a TlsConfig is given.
+rustls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots", "reqwest/rustls-no-provider", "tokio-tungstenite/rustls-tls-webpki-roots"]
+## TLS through the platform library (OpenSSL on Linux, Security.framework on macOS, SChannel on Windows).
+native-tls = ["dep:native-tls", "reqwest/native-tls", "tokio-tungstenite/native-tls"]
+
+[dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
+native-tls = { workspace = true, optional = true }
+reqwest = { workspace = true }
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+webpki-roots = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["async_tokio"] }
+socketio-next-testing = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "test-util"] }
+tracing-subscriber = { workspace = true }
+
+[lib]
+bench = false
+
+[[bench]]
+name = "engineio"
+harness = false
