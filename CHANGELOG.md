@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Documentation site at <https://s00d.github.io/rust-socketio/>; the README is short and links
+  to it.
+
 ## [0.1.0] - 2026-11-08
 
 First release of `socketio-next`, the successor of the s00d/rust-socketio fork of

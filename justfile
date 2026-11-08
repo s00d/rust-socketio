@@ -103,6 +103,14 @@ msrv:
         && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}/msrv" cargo "+${tc}" check -q --locked)
     done
 
+# Documentation site (docs/, Nuxt): dev server on http://localhost:3000
+docs-dev:
+    cd docs && pnpm install --frozen-lockfile && pnpm dev
+
+# Documentation site: static build in docs/.output/public (deployed by the manual `docs` workflow)
+docs-build:
+    cd docs && pnpm install --frozen-lockfile && NUXT_APP_BASE_URL="${NUXT_APP_BASE_URL:-/rust-socketio/}" pnpm generate
+
 # Run the examples against a local server (see examples/README)
 example name *args:
     cargo run -p examples --bin {{ name }} {{ ci_flags }} -- {{ args }}

@@ -1,5 +1,6 @@
 //! Tauri 2 plugin for [socketio-next](https://docs.rs/socketio-next): one registry of named
-//! Socket.IO clients that Rust and the webviews share.
+//! Socket.IO clients that Rust and the webviews share. Guide:
+//! <https://s00d.github.io/rust-socketio/tauri/setup>.
 //!
 //! - Rust registers clients with [`SocketIo::connect`] (built and connected here) or
 //!   [`SocketIo::insert`] (built elsewhere, e.g. by Tauri-free core code), optionally

@@ -35,6 +35,8 @@
 //!   runtime and reports [`ConnectionState`] / [`LinkInfo`].
 //! - [`blocking`] (feature `blocking`) is the same client without async.
 //! - [`engineio`] is the transport layer, [`protocol`] the packet codecs (no I/O).
+//!
+//! Guide: <https://s00d.github.io/rust-socketio/>.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod actor;
