@@ -76,9 +76,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # just's GitHub release asset answers 504 on the macOS runners (Nov 2026): Homebrew there
+      - if: runner.os == 'macOS'
+        run: brew install just
       - uses: taiki-e/install-action@v2
         with:
-          tool: just,cargo-hack
+          tool: ${{ runner.os == 'macOS' && 'cargo-hack' || 'just,cargo-hack' }}
       - uses: Swatinem/rust-cache@v2
       - run: just servers-setup
       # The servers run in the background of this step; the tests trust ci/cert/ca.crt in-process.
@@ -118,7 +121,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: taiki-e/install-action@v2
+      - if: runner.os == 'macOS'
+        run: brew install just
+      - if: runner.os != 'macOS'
+        uses: taiki-e/install-action@v2
         with:
           tool: just
       - uses: Swatinem/rust-cache@v2
