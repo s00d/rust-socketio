@@ -379,6 +379,54 @@
           "markdownDescription": "Denies the list command without any pre-configured scope."
         },
         {
+          "description": "Enables the reconnect command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reconnect",
+          "markdownDescription": "Enables the reconnect command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reconnect command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reconnect",
+          "markdownDescription": "Denies the reconnect command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_auth command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-auth",
+          "markdownDescription": "Enables the set_auth command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_auth command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-auth",
+          "markdownDescription": "Denies the set_auth command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_headers command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-headers",
+          "markdownDescription": "Enables the set_headers command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_headers command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-headers",
+          "markdownDescription": "Denies the set_headers command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_query command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-query",
+          "markdownDescription": "Enables the set_query command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_query command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-query",
+          "markdownDescription": "Denies the set_query command without any pre-configured scope."
+        },
+        {
           "description": "Enables the state command without any pre-configured scope.",
           "type": "string",
           "const": "allow-state",
@@ -415,10 +463,10 @@
           "markdownDescription": "Denies the unsubscribe command without any pre-configured scope."
         },
         {
-          "description": "Every command: connect, attach, emit (with or without ack), answer server acks, disconnect.\nClients that Rust registered as read-only still refuse emit, ack and disconnect.\n\n#### This default permission set includes:\n\n- `allow-connect`\n- `allow-disconnect`\n- `allow-emit`\n- `allow-emit-with-ack`\n- `allow-ack`\n- `allow-subscribe`\n- `allow-unsubscribe`\n- `allow-list`\n- `allow-state`\n- `allow-link-info`",
+          "description": "Every command: connect, attach, emit (with or without ack), answer server acks, change the\nauth / headers / query of the next connect, reconnect a closed client, disconnect.\nClients that Rust registered as read-only still refuse emit, ack and disconnect.\n\n#### This default permission set includes:\n\n- `allow-connect`\n- `allow-disconnect`\n- `allow-emit`\n- `allow-emit-with-ack`\n- `allow-ack`\n- `allow-subscribe`\n- `allow-unsubscribe`\n- `allow-list`\n- `allow-state`\n- `allow-link-info`\n- `allow-set-auth`\n- `allow-set-headers`\n- `allow-set-query`\n- `allow-reconnect`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Every command: connect, attach, emit (with or without ack), answer server acks, disconnect.\nClients that Rust registered as read-only still refuse emit, ack and disconnect.\n\n#### This default permission set includes:\n\n- `allow-connect`\n- `allow-disconnect`\n- `allow-emit`\n- `allow-emit-with-ack`\n- `allow-ack`\n- `allow-subscribe`\n- `allow-unsubscribe`\n- `allow-list`\n- `allow-state`\n- `allow-link-info`"
+          "markdownDescription": "Every command: connect, attach, emit (with or without ack), answer server acks, change the\nauth / headers / query of the next connect, reconnect a closed client, disconnect.\nClients that Rust registered as read-only still refuse emit, ack and disconnect.\n\n#### This default permission set includes:\n\n- `allow-connect`\n- `allow-disconnect`\n- `allow-emit`\n- `allow-emit-with-ack`\n- `allow-ack`\n- `allow-subscribe`\n- `allow-unsubscribe`\n- `allow-list`\n- `allow-state`\n- `allow-link-info`\n- `allow-set-auth`\n- `allow-set-headers`\n- `allow-set-query`\n- `allow-reconnect`"
         },
         {
           "description": "Observe only: list the clients, attach to one (events and state over a channel), detach,\nread its state and link info. No connect, emit, ack or disconnect.\n\n#### This permission set includes:\n\n- `allow-list`\n- `allow-subscribe`\n- `allow-unsubscribe`\n- `allow-state`\n- `allow-link-info`",

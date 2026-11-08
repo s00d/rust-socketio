@@ -9,6 +9,10 @@ const COMMANDS: &[&str] = &[
     "list",
     "state",
     "link_info",
+    "set_auth",
+    "set_headers",
+    "set_query",
+    "reconnect",
 ];
 
 fn main() {

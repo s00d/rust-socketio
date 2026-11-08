@@ -17,4 +17,4 @@ that supports it (tauri 2.12 itself needs 1.90).
 
 `just msrv` (run in CI) builds the crate (and the plugin with `rustls`) on 1.85 in a throwaway project whose lockfile is
 resolved for 1.85, as a downstream project would, once with `rustls` and once with
-`native-tls` + `blocking`.
+`native-tls` + `blocking` + `cookies` + `platform-verifier`.

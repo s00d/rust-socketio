@@ -18,7 +18,7 @@ include = ["/src/**", "/LICENSE", "/Cargo.toml"]
 workspace = true
 
 [package.metadata.docs.rs]
-features = ["rustls", "native-tls", "blocking"]
+features = ["rustls", "native-tls", "blocking", "cookies", "platform-verifier"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
@@ -27,6 +27,13 @@ default = ["rustls"]
 blocking = ["tokio/rt-multi-thread"]
 ## TLS through rustls: ring provider, Mozilla roots from webpki-roots unless a TlsConfig is given.
 rustls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots", "reqwest/rustls-no-provider", "tokio-tungstenite/rustls-tls-webpki-roots"]
+## rustls verifies with the operating system's trust store (enterprise / user-installed CAs)
+## through rustls-platform-verifier instead of the bundled Mozilla roots. Not on Android (it
+## needs JVM setup there); Android keeps webpki-roots.
+platform-verifier = ["rustls", "dep:rustls-platform-verifier"]
+## Cookies: one jar per client for polling requests and the websocket handshake (sticky
+## sessions behind load balancers that pin by cookie).
+cookies = ["reqwest/cookies"]
 ## TLS through the platform library (OpenSSL on Linux, Security.framework on macOS, SChannel on Windows).
 native-tls = ["dep:native-tls", "reqwest/native-tls", "tokio-tungstenite/native-tls"]
 
@@ -47,6 +54,9 @@ tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 webpki-roots = { workspace = true, optional = true }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rustls-platform-verifier = { version = "0.7", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }

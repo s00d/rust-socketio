@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
 use http::HeaderMap;
-use reqwest::{Client, ClientBuilder};
+use reqwest::{Client, RequestBuilder};
 use std::fmt::Debug;
 use std::time::Duration;
 use std::{pin::Pin, sync::Arc};
@@ -10,7 +10,8 @@ use tokio::sync::RwLock;
 use url::Url;
 
 use crate::engineio::generator::StreamGenerator;
-use crate::engineio::tls::{self, TlsConfig, apply_reqwest_tls};
+use crate::engineio::http::Http;
+use crate::engineio::tls::{self, TlsConfig};
 use crate::engineio::{Error, error::Result};
 
 /// Largest polling response body read.
@@ -21,6 +22,7 @@ const MAX_BODY: usize = 64 << 20;
 #[derive(Clone)]
 pub struct PollingTransport {
     client: Client,
+    headers: HeaderMap,
     base_url: Arc<RwLock<Url>>,
     generator: StreamGenerator<Bytes>,
 }
@@ -31,46 +33,39 @@ impl PollingTransport {
         tls_config: Option<TlsConfig>,
         opening_headers: Option<HeaderMap>,
     ) -> Result<Self> {
-        Self::with_timeout(base_url, tls_config, opening_headers, None)
+        let http = Http::new(tls_config.as_ref(), None)?;
+        Self::with_client(base_url, &http, opening_headers.unwrap_or_default(), None)
     }
 
-    /// Like [`PollingTransport::new`], but every request (connect, send, body) fails after
-    /// `timeout`, so a silent peer or a half-open connection cannot hang a request forever.
-    pub(crate) fn with_timeout(
+    /// A transport on the shared `http` client. Each long-poll GET fails after
+    /// `poll_timeout`, so a silent peer or a half-open connection cannot hang it forever;
+    /// POSTs have no total bound (a large upload may take longer than a heartbeat).
+    pub(crate) fn with_client(
         base_url: Url,
-        tls_config: Option<TlsConfig>,
-        opening_headers: Option<HeaderMap>,
-        timeout: Option<Duration>,
+        http: &Http,
+        headers: HeaderMap,
+        poll_timeout: Option<Duration>,
     ) -> Result<Self> {
         tls::check_scheme(&base_url)?;
-        let mut builder = apply_reqwest_tls!(ClientBuilder::new(), tls_config.as_ref());
-        if let Some(map) = opening_headers {
-            builder = builder.default_headers(map);
-        }
-        if let Some(timeout) = timeout {
-            builder = builder.timeout(timeout);
-        }
-        let client = tls::build_reqwest(builder)?;
-
+        let client = http.client.clone();
         let mut url = base_url;
         url.query_pairs_mut().append_pair("transport", "polling");
-
-        Ok(PollingTransport {
+        let get = Get {
             client: client.clone(),
+            headers: headers.clone(),
+            timeout: poll_timeout,
+        };
+        Ok(PollingTransport {
+            client,
+            headers,
             base_url: Arc::new(RwLock::new(url.clone())),
-            generator: StreamGenerator::new(Self::stream(url, client)),
+            generator: StreamGenerator::new(Self::stream(url, get)),
         })
     }
 
-    fn stream(
-        url: Url,
-        client: Client,
-    ) -> Pin<Box<dyn Stream<Item = Result<Bytes>> + 'static + Send>> {
-        stream::try_unfold((url, client), |(url, client)| async move {
-            let response = client
-                .get(crate::engineio::util::with_timestamp(url.clone()))
-                .send()
-                .await?;
+    fn stream(url: Url, get: Get) -> Pin<Box<dyn Stream<Item = Result<Bytes>> + 'static + Send>> {
+        stream::try_unfold((url, get), |(url, get)| async move {
+            let response = get.request(&url).send().await?;
             // A non-200 reply (e.g. 400 "Session ID unknown") carries an error body, not a
             // payload: report it instead of handing it to the decoder.
             let status = response.status().as_u16();
@@ -91,9 +86,16 @@ impl PollingTransport {
                 }
                 body.extend_from_slice(&chunk);
             }
-            Ok(Some((body.freeze(), (url, client))))
+            Ok(Some((body.freeze(), (url, get))))
         })
         .boxed()
+    }
+
+    fn post(&self, url: Url, body: Bytes) -> RequestBuilder {
+        self.client
+            .post(url)
+            .headers(self.headers.clone())
+            .body(body)
     }
 
     pub(crate) async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
@@ -109,7 +111,7 @@ impl PollingTransport {
         };
 
         let address = crate::engineio::util::with_timestamp(self.base_url().await?);
-        let response = self.client.post(address).body(data_to_send).send().await?;
+        let response = self.post(address, data_to_send).send().await?;
         if response.status().as_u16() != 200 {
             return Err(http_status(response).await);
         }
@@ -130,6 +132,27 @@ impl PollingTransport {
         }
         *self.base_url.write().await = url;
         Ok(())
+    }
+}
+
+/// The long-poll GET: headers of this attempt, bounded by the heartbeat.
+#[derive(Clone)]
+struct Get {
+    client: Client,
+    headers: HeaderMap,
+    timeout: Option<Duration>,
+}
+
+impl Get {
+    fn request(&self, url: &Url) -> RequestBuilder {
+        let request = self
+            .client
+            .get(crate::engineio::util::with_timestamp(url.clone()))
+            .headers(self.headers.clone());
+        match self.timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
     }
 }
 
@@ -205,6 +228,35 @@ mod test {
         );
         assert_ne!(transport.base_url().await?.to_string(), url);
         Ok(())
+    }
+
+    /// Only the long-poll GET is bounded by the heartbeat; a POST (an upload) is not.
+    #[test]
+    fn only_the_long_poll_has_a_total_timeout() {
+        let http = Http::new(None, None).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-token", "t".parse().unwrap());
+        let url = Url::parse("http://h/engine.io/").unwrap();
+        let timeout = Duration::from_millis(500);
+        let transport =
+            PollingTransport::with_client(url.clone(), &http, headers.clone(), Some(timeout))
+                .unwrap();
+        let get = Get {
+            client: http.client.clone(),
+            headers,
+            timeout: Some(timeout),
+        }
+        .request(&url)
+        .build()
+        .unwrap();
+        assert_eq!(get.timeout(), Some(&timeout));
+        assert_eq!(get.headers()["x-token"], "t");
+        let post = transport
+            .post(url, Bytes::from_static(b"x"))
+            .build()
+            .unwrap();
+        assert_eq!(post.timeout(), None);
+        assert_eq!(post.headers()["x-token"], "t");
     }
 
     #[tokio::test]

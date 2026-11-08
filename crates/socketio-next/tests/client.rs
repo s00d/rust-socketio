@@ -1229,3 +1229,117 @@ async fn reconnect_after_closed_keeps_the_handlers() {
     );
     client.disconnect().await.unwrap();
 }
+
+/// `.proxy()`: polling as absolute-form requests, the websocket through a `CONNECT` tunnel,
+/// both with the proxy credentials.
+#[tokio::test]
+async fn an_explicit_proxy_carries_polling_and_the_websocket() {
+    let proxy = HttpProxy::start().await;
+    let with_auth = proxy.url().replace("http://", "http://user:p%40ss@");
+    let client = connect(
+        ClientBuilder::new(server())
+            .proxy(with_auth)
+            .transport_type(TransportType::WebsocketUpgrade),
+    )
+    .await;
+    let reply = client
+        .emit_with_ack("echo", json!("via proxy"), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(reply.arg::<String>(0).unwrap(), "via proxy");
+    let log = proxy.log();
+    let auth = "Basic dXNlcjpwQHNz"; // user:p@ss
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("GET /socket.io/") && l.ends_with(auth)),
+        "{log:?}"
+    );
+    let target = host_port(&server());
+    assert!(
+        log.iter().any(|l| l == &format!("CONNECT {target} {auth}")),
+        "{log:?}"
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_proxy_that_refuses_is_a_typed_error() {
+    let result = ClientBuilder::new(server())
+        .proxy("http://127.0.0.1:9")
+        .transport_type(TransportType::Websocket)
+        .reconnection(false)
+        .connect()
+        .await;
+    match result {
+        Err(Error::Engine(socketio_next::engineio::Error::ProxyFailed(text))) => {
+            assert!(!text.contains("127.0.0.1"), "{text}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// One HTTP client per socket.io client: the handshake connection is reused for the polls
+/// (two clients, as before, meant a third TCP connection).
+#[tokio::test]
+async fn one_http_client_for_every_request() {
+    let tcp = Proxy::start(&host_port(&server())).await;
+    let client =
+        connect(ClientBuilder::new(tcp.url()).transport_type(TransportType::Polling)).await;
+    client.emit_with_ack("echo", 1, WAIT).await.unwrap();
+    client.emit_with_ack("echo", 2, WAIT).await.unwrap();
+    assert!(tcp.accepted() <= 2, "{} connections", tcp.accepted());
+    client.disconnect().await.unwrap();
+}
+
+/// `cookies`: the engine.io `io` cookie set on the handshake goes back on every later polling
+/// request and on the websocket upgrade.
+#[cfg(feature = "cookies")]
+#[tokio::test]
+async fn cookies_reach_polling_and_the_websocket() {
+    for (transport, kind) in [
+        (TransportType::Polling, "polling"),
+        (TransportType::WebsocketUpgrade, "websocket"),
+    ] {
+        let client = connect(ClientBuilder::new(cookie_server()).transport_type(transport)).await;
+        client.emit_with_ack("echo", 1, WAIT).await.unwrap();
+        let sid = client.link_info().engine_sid.unwrap();
+        let seen = cookies_seen(&sid).await;
+        let cookie = format!("io={sid}");
+        assert!(
+            seen.iter()
+                .any(|l| l.starts_with(&format!("{kind} ")) && l.contains(&cookie)),
+            "{kind}: {seen:?}"
+        );
+        client.disconnect().await.unwrap();
+    }
+}
+
+#[cfg(any(feature = "rustls", feature = "native-tls"))]
+/// A private CA through `tls_config`: the TLS handshake with the test server passes (4202 is an
+/// engine.io server: its greeting then fails to parse as socket.io, a protocol error).
+#[tokio::test]
+async fn tls_config_trusts_a_private_ca() {
+    let tls = socketio_next::TlsConfig::with_root_certificates_pem(&ca_cert_pem()).unwrap();
+    let result = ClientBuilder::new("https://localhost:4202")
+        .tls_config(tls)
+        .path("/engine.io/")
+        .transport_type(TransportType::Polling)
+        .timeout(Duration::from_millis(1500))
+        .connect()
+        .await;
+    assert!(matches!(result, Err(Error::Protocol(_))), "{result:?}");
+}
+
+/// The bundled roots only: native-tls and `platform-verifier` ask the OS, whose store may trust
+/// a CA a developer installed.
+#[cfg(all(feature = "rustls", not(feature = "platform-verifier")))]
+#[tokio::test]
+async fn without_the_ca_tls_fails() {
+    let result = ClientBuilder::new("https://localhost:4202")
+        .path("/engine.io/")
+        .transport_type(TransportType::Polling)
+        .timeout(Duration::from_millis(1500))
+        .connect()
+        .await;
+    assert!(matches!(result, Err(Error::Engine(_))), "{result:?}");
+}

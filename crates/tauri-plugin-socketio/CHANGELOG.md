@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the channel starts with that snapshot (`snapshot: true`) and nothing older follows it.
 - One forwarding hub per client: ending a subscription drops its channel; a reload during a
   JS `connect` leaves no subscription behind.
+- `setAuth` / `setHeaders` / `setQuery` (commands `set_auth`, `set_headers`, `set_query`) for
+  clients a webview connected, read before every connect attempt; `reconnect` after `closed`;
+  a `ca` option (PEM) for private CAs.
+- `linkInfo` has `packetsIn` / `packetsOut`, `bytesIn` / `bytesOut`, `sessions`; `disconnected`
+  states carry the error (`WebsocketClosed` with `data: { code, reason }`); `HttpStatus`
+  errors have `data.message`.
 - Typed `InvalidOptions` for wrong option types/values (values are not echoed); connect
   options' `Debug` hides query, header and auth values.
 - Binary arguments both ways (`Uint8Array` ↔ socket.io attachments).

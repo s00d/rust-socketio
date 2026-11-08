@@ -5,7 +5,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use socketio_next::{ClientBuilder, ConnectionState, LinkInfo, Payload, TransportType};
+use std::sync::{Arc, Mutex};
+
+use socketio_next::{
+    ClientBuilder, ConnectParams, ConnectionState, LinkInfo, Payload, TransportType,
+};
 
 use crate::error::ErrorPayload;
 
@@ -55,6 +59,8 @@ pub(crate) struct ConnectOptions {
     pub randomization_factor: Option<f64>,
     pub reconnect_on_disconnect: Option<bool>,
     pub buffer_while_disconnected: Option<bool>,
+    /// PEM certificates to trust instead of the default roots (a private CA).
+    pub ca: Option<String>,
 }
 
 /// Query, header and auth values are secrets as often as not: only their keys are shown.
@@ -67,6 +73,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("header_keys", &self.headers.keys().collect::<Vec<_>>())
             .field("auth", &self.auth.as_ref().map(|_| "***"))
             .field("transports", &self.transports)
+            .field("ca", &self.ca.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -99,8 +106,15 @@ impl ConnectOptions {
         serde_json::from_value(value).map_err(|e| invalid(&e))
     }
 
-    pub(crate) fn into_builder(self) -> ClientBuilder {
+    /// The builder, plus the values the webview may change later (`setAuth`, `setHeaders`,
+    /// `setQuery`): they are read again before every connect attempt.
+    pub(crate) fn into_builder(self) -> crate::Result<(ClientBuilder, Arc<Mutex<Dynamic>>)> {
         let ms = Duration::from_millis;
+        let dynamic = Arc::new(Mutex::new(Dynamic {
+            auth: self.auth,
+            headers: self.headers,
+            query: self.query,
+        }));
         let mut b = ClientBuilder::new(self.url).transport_type(match self.transports {
             Transports::Any => TransportType::Any,
             Transports::Polling => TransportType::Polling,
@@ -113,14 +127,32 @@ impl ConnectOptions {
         if let Some(v) = self.path {
             b = b.path(v);
         }
-        for (k, v) in self.query {
-            b = b.query(k, v);
-        }
-        for (k, v) in self.headers {
-            b = b.header(k, v);
-        }
-        if let Some(v) = self.auth {
-            b = b.auth(v);
+        let (auth, params) = (Arc::clone(&dynamic), Arc::clone(&dynamic));
+        b = b
+            .auth_with(move || {
+                let auth = lock(&auth).auth.clone();
+                async move { auth.unwrap_or_else(|| Value::Object(Default::default())) }
+            })
+            .connect_params_with(move || {
+                let d = lock(&params);
+                let mut p = ConnectParams::new();
+                for (k, v) in &d.query {
+                    p = p.query(k, v);
+                }
+                for (k, v) in &d.headers {
+                    p = p.header(k, v);
+                }
+                async move { p }
+            });
+        if let Some(pem) = self.ca {
+            let tls = socketio_next::TlsConfig::with_root_certificates_pem(pem.as_bytes())
+                .map_err(|e| crate::Error::SocketIo(e.into()))?;
+            #[cfg(any(feature = "rustls", feature = "native-tls"))]
+            {
+                b = b.tls_config(tls);
+            }
+            #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
+            let _ = tls; // unreachable: without TLS the PEM is refused above
         }
         if let Some(v) = self.timeout {
             b = b.timeout(ms(v));
@@ -146,8 +178,20 @@ impl ConnectOptions {
         if let Some(v) = self.buffer_while_disconnected {
             b = b.buffer_while_disconnected(v);
         }
-        b
+        Ok((b, dynamic))
     }
+}
+
+/// Connect values a webview may replace on a client it connected; used from the next attempt.
+#[derive(Default)]
+pub(crate) struct Dynamic {
+    pub auth: Option<Value>,
+    pub headers: BTreeMap<String, String>,
+    pub query: BTreeMap<String, String>,
+}
+
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Event arguments over the IPC: JSON `args`, and the binary attachments that the
@@ -222,6 +266,9 @@ pub enum State {
     Disconnected {
         /// `"transport close"`, `"ping timeout"`, ...
         reason: String,
+        /// The error behind it (e.g. `WebsocketClosed` with the close code).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<ErrorPayload>,
     },
     /// Waiting `delay` ms before reconnect attempt `attempt`.
     Reconnecting {
@@ -252,8 +299,9 @@ impl From<&ConnectionState> for State {
                 sid: sid.clone(),
                 recovered: *recovered,
             },
-            ConnectionState::Disconnected { reason } => State::Disconnected {
+            ConnectionState::Disconnected { reason, error } => State::Disconnected {
                 reason: reason.as_str().to_owned(),
+                error: err(error),
             },
             ConnectionState::Reconnecting {
                 attempt,
@@ -308,6 +356,16 @@ pub struct Link {
     pub pending_acks: usize,
     /// Emits queued while disconnected.
     pub buffered_emits: usize,
+    /// Engine.io message packets sent / received.
+    pub packets_out: u64,
+    /// See `packets_out`.
+    pub packets_in: u64,
+    /// Bytes of those packets sent / received.
+    pub bytes_out: u64,
+    /// See `bytes_out`.
+    pub bytes_in: u64,
+    /// Successful connects of this client (first one and reconnects).
+    pub sessions: u32,
 }
 
 impl From<&LinkInfo> for Link {
@@ -333,6 +391,11 @@ impl From<&LinkInfo> for Link {
             reconnect_attempts: l.reconnect_attempts,
             pending_acks: l.pending_acks,
             buffered_emits: l.buffered_emits,
+            packets_out: l.packets_out,
+            packets_in: l.packets_in,
+            bytes_out: l.bytes_out,
+            bytes_in: l.bytes_in,
+            sessions: l.sessions,
         }
     }
 }
@@ -421,6 +484,7 @@ mod tests {
     fn states_serialize_with_js_reasons() {
         let s: State = (&ConnectionState::Disconnected {
             reason: socketio_next::DisconnectReason::TransportClose,
+            error: None,
         })
             .into();
         assert_eq!(

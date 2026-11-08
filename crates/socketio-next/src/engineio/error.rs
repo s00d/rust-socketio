@@ -32,6 +32,9 @@ pub enum Error {
         /// a text body (at most 200 characters, URLs replaced by `<url>`).
         message: Option<String>,
     },
+    /// The HTTP proxy refused or broke the `CONNECT` tunnel (never shows the proxy URL).
+    #[error("proxy: {0}")]
+    ProxyFailed(String),
     /// The server closed the websocket with a close frame (code and reason as sent).
     #[error("the server closed the websocket (code {code}{})", if reason.is_empty() { String::new() } else { format!(": {reason}") })]
     WebsocketClosed {

@@ -238,6 +238,26 @@ describe('Socket', () => {
     await expect(socket.emit('x')).rejects.toMatchObject({ kind: 'AccessDenied' })
   })
 
+  it('setAuth, setHeaders, setQuery and reconnect', async () => {
+    replies['plugin:socketio|reconnect'] = () => connected
+    const socket = await connect('cfg', { url: 'http://x', ca: '-----BEGIN CERTIFICATE-----' })
+    expect((calls[0].args.options as { ca?: string }).ca).toBe('-----BEGIN CERTIFICATE-----')
+    await socket.setAuth({ token: 'new' })
+    await socket.setHeaders({ authorization: 'Bearer x' })
+    await socket.setQuery({ v: '2' })
+    expect(await socket.reconnect()).toEqual(connected)
+    expect(calls.slice(1)).toEqual([
+      { cmd: 'plugin:socketio|set_auth', args: { id: 'cfg', auth: { token: 'new' } } },
+      { cmd: 'plugin:socketio|set_headers', args: { id: 'cfg', headers: { authorization: 'Bearer x' } } },
+      { cmd: 'plugin:socketio|set_query', args: { id: 'cfg', query: { v: '2' } } },
+      { cmd: 'plugin:socketio|reconnect', args: { id: 'cfg' } }
+    ])
+    replies['plugin:socketio|set_auth'] = () => {
+      throw { kind: 'NotConfigurable', message: 'registered from Rust' }
+    }
+    await expect(socket.setAuth({})).rejects.toMatchObject({ kind: 'NotConfigurable' })
+  })
+
   it('state, linkInfo, close and disconnect', async () => {
     replies['plugin:socketio|state'] = () => ({ status: 'connected', sid: 's', recovered: true })
     replies['plugin:socketio|link_info'] = () => ({ transport: 'websocket' })

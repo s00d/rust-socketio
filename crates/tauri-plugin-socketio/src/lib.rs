@@ -116,6 +116,10 @@ impl Builder {
                 commands::list,
                 commands::state,
                 commands::link_info,
+                commands::set_auth,
+                commands::set_headers,
+                commands::set_query,
+                commands::reconnect,
             ])
             .setup(move |app, _api| {
                 app.manage(SocketIo::with_allowed(allowed));

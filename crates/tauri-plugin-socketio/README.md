@@ -63,7 +63,10 @@ await socket.emit('message', 'hi', new Uint8Array([1, 2, 3]))
 const [sum] = await socket.emitWithAck('add', [1, 2], { timeout: 5000 })
 
 socket.connected; socket.id; socket.lastState
-await socket.state(); await socket.linkInfo()
+await socket.state(); await socket.linkInfo()   // ... packetsIn/Out, bytesIn/Out, sessions
+await socket.setAuth({ token: fresh })           // used from the next connect attempt
+await socket.setHeaders({ authorization: `Bearer ${fresh}` }); await socket.setQuery({ v: '2' })
+await socket.reconnect()   // after `closed` (rejected, attempts used up, server disconnect)
 await socket.close()       // stop receiving here; the client stays connected
 await socket.disconnect()  // leave, close, unregister (every webview sees `closed`)
 
@@ -75,7 +78,11 @@ Options (milliseconds for durations): `url`, `namespace`, `path`, `query`, `head
 (`extraHeaders`), `auth`, `transports` (`['polling', 'websocket']`, `['websocket']`,
 `['polling']` or `'websocket-upgrade'`), `timeout`, `reconnection`, `reconnectionAttempts`,
 `reconnectionDelay`, `reconnectionDelayMax`, `randomizationFactor`, `reconnectOnDisconnect`,
-`bufferWhileDisconnected`, plus `events` (the forwarding filter).
+`bufferWhileDisconnected`, `ca` (PEM certificates of a private CA; checks cannot be turned
+off), plus `events` (the forwarding filter). Auth, headers and query are read again before every
+connect attempt, so `setAuth` / `setHeaders` / `setQuery` take effect on the next reconnect;
+they work on clients the webview connected (`NotConfigurable` for Rust's, `AccessDenied` for
+read-only ones).
 
 **Timing.** `connect` attaches the subscription before connecting, so the events the server
 sends right after the connect are not lost. When `connect` / `attach` resolve, the socket
@@ -97,8 +104,9 @@ cross the IPC as arrays of numbers, so prefer the websocket for large blobs.
 the server middleware's `err.data`), `ConnectTimeout`, `NotConnected`, `AckTimeout`,
 `Disconnected`, `Closed`, `AccessDenied`, `UnknownClient`, `AlreadyExists`, `UnknownAck`,
 `Reserved`, `UrlNotAllowed`, `TooManySubscriptions`, `InvalidOptions` (a wrong option type or
-value; the value is not echoed), engine
-failures by name (`HttpStatus` with `data.status`, `Websocket`, `Http`, `TlsProviderMissing`,
+value; the value is not echoed), `NotConfigurable`, `WebsocketClosed` (`data: { code, reason }`),
+`ProxyFailed`, engine
+failures by name (`HttpStatus` with `data.status` and `data.message`, `Websocket`, `Http`, `TlsProviderMissing`,
 ...), and `Ipc` for a rejection that is not the plugin's (a command the capability does not
 allow). Messages never contain URLs or query values.
 
@@ -208,6 +216,7 @@ answerable from JS (`ack` is refused); answer them in Rust.
 | `socketio:allow-read` | `list`, `subscribe`, `unsubscribe`, `state`, `link_info` |
 | `socketio:allow-connect` / `allow-disconnect` | `connect` / `disconnect` |
 | `socketio:allow-emit` / `allow-emit-with-ack` / `allow-ack` | `emit` / `emit_with_ack` / `ack` |
+| `socketio:allow-set-auth` / `allow-set-headers` / `allow-set-query` / `allow-reconnect` | `set_auth` / `set_headers` / `set_query` / `reconnect` |
 | `socketio:allow-subscribe`, `allow-unsubscribe`, `allow-list`, `allow-state`, `allow-link-info` | one each |
 
 Every `allow-*` has a `deny-*`. The full table is in
@@ -218,7 +227,7 @@ Every `allow-*` has a `deny-*`. The full table is in
 A subscription's channel carries `{ type: 'state', state }` (the first one is the state at
 subscribe time) and `{ type: 'event', event, args, binary?, ackId? }`. State objects are
 `{ status: 'connecting', attempt }`, `{ status: 'connected', sid, recovered }`,
-`{ status: 'disconnected', reason }`, `{ status: 'reconnecting', attempt, delay, error? }`,
+`{ status: 'disconnected', reason, error? }`, `{ status: 'reconnecting', attempt, delay, error? }`,
 `{ status: 'closed', reason, error? }` with socket.io-client's reason strings (`io server
 disconnect`, `io client disconnect`, `ping timeout`, `transport close`, `transport error`,
 `parse error`) plus `connect rejected`, `reconnect failed`, `client dropped`.

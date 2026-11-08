@@ -34,6 +34,10 @@ pub enum Error {
     /// subscriptions already.
     #[error("too many socket.io subscriptions for this webview (at most {0})")]
     TooManySubscriptions(usize),
+    /// `setAuth` / `setHeaders` / `setQuery` on a client the webview did not connect (Rust
+    /// built it; Rust decides what it sends).
+    #[error("socket.io client `{0}` was registered from Rust: its connect values are Rust's")]
+    NotConfigurable(String),
     /// A connect option or argument has the wrong type or value (the value itself is not shown).
     #[error("invalid options: {0}")]
     InvalidOptions(String),
@@ -46,7 +50,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `AckTimeout`, `ConnectTimeout`, `AccessDenied`, `UnknownClient`, ..., engine.io failures by
 /// their own name such as `HttpStatus` or `TlsProviderMissing`), `message` the text (never a
 /// URL or query value), `data` extra fields (`ConnectRejected`: the server's `err.data`;
-/// `HttpStatus`: `{ status }`).
+/// `HttpStatus`: `{ status, message }`; `WebsocketClosed`: `{ code, reason }`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ErrorPayload {
     /// The variant name.
@@ -97,10 +101,15 @@ fn engine_kind(err: &engineio::Error, data: &mut Option<Value>) -> &'static str 
         E::InvalidUrl(_) => "InvalidUrl",
         E::InvalidUrlScheme(_) => "InvalidUrlScheme",
         E::Http(_) => "Http",
-        E::HttpStatus { status } => {
-            *data = Some(json!({ "status": status }));
+        E::HttpStatus { status, message } => {
+            *data = Some(json!({ "status": status, "message": message }));
             "HttpStatus"
         }
+        E::WebsocketClosed { code, reason } => {
+            *data = Some(json!({ "code": code, "reason": reason }));
+            "WebsocketClosed"
+        }
+        E::ProxyFailed(_) => "ProxyFailed",
         E::Websocket(_) => "Websocket",
         E::InvalidHandshake(_) => "InvalidHandshake",
         E::NotConnected => "NotConnected",
@@ -127,6 +136,7 @@ impl From<&Error> for ErrorPayload {
             Error::UrlNotAllowed => "UrlNotAllowed",
             Error::TooManySubscriptions(_) => "TooManySubscriptions",
             Error::InvalidOptions(_) => "InvalidOptions",
+            Error::NotConfigurable(_) => "NotConfigurable",
         };
         ErrorPayload {
             kind,
@@ -160,10 +170,27 @@ mod tests {
                 "data": { "reason": "test" }
             })
         );
-        let status = Error::SocketIo(engineio::Error::HttpStatus { status: 403 }.into());
+        let status = Error::SocketIo(
+            engineio::Error::HttpStatus {
+                status: 403,
+                message: Some("denied".into()),
+            }
+            .into(),
+        );
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["kind"], "HttpStatus");
         assert_eq!(v["data"]["status"], 403);
+        assert_eq!(v["data"]["message"], "denied");
+        let closed = Error::SocketIo(
+            engineio::Error::WebsocketClosed {
+                code: 4001,
+                reason: "kicked".into(),
+            }
+            .into(),
+        );
+        let v = serde_json::to_value(&closed).unwrap();
+        assert_eq!(v["kind"], "WebsocketClosed");
+        assert_eq!(v["data"], json!({ "code": 4001, "reason": "kicked" }));
         let denied = serde_json::to_value(Error::AccessDenied("core".into())).unwrap();
         assert_eq!(denied["kind"], "AccessDenied");
         assert!(denied.get("data").is_none());

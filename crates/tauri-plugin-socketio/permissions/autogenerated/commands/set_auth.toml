@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-set-auth"
+description = "Enables the set_auth command without any pre-configured scope."
+commands.allow = ["set_auth"]
+
+[[permission]]
+identifier = "deny-set-auth"
+description = "Denies the set_auth command without any pre-configured scope."
+commands.deny = ["set_auth"]

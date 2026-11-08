@@ -33,6 +33,10 @@ const ALL: &[&str] = &[
     "list",
     "state",
     "link_info",
+    "set_auth",
+    "set_headers",
+    "set_query",
+    "reconnect",
 ];
 /// The commands the `allow-read` set should grant.
 const READ: &[&str] = &["list", "subscribe", "unsubscribe", "state", "link_info"];
@@ -852,4 +856,132 @@ fn emit_with_ack_timeout_must_be_a_number() {
         json!({ "args": [] })
     );
     h.ok("disconnect", json!({ "id": "t" }));
+}
+
+/// `set_query` changes what the next attempt sends (here: the reconnect after the server
+/// closed the transport); `set_auth` / `set_headers` likewise.
+#[test]
+fn set_query_applies_from_the_next_attempt() {
+    let mut h = Harness::new();
+    let options = json!({
+        "url": socket_io_server(),
+        "query": { "token": "a" },
+        "reconnectionDelay": 20,
+        "randomizationFactor": 0,
+    });
+    h.connect("q", options, 1);
+    let token = |h: &Harness| {
+        h.ok("emit_with_ack", json!({ "id": "q", "event": "handshake_query", "args": { "args": [] }, "timeout": 5000 }))
+            ["args"][0]["token"]
+            .clone()
+    };
+    assert_eq!(token(&h), "a");
+    h.ok("set_query", json!({ "id": "q", "query": { "token": "b" } }));
+    h.ok(
+        "set_headers",
+        json!({ "id": "q", "headers": { "x-extra": "1" } }),
+    );
+    h.ok("set_auth", json!({ "id": "q", "auth": { "user": "u" } }));
+    assert_eq!(
+        h.err_kind("set_auth", json!({ "id": "q", "auth": "not an object" })),
+        "InvalidOptions"
+    );
+    h.ok(
+        "emit",
+        json!({ "id": "q", "event": "close_transport", "args": { "args": [] } }),
+    );
+    h.state(1, "disconnected");
+    h.state(1, "connected");
+    assert_eq!(token(&h), "b");
+    h.ok("disconnect", json!({ "id": "q" }));
+}
+
+#[test]
+fn connect_values_of_rust_clients_are_not_the_webviews() {
+    let h = Harness::new();
+    let io = h.app.socketio().clone();
+    tauri::async_runtime::block_on(io.connect("rs", ClientBuilder::new(conformance_server())))
+        .unwrap();
+    let client =
+        tauri::async_runtime::block_on(ClientBuilder::new(conformance_server()).connect()).unwrap();
+    io.insert("ro", client, Access::ReadOnly).unwrap();
+    let body = |id: &str| json!({ "id": id, "auth": {} });
+    assert_eq!(h.err_kind("set_auth", body("rs")), "NotConfigurable");
+    assert_eq!(h.err_kind("set_auth", body("ro")), "AccessDenied");
+    assert_eq!(
+        h.err_kind("set_query", json!({ "id": "nope", "query": {} })),
+        "UnknownClient"
+    );
+    assert_eq!(
+        h.err_kind("reconnect", json!({ "id": "ro" })),
+        "AccessDenied"
+    );
+    tauri::async_runtime::block_on(io.remove("rs").unwrap().disconnect()).unwrap();
+    io.remove("ro").unwrap();
+}
+
+/// `reconnect` brings back a client that closed itself (the server disconnected it).
+#[test]
+fn reconnect_after_a_server_disconnect() {
+    let mut h = Harness::new();
+    h.connect("back", json!({ "url": socket_io_server() }), 1);
+    h.ok(
+        "emit",
+        json!({ "id": "back", "event": "server_disconnect", "args": { "args": [] } }),
+    );
+    assert_eq!(h.state(1, "closed")["reason"], "io server disconnect");
+    assert_eq!(
+        h.ok("reconnect", json!({ "id": "back" }))["status"],
+        "connected"
+    );
+    h.ok(
+        "emit",
+        json!({ "id": "back", "event": "echo", "args": { "args": ["again"] } }),
+    );
+    assert_eq!(h.event(1, "echo-back")["args"], json!(["again"]));
+    let link = h.ok("link_info", json!({ "id": "back" }));
+    assert_eq!(link["sessions"], 2, "both connects count: {link}");
+    assert!(link["packetsOut"].as_u64().unwrap() > 0 && link["bytesIn"].as_u64().unwrap() > 0);
+    h.ok("disconnect", json!({ "id": "back" }));
+}
+
+/// `ca`: the private CA of the test servers is trusted (the TLS handshake passes and the
+/// failure is a later one: 4202 is an engine.io server whose greeting is not socket.io);
+/// without it TLS fails.
+#[test]
+fn a_ca_option_trusts_a_private_ca() {
+    let h = Harness::new();
+    let pem =
+        std::fs::read_to_string(socketio_next_testing::repo_root().join("ci/cert/ca.crt")).unwrap();
+    let options = |ca: Option<&str>| {
+        let mut o = json!({ "url": "https://localhost:4202", "path": "/engine.io/", "transports": "polling", "timeout": 1500 });
+        if let Some(ca) = ca {
+            o["ca"] = json!(ca);
+        }
+        o
+    };
+    // rustls only: native-tls asks the OS store, which may trust a developer's test CA
+    if cfg!(feature = "rustls") {
+        let without = h
+            .invoke(
+                "connect",
+                json!({ "id": "t1", "options": options(None), "channel": "__CHANNEL__:1" }),
+            )
+            .unwrap_err();
+        assert_eq!(without["kind"], "Http", "{without}");
+    }
+    let with = h
+        .invoke(
+            "connect",
+            json!({ "id": "t2", "options": options(Some(&pem)), "channel": "__CHANNEL__:2" }),
+        )
+        .unwrap_err();
+    assert_eq!(with["kind"], "Protocol", "{with}");
+    let bad = h
+        .invoke(
+            "connect",
+            json!({ "id": "t3", "options": options(Some("nope")), "channel": "__CHANNEL__:3" }),
+        )
+        .unwrap_err();
+    assert_eq!(bad["kind"], "InvalidTlsConfig", "{bad}");
 }

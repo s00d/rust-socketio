@@ -8,6 +8,7 @@ use url::Url;
 
 use crate::engineio::callback::{Callbacks, boxed};
 use crate::engineio::error::Result;
+use crate::engineio::http::Http;
 use crate::engineio::socket::Socket as InnerSocket;
 use crate::engineio::tls::{self, TlsConfig};
 use crate::engineio::transport::Frame;
@@ -27,6 +28,8 @@ pub struct ClientBuilder {
     timeout: Duration,
     handshake: Option<HandshakePacket>,
     callbacks: Callbacks,
+    /// Shared by every transport this builder opens (built on first use).
+    http: Option<Http>,
 }
 
 impl std::fmt::Debug for ClientBuilder {
@@ -67,7 +70,21 @@ impl ClientBuilder {
             timeout: DEFAULT_TIMEOUT,
             handshake: None,
             callbacks: Callbacks::default(),
+            http: None,
         }
+    }
+
+    /// The HTTP client (pool, cookie jar) and proxy of the socket.io client.
+    pub(crate) fn http(mut self, http: Http) -> Self {
+        self.http = Some(http);
+        self
+    }
+
+    fn http_settings(&mut self) -> Result<Http> {
+        if self.http.is_none() {
+            self.http = Some(Http::new(self.tls_config.as_ref(), None)?);
+        }
+        Ok(self.http.clone().expect("set above"))
     }
 
     /// TLS configuration for `https`/`wss` (default: the backend's default roots).
@@ -180,10 +197,11 @@ impl ClientBuilder {
             return Ok(());
         }
         tls::check_scheme(&self.url)?;
-        let mut transport = PollingTransport::with_timeout(
+        let http = self.http_settings()?;
+        let mut transport = PollingTransport::with_client(
             self.url.clone(),
-            self.tls_config.clone(),
-            self.headers.clone(),
+            &http,
+            self.headers.clone().unwrap_or_default(),
             Some(self.timeout),
         )?;
         self.handshake_with_transport(&mut transport).await
@@ -214,10 +232,11 @@ impl ClientBuilder {
                 .ping_interval
                 .saturating_add(handshake.ping_timeout),
         );
-        let transport = PollingTransport::with_timeout(
+        let http = self.http_settings()?;
+        let transport = PollingTransport::with_client(
             self.url,
-            self.tls_config,
-            self.headers,
+            &http,
+            self.headers.unwrap_or_default(),
             Some(request_timeout),
         )?;
         tracing::debug!(transport = "polling", "engine.io transport chosen");
@@ -245,10 +264,18 @@ impl ClientBuilder {
     pub async fn build_websocket(mut self) -> Result<Client> {
         let timeout = self.timeout;
         let connect = async move {
-            let mut transport = WebsocketTransport::new(
+            let http = self.http_settings()?;
+            #[allow(unused_mut)]
+            let mut headers = self.headers.clone().unwrap_or_default();
+            #[cfg(feature = "cookies")]
+            if let Some(cookies) = http.cookies(&self.url) {
+                headers.insert(http::header::COOKIE, cookies);
+            }
+            let mut transport = WebsocketTransport::connect(
                 self.url.clone(),
                 self.tls_config.clone(),
-                self.headers.clone(),
+                Some(headers),
+                http.ws_proxy(&self.url),
             )
             .await?;
             if self.handshake.is_some() {

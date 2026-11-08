@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-set-query"
+description = "Enables the set_query command without any pre-configured scope."
+commands.allow = ["set_query"]
+
+[[permission]]
+identifier = "deny-set-query"
+description = "Denies the set_query command without any pre-configured scope."
+commands.deny = ["set_query"]

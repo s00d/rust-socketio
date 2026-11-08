@@ -23,10 +23,12 @@ export type DisconnectReason =
 /** An error as the plugin sends it. */
 export interface ErrorData {
   /** The variant name: `ConnectRejected`, `NotConnected`, `AckTimeout`, `AccessDenied`,
-   * `Reserved`, `UrlNotAllowed`, `TooManySubscriptions`, `InvalidOptions`, ... */
+   * `Reserved`, `UrlNotAllowed`, `TooManySubscriptions`, `InvalidOptions`, `NotConfigurable`,
+   * `WebsocketClosed`, `HttpStatus`, `ProxyFailed`, ... */
   kind: string
   message: string
-  /** `ConnectRejected`: the server's `err.data`; `HttpStatus`: `{ status }`. */
+  /** `ConnectRejected`: the server's `err.data`; `HttpStatus`: `{ status, message }`;
+   * `WebsocketClosed`: `{ code, reason }`. */
   data?: unknown
 }
 
@@ -34,7 +36,7 @@ export interface ErrorData {
 export type ConnectionState =
   | { status: 'connecting'; attempt: number }
   | { status: 'connected'; sid: string; recovered: boolean }
-  | { status: 'disconnected'; reason: DisconnectReason }
+  | { status: 'disconnected'; reason: DisconnectReason; error?: ErrorData }
   | { status: 'reconnecting'; attempt: number; delay: number; error?: ErrorData }
   | { status: 'closed'; reason: DisconnectReason; error?: ErrorData }
 
@@ -92,6 +94,9 @@ export interface SocketOptions {
   reconnectOnDisconnect?: boolean
   /** Queue emits while disconnected (socket.io-client's send buffer; default false: they fail). */
   bufferWhileDisconnected?: boolean
+  /** PEM certificates to trust instead of the default roots (a private CA). There is no way
+   * to turn certificate checks off. */
+  ca?: string
   /** Forward only these events to this webview (state is always forwarded). */
   events?: string[]
 }
@@ -117,6 +122,13 @@ export interface LinkInfo {
   reconnectAttempts: number
   pendingAcks: number
   bufferedEmits: number
+  /** Engine.io message packets / bytes sent and received. */
+  packetsOut: number
+  packetsIn: number
+  bytesOut: number
+  bytesIn: number
+  /** Successful connects (the first one and every reconnect). */
+  sessions: number
 }
 
 /** A registered client. `readOnly`: this webview may observe it but not emit, ack or
@@ -337,6 +349,27 @@ export class Socket {
 
   linkInfo(): Promise<LinkInfo> {
     return call('link_info', { id: this.clientId })
+  }
+
+  /** Replaces the CONNECT auth payload from the next connect attempt (a refreshed token). */
+  async setAuth(auth: Record<string, unknown>): Promise<void> {
+    await call('set_auth', { id: this.clientId, auth })
+  }
+
+  /** Replaces the extra headers from the next connect attempt. */
+  async setHeaders(headers: Record<string, string>): Promise<void> {
+    await call('set_headers', { id: this.clientId, headers })
+  }
+
+  /** Replaces the query parameters from the next connect attempt. */
+  async setQuery(query: Record<string, string>): Promise<void> {
+    await call('set_query', { id: this.clientId, query })
+  }
+
+  /** Connects again after the client closed (rejected, reconnect attempts used up, server
+   * disconnect); resolves with the new state. A no-op while it is not closed. */
+  reconnect(): Promise<ConnectionState> {
+    return call('reconnect', { id: this.clientId })
   }
 
   /** Leaves the namespace, closes the connection and unregisters the client (for every

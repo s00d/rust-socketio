@@ -20,7 +20,7 @@ use socketio_next::{
 use tauri::ipc::Channel;
 use tokio::sync::watch;
 
-use crate::models::{Access, ClientInfo, Message, State};
+use crate::models::{Access, ClientInfo, Dynamic, Message, State};
 use crate::{Error, Result};
 
 /// Server acks wait this long for the webview's answer, then are forgotten.
@@ -65,6 +65,8 @@ struct Entry {
     hub: Arc<Hub>,
     /// The hub's listeners when they were added after the client was built (`insert`).
     listeners: Vec<ListenerId>,
+    /// Auth, headers and query a webview may replace (clients a webview connected).
+    dynamic: Option<Arc<Mutex<Dynamic>>>,
 }
 
 /// Fans one client out to its subscriptions; keeps the acks offered to webviews.
@@ -153,7 +155,7 @@ impl SocketIo {
     /// Fails with the connect error, or [`Error::AlreadyExists`] (then the new client is
     /// dropped, which closes it).
     pub async fn connect(&self, id: impl Into<String>, builder: ClientBuilder) -> Result<Client> {
-        Ok(self.connect_with(id.into(), builder, None).await?.0)
+        Ok(self.connect_with(id.into(), builder, None, None).await?.0)
     }
 
     /// The webview's connect: reservations, the URL allow-list and the subscription cap apply;
@@ -164,6 +166,7 @@ impl SocketIo {
         id: String,
         url: &str,
         builder: ClientBuilder,
+        dynamic: Arc<Mutex<Dynamic>>,
         sub: SubscribeArgs,
     ) -> Result<(SubscriptionId, State)> {
         if lock(&self.inner.reserved).contains(&id) {
@@ -172,7 +175,9 @@ impl SocketIo {
         if !self.url_allowed(url) {
             return Err(Error::UrlNotAllowed);
         }
-        let (_, sub) = self.connect_with(id, builder, Some(sub)).await?;
+        let (_, sub) = self
+            .connect_with(id, builder, Some(sub), Some(dynamic))
+            .await?;
         Ok(sub.expect("a subscription was given"))
     }
 
@@ -181,6 +186,7 @@ impl SocketIo {
         id: String,
         builder: ClientBuilder,
         sub: Option<SubscribeArgs>,
+        dynamic: Option<Arc<Mutex<Dynamic>>>,
     ) -> Result<(Client, Option<(SubscriptionId, State)>)> {
         let webview = sub.as_ref().and_then(|s| s.webview.clone());
         {
@@ -223,6 +229,7 @@ impl SocketIo {
                     access: Access::Full,
                     hub: Arc::clone(&hub),
                     listeners: Vec::new(),
+                    dynamic,
                 },
             );
         }
@@ -269,6 +276,7 @@ impl SocketIo {
                 access,
                 hub,
                 listeners,
+                dynamic: None,
             },
         );
         Ok(())
@@ -433,6 +441,24 @@ impl SocketIo {
         let result = entry.client.disconnect().await;
         entry.release();
         Ok(result?)
+    }
+
+    /// Changes what the next connect attempt of `id` sends (a client a webview connected,
+    /// [`Access::Full`]): `f` edits its auth, headers and query.
+    pub(crate) fn configure(&self, id: &str, f: impl FnOnce(&mut Dynamic)) -> Result<()> {
+        let clients = lock(&self.inner.clients);
+        let entry = clients
+            .get(id)
+            .ok_or_else(|| Error::UnknownClient(id.to_owned()))?;
+        if entry.access == Access::ReadOnly {
+            return Err(Error::AccessDenied(id.to_owned()));
+        }
+        let dynamic = entry
+            .dynamic
+            .as_ref()
+            .ok_or_else(|| Error::NotConfigurable(id.to_owned()))?;
+        f(&mut crate::models::lock(dynamic));
+        Ok(())
     }
 
     /// Answers server ack `ack_id` of client `id`, offered to `webview`.
@@ -907,6 +933,7 @@ mod tests {
         );
         hub.state(&ConnectionState::Disconnected {
             reason: socketio_next::DisconnectReason::TransportClose,
+            error: None,
         });
         let (ch2, rx2) = channel();
         lock(&hub.state).subs.insert(2, sub(ch2, "w").into_sub());
@@ -930,8 +957,14 @@ mod tests {
                 // /slow answers CONNECT after 200 ms
                 let url = format!("{}/slow", socket_io_server());
                 let builder = ClientBuilder::new(url.clone());
-                io.connect_from_webview("slow".into(), &url, builder, sub(ch, "w"))
-                    .await
+                io.connect_from_webview(
+                    "slow".into(),
+                    &url,
+                    builder,
+                    Default::default(),
+                    sub(ch, "w"),
+                )
+                .await
             })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;

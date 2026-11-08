@@ -112,16 +112,35 @@ fn rustls_config(roots: rustls::RootCertStore) -> Result<rustls::ClientConfig> {
     .with_no_client_auth())
 }
 
-/// The rustls configuration used when the caller gives none: Mozilla roots.
+/// The rustls configuration used when the caller gives none: Mozilla roots, or the operating
+/// system's verifier with `platform-verifier` (not on Android).
 #[cfg(feature = "rustls")]
 fn default_rustls() -> Arc<rustls::ClientConfig> {
     static CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
+        #[cfg(all(feature = "platform-verifier", not(target_os = "android")))]
+        match platform_config() {
+            Ok(config) => return Arc::new(config),
+            Err(err) => {
+                tracing::warn!(error = %err, "platform verifier unavailable; using webpki roots")
+            }
+        }
         let roots = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
         Arc::new(rustls_config(roots).expect("ring supports the default protocol versions"))
     });
     Arc::clone(&CONFIG)
+}
+
+#[cfg(all(feature = "platform-verifier", not(target_os = "android")))]
+fn platform_config() -> std::result::Result<rustls::ClientConfig, rustls::Error> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls_platform_verifier::Verifier::new(Arc::clone(&provider))?;
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth())
 }
 
 /// The configuration to use: the caller's, or the default of the preferred backend.
@@ -237,6 +256,18 @@ mod tests {
     #[test]
     fn pem_without_certificates_is_an_error() {
         assert!(TlsConfig::with_root_certificates_pem(b"not a pem").is_err());
+    }
+
+    /// `platform-verifier`: the default config verifies through the OS, not the bundled roots.
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn default_verifier_matches_the_features() {
+        let debug = format!("{:?}", default_rustls());
+        let platform = cfg!(all(
+            feature = "platform-verifier",
+            not(target_os = "android")
+        ));
+        assert_eq!(!debug.contains("WebPkiServerVerifier"), platform, "{debug}");
     }
 
     #[cfg(any(feature = "rustls", feature = "native-tls"))]

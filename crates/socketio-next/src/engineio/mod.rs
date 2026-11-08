@@ -26,6 +26,7 @@ mod callback;
 mod client;
 mod error;
 mod generator;
+pub(crate) mod http;
 mod socket;
 pub mod tls;
 mod transport;

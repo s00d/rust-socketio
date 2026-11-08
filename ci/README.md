@@ -16,6 +16,7 @@ Logs go to `ci/logs/`.
 | 4210 | `conformance/server.js` | socket.io 4.8, records each client's packets (`GET /log?tag=`) |
 | 4211 | `conformance/server.js` | the same with connection state recovery |
 | 4212 | `conformance/server.js` | the same with pingInterval 300 ms / pingTimeout 200 ms |
+| 4213 | `conformance/cookies.js` | socket.io 4.8 with the engine.io `io` cookie; `GET /cookies?sid=` lists each request's `Cookie` |
 
 `conformance/client.js` is the Node side of the differential tests (socket.io-client 4.8).
 

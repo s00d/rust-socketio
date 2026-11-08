@@ -1,6 +1,7 @@
 ## Default Permission
 
-Every command: connect, attach, emit (with or without ack), answer server acks, disconnect.
+Every command: connect, attach, emit (with or without ack), answer server acks, change the
+auth / headers / query of the next connect, reconnect a closed client, disconnect.
 Clients that Rust registered as read-only still refuse emit, ack and disconnect.
 
 #### This default permission set includes the following:
@@ -15,6 +16,10 @@ Clients that Rust registered as read-only still refuse emit, ack and disconnect.
 - `allow-list`
 - `allow-state`
 - `allow-link-info`
+- `allow-set-auth`
+- `allow-set-headers`
+- `allow-set-query`
+- `allow-reconnect`
 
 ## Permission Table
 
@@ -203,6 +208,110 @@ Enables the list command without any pre-configured scope.
 <td>
 
 Denies the list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`socketio:allow-reconnect`
+
+</td>
+<td>
+
+Enables the reconnect command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`socketio:deny-reconnect`
+
+</td>
+<td>
+
+Denies the reconnect command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`socketio:allow-set-auth`
+
+</td>
+<td>
+
+Enables the set_auth command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`socketio:deny-set-auth`
+
+</td>
+<td>
+
+Denies the set_auth command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`socketio:allow-set-headers`
+
+</td>
+<td>
+
+Enables the set_headers command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`socketio:deny-set-headers`
+
+</td>
+<td>
+
+Denies the set_headers command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`socketio:allow-set-query`
+
+</td>
+<td>
+
+Enables the set_query command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`socketio:deny-set-query`
+
+</td>
+<td>
+
+Denies the set_query command without any pre-configured scope.
 
 </td>
 </tr>

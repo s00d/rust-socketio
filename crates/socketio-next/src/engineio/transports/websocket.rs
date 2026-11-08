@@ -44,6 +44,16 @@ impl WebsocketTransport {
         tls_config: Option<TlsConfig>,
         headers: Option<HeaderMap>,
     ) -> Result<Self> {
+        Self::connect(base_url, tls_config, headers, None).await
+    }
+
+    /// Like [`new`](Self::new), through the HTTP proxy `proxy` (a `CONNECT` tunnel) if given.
+    pub(crate) async fn connect(
+        base_url: Url,
+        tls_config: Option<TlsConfig>,
+        headers: Option<HeaderMap>,
+        proxy: Option<Url>,
+    ) -> Result<Self> {
         tls::check_scheme(&base_url)?;
         let secure = matches!(base_url.scheme(), "https" | "wss");
         let mut url = base_url;
@@ -56,6 +66,29 @@ impl WebsocketTransport {
             req.headers_mut().extend(map);
         }
         // TCP_NODELAY like the Node `ws` client: engine.io packets are small and latency-bound.
+        let tcp = match &proxy {
+            Some(proxy) => {
+                let host = url
+                    .host_str()
+                    .ok_or_else(|| Error::InvalidHandshake("the URL has no host".into()))?;
+                let port = url.port_or_known_default().unwrap_or(80);
+                crate::engineio::http::tunnel(proxy, host, port).await?
+            }
+            None => {
+                let host = url
+                    .host_str()
+                    .ok_or_else(|| Error::InvalidHandshake("the URL has no host".into()))?
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_owned();
+                let port = url.port_or_known_default().unwrap_or(80);
+                let tcp = TcpStream::connect((host.as_str(), port))
+                    .await
+                    .map_err(|e| Error::from(tokio_tungstenite::tungstenite::Error::Io(e)))?;
+                tcp.set_nodelay(true).ok();
+                tcp
+            }
+        };
         #[cfg(any(feature = "rustls", feature = "native-tls"))]
         let (ws_stream, _) = {
             let connector = if secure {
@@ -63,12 +96,13 @@ impl WebsocketTransport {
             } else {
                 None
             };
-            tokio_tungstenite::connect_async_tls_with_config(req, None, true, connector).await?
+            tokio_tungstenite::client_async_tls_with_config(req, tcp, None, connector).await?
         };
         #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
         let (ws_stream, _) = {
             let _ = tls_config;
-            tokio_tungstenite::connect_async_with_config(req, None, true).await?
+            tokio_tungstenite::client_async_with_config(req, MaybeTlsStream::Plain(tcp), None)
+                .await?
         };
         let (sender, receiver) = ws_stream.split();
 

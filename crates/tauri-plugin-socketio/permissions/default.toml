@@ -2,7 +2,8 @@
 
 [default]
 description = """
-Every command: connect, attach, emit (with or without ack), answer server acks, disconnect.
+Every command: connect, attach, emit (with or without ack), answer server acks, change the
+auth / headers / query of the next connect, reconnect a closed client, disconnect.
 Clients that Rust registered as read-only still refuse emit, ack and disconnect.
 """
 permissions = [
@@ -16,6 +17,10 @@ permissions = [
   "allow-list",
   "allow-state",
   "allow-link-info",
+  "allow-set-auth",
+  "allow-set-headers",
+  "allow-set-query",
+  "allow-reconnect",
 ]
 
 [[set]]

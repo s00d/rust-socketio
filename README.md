@@ -57,6 +57,8 @@ async fn main() -> socketio_next::Result<()> {
 | `rustls` | yes | TLS with rustls (ring provider, Mozilla roots from `webpki-roots`). Pure Rust: no OpenSSL, builds for Android/iOS. |
 | `native-tls` | no | TLS with the platform library: OpenSSL on Linux, Security.framework on macOS, SChannel on Windows. |
 | `blocking` | no | `socketio_next::blocking`: the same client with blocking methods and plain-closure handlers. |
+| `cookies` | no | One cookie jar per client: cookies set by polling answers go back on later requests and on the websocket handshake (sticky sessions behind a load balancer). |
+| `platform-verifier` | no | rustls checks certificates with the operating system's trust store (enterprise and user-installed CAs) through `rustls-platform-verifier`, instead of the bundled Mozilla roots. Not on Android (it needs JVM setup there), which keeps the bundled roots. |
 
 Without `rustls` and `native-tls` (`default-features = false`) the crate builds without any TLS
 code; `https`/`wss` URLs then fail with `TlsNotEnabled`. If another crate in your build turns on
@@ -77,6 +79,8 @@ answered the namespace CONNECT, or fails with the error of that first attempt.
 | `query(k, v)` | `query` | — |
 | `header(k, v)` | `extraHeaders` | — |
 | `auth(json)`, `auth_with(\|\| async { json })` | `auth` (object / function) | — |
+| `connect_params_with(\|\| async { ConnectParams::new().query(k, v).header(k, v) })` | `query` / `extraHeaders` recomputed per attempt | — |
+| `proxy("http://user:pass@host:port")` | — | `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, `NO_PROXY` |
 | `transport_type(Any \| Polling \| Websocket \| WebsocketUpgrade)` | `transports` | polling + upgrade, polling fallback |
 | `tls_config(TlsConfig \| rustls::ClientConfig \| native_tls::TlsConnector)` | `ca`, `rejectUnauthorized` | default roots |
 | `timeout(d)` | `timeout` | 20 s for handshake + upgrade + CONNECT |
@@ -121,7 +125,29 @@ Read it with `client.state()`, wait with `client.wait_for(|s| ..)`, watch it wit
 `DisconnectReason` has socket.io-client's reasons (`io server disconnect`, `io client
 disconnect`, `ping timeout`, `transport close`, `transport error`, `parse error`) plus
 `ConnectRejected`, `ReconnectFailed` and `Dropped`. `client.link_info()` gives the transport,
-sids, ping interval/timeout, last ping, last packet, attempts, pending acks.
+sids, ping interval/timeout, last ping, last packet, attempts, pending acks, packets and bytes
+in and out, and `sessions` (successful connects). `Disconnected { reason, error }` carries the
+error that ended the connection, such as `WebsocketClosed { code, reason }` from a close frame.
+The heartbeat also compares the wall clock with the deadline, so a link that died while the
+machine slept is noticed on wake-up (engine.io-client does the same).
+
+**Connect values per attempt.** `auth_with` and `connect_params_with` run before every connect
+and reconnect, inside the attempt's timeout (a panic fails the attempt): a refreshed token, a
+signed timestamp. Their values replace the builder's ones of the same key.
+
+**Proxy.** Polling requests and the websocket go through the same HTTP proxy: the one given to
+`proxy(..)`, else the environment's (`HTTPS_PROXY` for `https`/`wss`, `HTTP_PROXY` for
+`http`/`ws`, `ALL_PROXY`, minus `NO_PROXY`). The websocket uses a `CONNECT` tunnel with basic
+auth from the proxy URL's user info. Only `http://` proxies are spoken.
+
+**One HTTP client per client.** The handshake, the polls and the POSTs of one client share one
+reqwest client (its connection pool and, with `cookies`, its jar) across reconnects. Long-poll
+GETs fail after pingInterval + pingTimeout; POSTs have no total bound, so a large upload is not
+cut by the heartbeat.
+
+**Reconnect after close.** `client.reconnect().await` connects a closed client again
+(`ConnectRejected`, `ReconnectFailed`, a server disconnect, `disconnect()`) with the same
+handlers; `auth_with` / `connect_params_with` run again first.
 
 **Shutdown.** `client.disconnect().await` leaves the namespace and closes the connection; it is
 bounded (1 s for the goodbye packets on a dead link) and no handler starts after it returns.
@@ -129,8 +155,10 @@ Dropping the last `Client` closes the connection too.
 
 **Errors.** One typed, `non_exhaustive`, cloneable `Error`: `ConnectRejected { message, data }`
 (the server's `connect_error`), `ConnectTimeout`, `IncompatibleServer`, `Engine(engineio::Error)`
-(`HttpStatus { status }`, `Timeout`, `PingTimeout`, `UpgradeUnavailable`, `InvalidHandshake`,
-`TlsNotEnabled`, ...), `NotConnected`, `Closed`, `AckTimeout`, `Disconnected`, `ReservedEvent`.
+(`HttpStatus { status, message }` with the body's engine.io message or the start of a text
+body, `WebsocketClosed { code, reason }`, `ProxyFailed`, `Timeout`, `PingTimeout`,
+`UpgradeUnavailable`, `InvalidHandshake`, `TlsNotEnabled`, ...), `NotConnected`, `Closed`,
+`AckTimeout`, `Disconnected`, `ReservedEvent`.
 Messages never contain URLs or query values.
 
 Examples for every topic are in [`examples/`](examples/src/bin): `just example basic`, `auth`,
@@ -169,7 +197,11 @@ request (URL with query, headers) with the `log` crate at trace level; if you br
 | `HttpStatus { status: 400 }` after a server restart | The old session id is gone; the client reconnects with a new one. |
 | `HttpStatus { status: 403 }` / CORS | CORS does not apply to non-browser clients; a 403 comes from a proxy or the server's `allowRequest`. |
 | `ConnectRejected { message, data }` | The namespace middleware refused the auth (`next(new Error(message))`), or the namespace does not exist (`Invalid namespace`). The client does not retry. |
-| TLS: `invalid peer certificate` | A private CA: `tls_config(TlsConfig::with_root_certificates_pem(&pem)?)`; or build with `native-tls` to use the OS trust store. |
+| TLS: `invalid peer certificate` | A private CA: `tls_config(TlsConfig::with_root_certificates_pem(&pem)?)`; or the `platform-verifier` feature (rustls with the OS trust store), or `native-tls`. |
+| `HttpStatus { status: 400, message: "Session ID unknown" }` | The server forgot the session (restart, another node behind a load balancer without sticky sessions: enable `cookies` if the balancer pins by cookie). |
+| `WebsocketClosed { code, reason }` | The server or a proxy closed the websocket on purpose; the code says why (1001 going away, 1008 policy, 4xxx the application's). |
+| Corporate proxy | Set `HTTPS_PROXY` / `HTTP_PROXY` or call `proxy(..)`; `ProxyFailed` says what the proxy answered. |
+| Token expired, reconnects keep failing | Return the fresh token from `auth_with` / `connect_params_with`; after `ReconnectFailed` call `reconnect()`. |
 | `TlsNotEnabled` | Built with `default-features = false`; enable `rustls` or `native-tls`. |
 | `TlsProviderMissing` | Another crate enabled reqwest's `rustls-no-provider`; enable `rustls` (see Cargo features). |
 | Large messages fail | The server's `maxHttpBufferSize` (engine.io `maxPayload`, see `link_info().max_payload`). |
@@ -238,9 +270,22 @@ where the Node client and this client play the same scenario against one recordi
 
 Not implemented, on purpose: one `Manager` multiplexing several namespaces over one connection
 (each `Client` has its own; connect several), `volatile` (offline emits already fail fast),
-`retries`/`ackTimeout` queues, `onAnyOutgoing`, cookies (`withCredentials`), `forceBase64`,
-WebTransport, browser-only options. `connect()` returns the first attempt's error instead of
+`retries`/`ackTimeout` queues, `onAnyOutgoing`, `forceBase64`, WebTransport, WASM, Engine.IO
+v3 (socket.io 2.x servers), permessage-deflate, the msgpack parser (a feature later if a server
+needs it), derive macros for events, concurrent handler dispatch (handlers run in order),
+injecting your own reqwest or tungstenite client (it would tie the public API to their
+versions), browser-only options. `connect()` returns the first attempt's error instead of
 retrying silently.
+
+## Other Rust clients
+
+[rust_socketio](https://github.com/1c3t3a/rust-socketio) 0.6 is where this crate started (see
+the migration table above). tf-rust-socketio (a fork of it) and sioc/eioc are other clients;
+per-attempt query and headers, cookies, proxy support, the OS verifier, close codes, HTTP error
+bodies and `reconnect()` after close were added after comparing with them and with the
+upstream branch. What this crate has on top: socket.io-client 4.8 behaviour checked against the
+reference client on the wire, typed states and errors, binary anywhere in the arguments,
+connection state recovery, and a Tauri plugin.
 
 ## Tauri
 

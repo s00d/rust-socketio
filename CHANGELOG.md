@@ -13,8 +13,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named clients shared by Rust and the webviews; its own changelog is
   [crates/tauri-plugin-socketio/CHANGELOG.md](crates/tauri-plugin-socketio/CHANGELOG.md).
 
+- `ClientBuilder::connect_params_with`: query parameters and headers computed before every
+  connect attempt (inside its timeout, panics contained), like `auth_with`.
+- `Client::reconnect()` (and blocking): connect a closed client again with the same handlers.
+- `ClientBuilder::proxy(..)` and `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` for the
+  websocket too (a `CONNECT` tunnel with basic auth); `engineio::Error::ProxyFailed`.
+- `cookies` feature: one cookie jar per client for polling and the websocket handshake.
+- `platform-verifier` feature: rustls with the OS trust store (not on Android).
+- `engineio::Error::WebsocketClosed { code, reason }` from close frames (also during the
+  upgrade probe), a `TransportClose`; `ConnectionState::Disconnected` carries the error.
+- `HttpStatus` has the body's message (`message`, at most 4 KiB read, URLs removed).
+- `LinkInfo`: `packets_in` / `packets_out`, `bytes_in` / `bytes_out`, `sessions`.
+
+### Changed
+
+- One reqwest client per socket.io client, shared by every transport and reconnect (it was
+  two per connect attempt); only long-poll GETs are bounded by pingInterval + pingTimeout, so
+  slow POST uploads are no longer cut.
+
 ### Fixed
 
+- The heartbeat also checks the wall clock: after a system sleep a dead link is detected on
+  wake-up instead of after the remaining monotonic time.
+- The websocket reader could miss a wakeup when another task held the receiver (a lock
+  future polled once and dropped); the receiver is now polled under a short std lock.
 - `connect().await` could return before the client was connected: `connected()` false,
   `state()` `Connecting`, `id()` None and `emit()` failing with `NotConnected` on a
   multi-thread runtime or with the blocking client. The connected state is now set before

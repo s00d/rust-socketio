@@ -17,7 +17,7 @@ async fn main() -> socketio_next::Result<()> {
                 ConnectionState::Connected { sid, recovered } => {
                     println!("connected {sid} recovered={recovered}")
                 }
-                ConnectionState::Disconnected { reason } => println!("lost: {reason}"),
+                ConnectionState::Disconnected { reason, .. } => println!("lost: {reason}"),
                 ConnectionState::Reconnecting {
                     attempt,
                     delay,

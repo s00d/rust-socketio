@@ -851,6 +851,9 @@ async fn attempt_connect_unbounded(
     let mut builder = engineio::ClientBuilder::new(url)
         .timeout(config.timeout)
         .headers(headers);
+    if let Some(http) = &config.http {
+        builder = builder.http(http.clone());
+    }
     #[cfg(any(feature = "rustls", feature = "native-tls"))]
     if let Some(tls) = &config.tls_config {
         builder = builder.tls_config(tls.clone());

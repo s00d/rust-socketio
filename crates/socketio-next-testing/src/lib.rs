@@ -245,3 +245,129 @@ pub async fn recorded_packets(tag: &str) -> Vec<String> {
         .map(|v| v.as_str().unwrap().to_owned())
         .collect()
 }
+
+/// socket.io 4.8 server with engine.io cookies on (`ci/conformance/cookies.js`); `GET
+/// /cookies?sid=<engine sid>` lists the `Cookie` header of every request of that session.
+pub fn cookie_server() -> String {
+    env_or("COOKIE_SERVER", "http://localhost:4213")
+}
+
+/// The `Cookie` headers the cookie server saw for engine.io session `sid`, as
+/// `<transport> <cookie or ->` per request.
+pub async fn cookies_seen(sid: &str) -> Vec<String> {
+    let host = host_port(&cookie_server());
+    let mut stream = TcpStream::connect(&host).await.unwrap();
+    stream
+        .write_all(format!("GET /cookies?sid={sid} HTTP/1.0\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut body = String::new();
+    stream.read_to_string(&mut body).await.unwrap();
+    let json = body.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("[]");
+    let value: serde_json::Value = serde_json::from_str(json).unwrap();
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// A minimal HTTP proxy: `CONNECT` tunnels (websockets) and absolute-form requests (polling,
+/// forwarded one per connection in origin form). Records what it was asked.
+#[derive(Debug, Clone)]
+pub struct HttpProxy {
+    addr: String,
+    log: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl HttpProxy {
+    /// Starts the proxy on a free local port.
+    pub async fn start() -> HttpProxy {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let task_log = Arc::clone(&log);
+        tokio::spawn(async move {
+            while let Ok((inbound, _)) = listener.accept().await {
+                tokio::spawn(proxy_one(inbound, Arc::clone(&task_log)));
+            }
+        });
+        HttpProxy { addr, log }
+    }
+
+    /// `http://127.0.0.1:<port>`.
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// One line per request: `CONNECT host:port [auth]` or `GET|POST /path [auth]`, where
+    /// `auth` is the `Proxy-Authorization` header if any.
+    pub fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+async fn proxy_one(mut inbound: TcpStream, log: Arc<std::sync::Mutex<Vec<String>>>) {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8];
+        if inbound.read(&mut byte).await.unwrap_or(0) == 0 || head.len() > 65536 {
+            return;
+        }
+        head.push(byte[0]);
+    }
+    let text = String::from_utf8_lossy(&head).into_owned();
+    let mut lines = text.split("\r\n");
+    let first = lines.next().unwrap_or_default().to_owned();
+    let headers: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
+    let auth = headers
+        .iter()
+        .find_map(|h| {
+            let (name, value) = h.split_once(':')?;
+            name.eq_ignore_ascii_case("proxy-authorization")
+                .then(|| format!(" {}", value.trim()))
+        })
+        .unwrap_or_default();
+    let mut parts = first.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    if method == "CONNECT" {
+        log.lock().unwrap().push(format!("CONNECT {target}{auth}"));
+        let Ok(mut outbound) = TcpStream::connect(target).await else {
+            let _ = inbound.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+            return;
+        };
+        if inbound
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .is_ok()
+        {
+            let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+        }
+        return;
+    }
+    // absolute form: http://host:port/path?query
+    let rest = target.trim_start_matches("http://");
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let path = format!("/{path}");
+    log.lock().unwrap().push(format!(
+        "{method} {}{auth}",
+        path.split('?').next().unwrap_or("")
+    ));
+    let Ok(mut outbound) = TcpStream::connect(host).await else {
+        return;
+    };
+    let mut forwarded = format!("{method} {path} HTTP/1.1\r\n");
+    for h in headers {
+        let lower = h.to_ascii_lowercase();
+        if lower.starts_with("proxy-") || lower.starts_with("connection:") {
+            continue;
+        }
+        forwarded.push_str(h);
+        forwarded.push_str("\r\n");
+    }
+    forwarded.push_str("Connection: close\r\n\r\n");
+    if outbound.write_all(forwarded.as_bytes()).await.is_ok() {
+        let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+    }
+}

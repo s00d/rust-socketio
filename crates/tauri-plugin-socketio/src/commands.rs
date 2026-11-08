@@ -3,6 +3,7 @@
 //! `disconnect` whatever the capabilities allow. `unsubscribe` and `ack` act only on what was
 //! given to the calling webview.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -50,9 +51,10 @@ pub(crate) async fn connect<R: Runtime>(
 ) -> Result<Subscribed> {
     let options = ConnectOptions::parse(options)?;
     let url = options.url.clone();
+    let (builder, dynamic) = options.into_builder()?;
     let sub = sub_args(&webview, events, channel);
     let (subscription, state) = io
-        .connect_from_webview(id, &url, options.into_builder(), sub)
+        .connect_from_webview(id, &url, builder, dynamic, sub)
         .await?;
     Ok(Subscribed {
         subscription,
@@ -136,4 +138,41 @@ pub(crate) fn state(io: State<'_, SocketIo>, id: String) -> Result<ConnState> {
 #[tauri::command]
 pub(crate) fn link_info(io: State<'_, SocketIo>, id: String) -> Result<Link> {
     Ok(Link::from(&io.any(&id)?.link_info()))
+}
+
+/// Replaces the auth payload sent from the next connect attempt (e.g. a refreshed token).
+#[tauri::command]
+pub(crate) fn set_auth(io: State<'_, SocketIo>, id: String, auth: Value) -> Result<()> {
+    if !auth.is_object() {
+        return Err(Error::InvalidOptions("auth must be an object".into()));
+    }
+    io.configure(&id, |d| d.auth = Some(auth))
+}
+
+/// Replaces the extra headers sent from the next connect attempt.
+#[tauri::command]
+pub(crate) fn set_headers(
+    io: State<'_, SocketIo>,
+    id: String,
+    headers: BTreeMap<String, String>,
+) -> Result<()> {
+    io.configure(&id, |d| d.headers = headers)
+}
+
+/// Replaces the query parameters sent from the next connect attempt.
+#[tauri::command]
+pub(crate) fn set_query(
+    io: State<'_, SocketIo>,
+    id: String,
+    query: BTreeMap<String, String>,
+) -> Result<()> {
+    io.configure(&id, |d| d.query = query)
+}
+
+/// Connects a closed client again (rejected, reconnect attempts used up, server disconnect).
+#[tauri::command]
+pub(crate) async fn reconnect(io: State<'_, SocketIo>, id: String) -> Result<ConnState> {
+    let client = io.full(&id)?;
+    client.reconnect().await?;
+    Ok(ConnState::from(&client.state()))
 }

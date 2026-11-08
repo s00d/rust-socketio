@@ -80,6 +80,10 @@ pub(crate) struct Config {
     pub(crate) auth: Option<Value>,
     pub(crate) auth_fn: Option<AuthFn>,
     pub(crate) params_fn: Option<ParamsFn>,
+    /// `http://[user:pass@]host:port` for every transport; `None`: the environment's.
+    pub(crate) proxy: Option<String>,
+    /// Built by `connect()`: one HTTP client (pool, cookies) for every attempt.
+    pub(crate) http: Option<crate::engineio::http::Http>,
     #[cfg_attr(not(any(feature = "rustls", feature = "native-tls")), allow(dead_code))]
     pub(crate) tls_config: Option<TlsConfig>,
     pub(crate) transport: TransportType,
@@ -114,6 +118,7 @@ impl fmt::Debug for Config {
             .field("randomization_factor", &self.randomization_factor)
             .field("reconnect_on_disconnect", &self.reconnect_on_disconnect)
             .field("buffer_while_disconnected", &self.buffer_while_disconnected)
+            .field("proxy", &self.proxy.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -175,6 +180,8 @@ impl ClientBuilder {
                 auth: None,
                 auth_fn: None,
                 params_fn: None,
+                proxy: None,
+                http: None,
                 tls_config: None,
                 transport: TransportType::Any,
                 timeout: Duration::from_secs(20),
@@ -268,6 +275,15 @@ impl ClientBuilder {
     #[cfg_attr(docsrs, doc(cfg(any(feature = "rustls", feature = "native-tls"))))]
     pub fn tls_config(mut self, tls_config: impl Into<TlsConfig>) -> Self {
         self.config.tls_config = Some(tls_config.into());
+        self
+    }
+
+    /// Sends polling requests and the websocket through the HTTP proxy `proxy`
+    /// (`http://[user:password@]host:port`; the websocket goes through a `CONNECT` tunnel with
+    /// basic auth from the user info). Without it the environment is used: `HTTPS_PROXY` /
+    /// `HTTP_PROXY` / `ALL_PROXY` and `NO_PROXY`, for polling and websocket alike.
+    pub fn proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.config.proxy = Some(proxy.into());
         self
     }
 
@@ -389,6 +405,16 @@ impl ClientBuilder {
                 .map_err(|_| Error::InvalidHeader(format!("bad value for header {key:?}")))?;
             self.config.headers.append(name, value);
         }
+        let proxy = match &self.config.proxy {
+            Some(proxy) => Some(url::Url::parse(proxy).map_err(|_| {
+                crate::engineio::Error::ProxyFailed("the proxy is not a valid URL".into())
+            })?),
+            None => None,
+        };
+        self.config.http = Some(crate::engineio::http::Http::new(
+            self.config.tls_config.as_ref(),
+            proxy,
+        )?);
         crate::client::connect(self.config, self.handlers).await
     }
 }

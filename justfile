@@ -22,11 +22,11 @@ ci: fmt lint test docs deny package plugin
 fmt:
     cargo fmt --all --check
 
-# Unused dependencies, then clippy -D warnings on the workspace and on every feature set
+# Unused dependencies, then clippy -D warnings on the workspace and on feature pairs
 lint:
     cargo shear
     cargo clippy --workspace --all-targets --all-features {{ ci_flags }} -- -D warnings
-    cargo hack clippy -p {{ crate }} --feature-powerset --all-targets {{ ci_flags }} -- -D warnings
+    cargo hack clippy -p {{ crate }} --feature-powerset --depth 2 --all-targets {{ ci_flags }} -- -D warnings
     cargo hack clippy -p {{ plugin }} --each-feature --all-targets {{ ci_flags }} -- -D warnings
 
 # The Tauri plugin is tested by `just plugin`.
@@ -64,7 +64,7 @@ servers-setup:
     cd ci/conformance && npm ci --no-audit --no-fund
     ./ci/keygen.sh node-engine-io-secure 127.0.0.1
 
-# Start the Node test servers in the background (ports 4200-4206, 4210-4211)
+# Start the Node test servers in the background (ports 4200-4206, 4210-4213)
 servers:
     ./ci/servers.sh start
 
@@ -94,7 +94,7 @@ msrv:
     tc="$(cargo metadata --no-deps --format-version 1 --locked | python3 -c 'import json,sys; print(next(p["rust_version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="{{ crate }}"))')"
     dir="$(mktemp -d)"; trap 'rm -rf "${dir}"' EXIT
     mkdir "${dir}/src"; echo 'fn main() {}' > "${dir}/src/main.rs"
-    for spec in '{{ crate }}|"rustls"' '{{ crate }}|"native-tls", "blocking"' '{{ plugin }}|"rustls"'; do
+    for spec in '{{ crate }}|"rustls"' '{{ crate }}|"native-tls", "blocking", "cookies", "platform-verifier"' '{{ plugin }}|"rustls"'; do
       name="${spec%%|*}"; features="${spec#*|}"
       printf '[package]\nname = "msrv-probe"\nversion = "0.0.0"\nedition = "2024"\nrust-version = "%s"\npublish = false\n[dependencies]\n%s = { path = "%s", default-features = false, features = [%s] }\n[workspace]\n' \
         "${tc}" "${name}" "${PWD}/crates/${name}" "${features}" > "${dir}/Cargo.toml"
