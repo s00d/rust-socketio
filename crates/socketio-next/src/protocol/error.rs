@@ -1,7 +1,8 @@
 use std::str::Utf8Error;
+use std::sync::Arc;
 
 /// A packet that does not follow the Engine.IO v4 / Socket.IO v5 wire format.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The first character is not a known packet type.
@@ -21,7 +22,13 @@ pub enum Error {
     InvalidBase64(#[from] base64::DecodeError),
     /// The JSON payload does not parse.
     #[error("invalid JSON payload: {0}")]
-    InvalidJson(#[from] serde_json::Error),
+    InvalidJson(#[source] Arc<serde_json::Error>),
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(err: serde_json::Error) -> Self {
+        Error::InvalidJson(Arc::new(err))
+    }
 }
 
 /// Result alias of this crate.

@@ -65,8 +65,9 @@ var callback = client => {
     })
 
     // Acknowledges after 500 ms.
-    client.on('ack_late', (arg, ack) => {
-        setTimeout(() => ack('late'), 500);
+    client.on('ack_late', (...args) => {
+        const ack = args.pop();
+        if (typeof ack === 'function') setTimeout(() => ack('late'), 500);
     })
 
     client.on('handshake_query', (ack) => {
@@ -76,6 +77,16 @@ var callback = client => {
     // Makes the server send a packet that socket.io-parser rejects.
     client.on('invalid_packet', () => {
         client.conn.send('2[true,"foo"]');
+    })
+
+    // The server asks with a callback; the client's ack comes back as `answered`.
+    client.on('ask_me', (question) => {
+        client.emit('question', question, (...reply) => client.emit('answered', ...reply));
+    })
+
+    // Binary in nested positions and two attachments.
+    client.on('binary_mixed', () => {
+        client.emit('binary-mixed', { a: Buffer.from([1]), b: [Buffer.from([2, 3])] }, 'tail');
     })
 
     // Server-side namespace disconnect: leaves the underlying engine.io connection open.

@@ -82,8 +82,6 @@ fn deconstruct(payload: Payload) -> Result<(Vec<Value>, Vec<Bytes>)> {
             }
             Ok((args, attachments))
         }
-        #[allow(deprecated)]
-        Payload::String(text) => Ok((vec![Payload::string_to_value(text)], Vec::new())),
     }
 }
 
@@ -358,7 +356,7 @@ impl TryFrom<&Bytes> for Packet {
 
         // validate json, then the payload shape for the packet type (socket.io-parser's
         // isPayloadValid): a server event must not pose as a reserved client event like `connect`
-        let json = serde_json::from_str::<Value>(payload).map_err(Error::InvalidJson)?;
+        let json = serde_json::from_str::<Value>(payload).map_err(Error::from)?;
         if !is_payload_valid(packet.packet_type, &json) {
             return Err(Error::InvalidPacket(
                 "payload shape not allowed for this packet type",
@@ -371,7 +369,7 @@ impl TryFrom<&Bytes> for Packet {
 }
 
 /// Event names the socket.io client and server reserve (socket.io-parser `RESERVED_EVENTS`).
-const RESERVED_EVENTS: [&str; 6] = [
+pub const RESERVED_EVENTS: [&str; 6] = [
     "connect",
     "connect_error",
     "disconnect",
@@ -379,6 +377,11 @@ const RESERVED_EVENTS: [&str; 6] = [
     "newListener",
     "removeListener",
 ];
+
+/// Whether socket.io reserves `name` (it cannot be emitted or received as an event).
+pub fn is_reserved_event(name: &str) -> bool {
+    RESERVED_EVENTS.contains(&name)
+}
 
 fn is_payload_valid(packet_type: PacketId, payload: &Value) -> bool {
     match packet_type {
@@ -641,12 +644,10 @@ mod test {
         )
         .unwrap();
         assert_eq!(encode(&p), r#"27["ev",{"a":1},"b"]"#);
-        #[allow(deprecated)]
-        let p = Packet::new_event(Payload::String("plain".into()), ev(), "/", None).unwrap();
+        let p = Packet::new_event(Payload::from("plain"), ev(), "/", None).unwrap();
         assert_eq!(encode(&p), r#"2["ev","plain"]"#);
-        #[allow(deprecated)]
-        let p = Packet::new_event(Payload::String("{\"j\":1}".into()), ev(), "/", None).unwrap();
-        assert_eq!(encode(&p), r#"2["ev",{"j":1}]"#);
+        let p = Packet::new_event(Payload::empty(), ev(), "/", None).unwrap();
+        assert_eq!(encode(&p), r#"2["ev"]"#);
         // acks
         let p = Packet::new_ack(Payload::Text(vec![json!("ok")]), "/", 5).unwrap();
         assert_eq!(encode(&p), r#"35["ok"]"#);

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_tungstenite::tungstenite;
@@ -6,7 +7,7 @@ use tokio_tungstenite::tungstenite;
 ///
 /// Errors never contain the request URL: query strings often carry tokens, so `reqwest`
 /// errors are stored without their URL.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// A packet broke the engine.io wire format.
@@ -20,7 +21,7 @@ pub enum Error {
     InvalidUrlScheme(String),
     /// An HTTP request (polling transport) failed: connection refused, DNS, TLS, timeout, ...
     #[error("HTTP request failed: {0}")]
-    Http(#[source] reqwest::Error),
+    Http(#[source] Arc<reqwest::Error>),
     /// The server answered a polling request with a non-200 status (400 "Session ID unknown"
     /// after a server restart, 403 from a proxy, ...).
     #[error("server answered HTTP {status}")]
@@ -30,7 +31,7 @@ pub enum Error {
     },
     /// The websocket failed to open or broke.
     #[error("websocket error: {0}")]
-    Websocket(#[source] Box<tungstenite::Error>),
+    Websocket(#[source] Arc<tungstenite::Error>),
     /// The handshake (`0{...}` open packet) is missing or malformed. An Engine.IO v3 server
     /// answers in a format this v4 client does not speak.
     #[error("invalid engine.io handshake: {0}")]
@@ -62,13 +63,13 @@ pub enum Error {
 
 impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {
-        Error::Http(err.without_url())
+        Error::Http(Arc::new(err.without_url()))
     }
 }
 
 impl From<tungstenite::Error> for Error {
     fn from(err: tungstenite::Error) -> Self {
-        Error::Websocket(Box::new(err))
+        Error::Websocket(Arc::new(err))
     }
 }
 
