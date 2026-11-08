@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-08
+
 ### Added
 
 - First release: a registry of named socketio-next clients shared by Rust and the webviews.
