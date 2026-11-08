@@ -1,0 +1,10 @@
+{
+  "name": "socketio-next-conformance",
+  "private": true,
+  "description": "Differential tests: the Node socket.io-client and socketio-next against one recording socket.io server",
+  "license": "MIT",
+  "dependencies": {
+    "socket.io": "4.8.1",
+    "socket.io-client": "4.8.1"
+  }
+}

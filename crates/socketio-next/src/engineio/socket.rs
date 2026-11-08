@@ -133,7 +133,14 @@ impl Socket {
             return Ok(());
         }
         Callbacks::fire(&self.callbacks.on_close, ());
-        let result = self.emit(Packet::new(PacketId::Close, Bytes::new())).await;
+        // Like engine.io-client: a close packet over polling, a close frame over websocket.
+        let result = match &self.transport {
+            Transport::Polling(_) => self.emit(Packet::new(PacketId::Close, Bytes::new())).await,
+            Transport::Websocket(ws) => {
+                let _guard = self.writer.lock().await;
+                ws.close().await
+            }
+        };
         self.connected.store(false, Ordering::Release);
         tracing::debug!(sid = %self.handshake.sid, "engine.io closed by the client");
         result

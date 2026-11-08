@@ -918,3 +918,48 @@ async fn reconnects_after_a_server_restart() {
     next_named(&mut events, "message").await;
     client.disconnect().await.unwrap();
 }
+
+/// Query values never reach the logs (only the engine.io parameters stay visible).
+#[tokio::test]
+async fn logs_redact_query_values() {
+    use std::io::Write;
+    #[derive(Clone, Default)]
+    struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Buf::default();
+    let writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let client = connect(ClientBuilder::new(server()).query("token", "SECRET-TOKEN")).await;
+    client.emit_with_ack("echo", 1, WAIT).await.unwrap();
+    client.disconnect().await.unwrap();
+    let _ = ClientBuilder::new("http://127.0.0.1:9")
+        .query("token", "SECRET-TOKEN")
+        .reconnection(false)
+        .connect()
+        .await;
+
+    let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("token=***"),
+        "no redacted url in the logs:\n{logs}"
+    );
+    assert!(logs.contains("connected"), "{logs}");
+    assert!(
+        !logs.contains("SECRET-TOKEN"),
+        "secret in the logs:\n{logs}"
+    );
+}

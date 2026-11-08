@@ -117,6 +117,15 @@ impl WebsocketTransport {
         Ok(())
     }
 
+    /// Closes the websocket (close frame). engine.io-client sends no close packet over a
+    /// websocket; the server sees the socket close.
+    pub(crate) async fn close(&self) -> Result<()> {
+        let mut sender = self.sender.lock().await;
+        sender.send(Message::Close(None)).await?;
+        sender.close().await?;
+        Ok(())
+    }
+
     pub async fn base_url(&self) -> Result<Url> {
         Ok(self.base_url.read().await.clone())
     }

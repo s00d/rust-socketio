@@ -52,6 +52,7 @@ webpki-roots = { workspace = true, optional = true }
 criterion = { version = "0.8", features = ["async_tokio"] }
 socketio-next-testing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "test-util"] }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lib]

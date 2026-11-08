@@ -160,9 +160,13 @@ pub fn host_port(url: &str) -> String {
 
 /// Runs `ci/conformance/client.js <scenario> <tag>` (the Node socket.io-client 4.8); returns its
 /// stdout lines. Panics when node or the script fails.
-pub async fn run_node_client(scenario: &str, tag: &str) -> Vec<String> {
+pub async fn run_node_client(scenario: &str, tag: &str, transports: Option<&str>) -> Vec<String> {
     let dir = repo_root().join("ci/conformance");
-    let out = tokio::process::Command::new("node")
+    let mut command = tokio::process::Command::new("node");
+    if let Some(transports) = transports {
+        command.env("TRANSPORTS", transports);
+    }
+    let out = command
         .arg("client.js")
         .arg(scenario)
         .arg(tag)
