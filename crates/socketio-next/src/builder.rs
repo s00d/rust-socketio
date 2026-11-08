@@ -39,6 +39,7 @@ pub(crate) struct Config {
     pub(crate) headers: HeaderMap,
     pub(crate) auth: Option<Value>,
     pub(crate) auth_fn: Option<AuthFn>,
+    #[cfg_attr(not(any(feature = "rustls", feature = "native-tls")), allow(dead_code))]
     pub(crate) tls_config: Option<TlsConfig>,
     pub(crate) transport: TransportType,
     pub(crate) timeout: Duration,
@@ -208,6 +209,8 @@ impl ClientBuilder {
 
     /// TLS for `https`/`wss`: a [`TlsConfig`], a `rustls::ClientConfig` or a
     /// `native_tls::TlsConnector`. Default: the backend's default roots.
+    #[cfg(any(feature = "rustls", feature = "native-tls"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "rustls", feature = "native-tls"))))]
     pub fn tls_config(mut self, tls_config: impl Into<TlsConfig>) -> Self {
         self.config.tls_config = Some(tls_config.into());
         self

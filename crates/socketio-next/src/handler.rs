@@ -178,11 +178,9 @@ impl Handlers {
             removed |= list.len() != before;
         }
         self.events.retain(|_, list| !list.is_empty());
-        for list in [&mut self.any] {
-            let before = list.len();
-            list.retain(|e| e.id != id);
-            removed |= list.len() != before;
-        }
+        let before = self.any.len();
+        self.any.retain(|e| e.id != id);
+        removed |= self.any.len() != before;
         let before = self.state.len();
         self.state.retain(|e| e.id != id);
         removed | (self.state.len() != before)

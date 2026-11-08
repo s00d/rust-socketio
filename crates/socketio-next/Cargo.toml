@@ -9,10 +9,10 @@ homepage.workspace = true
 authors.workspace = true
 description = "Socket.IO v4 / Engine.IO v4 client with socket.io-client 4.8 parity: async (tokio) and blocking, rustls or native-tls"
 documentation = "https://docs.rs/socketio-next"
-readme = "README.md"
+readme = "../../README.md"
 keywords = ["socketio", "engineio", "websocket", "client", "realtime"]
 categories = ["network-programming", "web-programming", "web-programming::websocket", "asynchronous"]
-include = ["/src/**", "/README.md", "/LICENSE", "/Cargo.toml"]
+include = ["/src/**", "/LICENSE", "/Cargo.toml"]
 
 [lints]
 workspace = true
@@ -59,5 +59,5 @@ tracing-subscriber = { workspace = true }
 bench = false
 
 [[bench]]
-name = "engineio"
+name = "codec"
 harness = false

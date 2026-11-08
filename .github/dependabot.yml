@@ -1,12 +1,18 @@
 version: 2
 updates:
-  - package-ecosystem: "cargo" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  - package-ecosystem: "cargo"
+    directory: "/"
     schedule:
       interval: "monthly"
     groups:
       patches:
-        # Group cargo patch updates together to minimize PR management faff
         applies-to: version-updates
-        update-types:
-        - patch
+        update-types: ["patch", "minor"]
+  - package-ecosystem: "npm"
+    directories: ["/ci", "/ci/conformance"]
+    schedule:
+      interval: "monthly"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"

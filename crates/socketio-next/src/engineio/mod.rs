@@ -53,6 +53,7 @@ pub(crate) mod test {
     use super::*;
     use url::Url;
 
+    #[cfg(any(feature = "rustls", feature = "native-tls"))]
     const CERT_PATH: &str = "../../ci/cert/ca.crt";
 
     /// Trusts the test CA from `ci/cert` (`CA_CERT_PATH` overrides the path).

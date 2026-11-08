@@ -1,0 +1,17 @@
+[package]
+name = "examples"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "socketio-next examples: `just example <name> [url]` (default url: the ci/ test server)"
+
+[lints]
+workspace = true
+
+[dependencies]
+socketio-next = { workspace = true, features = ["rustls", "blocking"] }
+bytes = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "signal"] }
+tracing-subscriber = { workspace = true }

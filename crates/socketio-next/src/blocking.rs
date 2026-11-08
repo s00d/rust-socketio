@@ -27,6 +27,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::runtime::{Handle, Runtime};
 
+#[cfg(any(feature = "rustls", feature = "native-tls"))]
 use crate::engineio::TlsConfig;
 use crate::handler::ListenerId;
 use crate::{
@@ -99,8 +100,6 @@ impl ClientBuilder {
         fn header(key: impl Into<String>, value: impl Into<String>);
         /// See [`crate::ClientBuilder::auth`].
         fn auth(auth: impl Into<Value>);
-        /// See [`crate::ClientBuilder::tls_config`].
-        fn tls_config(tls_config: impl Into<TlsConfig>);
         /// See [`crate::ClientBuilder::transport_type`].
         fn transport_type(transport: TransportType);
         /// See [`crate::ClientBuilder::timeout`].
@@ -121,6 +120,15 @@ impl ClientBuilder {
         fn buffer_while_disconnected(buffer: bool);
         /// See [`crate::ClientBuilder::redact_query`].
         fn redact_query(redact: bool);
+    }
+
+    /// See [`crate::ClientBuilder::tls_config`].
+    #[cfg(any(feature = "rustls", feature = "native-tls"))]
+    pub fn tls_config(self, tls_config: impl Into<TlsConfig>) -> Self {
+        ClientBuilder {
+            inner: self.inner.tls_config(tls_config),
+            ..self
+        }
     }
 
     /// See [`crate::ClientBuilder::auth_with`]; `auth` runs on a blocking thread.

@@ -48,6 +48,8 @@ impl ClientBuilder {
     }
 
     /// TLS configuration for `https`/`wss` (default: the backend's default roots).
+    #[cfg(any(feature = "rustls", feature = "native-tls"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "rustls", feature = "native-tls"))))]
     pub fn tls_config(mut self, tls_config: impl Into<TlsConfig>) -> Self {
         self.tls_config = Some(tls_config.into());
         self

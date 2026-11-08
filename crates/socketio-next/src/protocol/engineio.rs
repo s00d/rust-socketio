@@ -178,6 +178,11 @@ impl Batch {
     pub fn len(&self) -> usize {
         self.0.len()
     }
+
+    /// No packets.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// A websocket frame is exactly one packet (whose binary data may contain the separator).

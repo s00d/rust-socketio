@@ -1,0 +1,83 @@
+name: CI
+
+# Every step is a `just` recipe (see justfile), so CI and local runs are the same commands.
+# Runs on pull requests and by hand (Actions -> CI -> Run workflow, or
+# `gh workflow run ci.yml --ref <branch>`). Nothing here publishes anything.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so new clippy lints / rustdoc checks cannot break CI unannounced. Bump deliberately.
+  RUST_TOOLCHAIN: "1.99.1"
+  MSRV_TOOLCHAIN: "1.85"
+
+jobs:
+  check:
+    name: Lint, docs, deny, package, MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+      - run: rustup toolchain install "${MSRV_TOOLCHAIN}" --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-hack,cargo-deny,cargo-shear
+      - uses: Swatinem/rust-cache@v2
+      # Later steps run even if an earlier one failed, so one run shows every failure.
+      - run: just fmt
+      - if: ${{ !cancelled() }}
+        run: just lint
+      - if: ${{ !cancelled() }}
+        run: just docs
+      - if: ${{ !cancelled() }}
+        run: just deny
+      - if: ${{ !cancelled() }}
+        run: just package
+      - if: ${{ !cancelled() }}
+        run: just msrv
+
+  test:
+    name: Tests on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            ci/package-lock.json
+            ci/conformance/package-lock.json
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      - run: just servers-setup
+      # The servers run in the background of this step; the tests trust ci/cert/ca.crt in-process.
+      - run: just servers && just test
+      - name: Server logs
+        if: ${{ failure() }}
+        run: for f in ci/logs/*.log; do echo "== ${f}"; cat "${f}"; done

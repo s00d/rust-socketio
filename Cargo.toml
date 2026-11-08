@@ -2,6 +2,7 @@
 members = [
     "crates/socketio-next",
     "crates/socketio-next-testing",
+    "examples",
 ]
 # "2", not edition 2024's "3": the lockfile is for development and CI and takes the newest
 # releases (security fixes included). MSRV is checked by `just msrv` with a lockfile resolved
@@ -23,7 +24,7 @@ socketio-next = { path = "crates/socketio-next", version = "0.1.0", default-feat
 socketio-next-testing = { path = "crates/socketio-next-testing" }
 
 # Shared external
-base64 = "0.22.1"
+base64 = "0.23"
 bytes = "1.10"
 futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
 http = "1.3"

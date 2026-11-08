@@ -1,0 +1,40 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/).
+# Run: `just deny` (`cargo deny --workspace --all-features check`).
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Unmaintained / unsound crates fail the check only when a workspace crate depends on them
+# directly; deep transitive ones are reported by `cargo audit`.
+unmaintained = "workspace"
+unsound = "workspace"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[licenses.private]
+# Unpublished workspace crates (examples, test support) need no license check.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
