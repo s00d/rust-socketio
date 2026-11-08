@@ -386,6 +386,9 @@ fn read_only_client_can_be_observed_not_driven() {
     client.emit("echo", json!("from rust")).unwrap();
     assert_eq!(h.event(1, "echo-back")["args"], json!(["from rust"]));
     assert!(client.connected(), "the webview did not disconnect it");
+    // server acks of a read-only client are Rust's to answer: no ackId for the webview
+    client.emit("ask", ()).unwrap();
+    assert!(h.event(1, "question").get("ackId").is_none());
 
     let back = h.app.socketio().remove("core").expect("registered");
     assert!(back.connected(), "remove does not disconnect");

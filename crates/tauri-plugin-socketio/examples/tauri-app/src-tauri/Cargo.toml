@@ -1,0 +1,21 @@
+[package]
+name = "tauri-plugin-socketio-example"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Not a member of the repository workspace: built on its own (`just plugin-example`).
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-socketio = { path = "../../.." }
+tokio = { version = "1", features = ["time"] }
+
+[features]
+# `tauri build` turns this on for production builds
+custom-protocol = ["tauri/custom-protocol"]

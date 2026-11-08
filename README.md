@@ -242,6 +242,12 @@ Not implemented, on purpose: one `Manager` multiplexing several namespaces over 
 WebTransport, browser-only options. `connect()` returns the first attempt's error instead of
 retrying silently.
 
+## Tauri
+
+[`tauri-plugin-socketio`](crates/tauri-plugin-socketio) (npm `tauri-plugin-socketio-api`) shares
+named clients between Rust and the webviews of a Tauri 2 app, with read-only clients for sockets
+that Rust code owns.
+
 ## Minimum Rust version
 
 1.85 (edition 2024), checked with a lockfile resolved for it; see [MSRV.md](MSRV.md).
@@ -250,7 +256,8 @@ retrying silently.
 
 `just` lists the tasks. `just servers-setup && just servers` starts the Node test servers
 (ports 4200-4206 and 4210-4211, no Docker), `just ci` runs what CI runs: fmt, cargo-shear,
-clippy on every feature set, all tests per feature set, docs, cargo-deny, package.
+clippy on every feature set, all tests per feature set, docs, cargo-deny, package, and the Tauri
+plugin (`just plugin`: Rust tests and guest-js; pnpm needed).
 
 ## License
 

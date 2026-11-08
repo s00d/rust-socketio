@@ -27,6 +27,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # tauri (tauri-plugin-socketio) links gtk and webkit2gtk on Linux: clippy, docs, MSRV
+      - name: Linux system deps (webkit for tauri)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -78,6 +83,47 @@ jobs:
       - run: just servers-setup
       # The servers run in the background of this step; the tests trust ci/cert/ca.crt in-process.
       - run: just servers && just test
+      - name: Server logs
+        if: ${{ failure() }}
+        run: for f in ci/logs/*.log; do echo "== ${f}"; cat "${f}"; done
+
+  plugin:
+    name: Tauri plugin on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - name: Linux system deps (webkit for tauri)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
+      # pnpm's version comes from the plugin's package.json `packageManager`
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: crates/tauri-plugin-socketio/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            ci/package-lock.json
+            ci/conformance/package-lock.json
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: Swatinem/rust-cache@v2
+      - run: just servers-setup
+      - run: just servers && just plugin
       - name: Server logs
         if: ${{ failure() }}
         run: for f in ci/logs/*.log; do echo "== ${f}"; cat "${f}"; done

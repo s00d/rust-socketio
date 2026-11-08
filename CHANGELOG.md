@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tauri-plugin-socketio` (crate) and `tauri-plugin-socketio-api` (npm): a Tauri 2 plugin with
+  named clients shared by Rust and the webviews; its own changelog is
+  [crates/tauri-plugin-socketio/CHANGELOG.md](crates/tauri-plugin-socketio/CHANGELOG.md).
+
 ## [0.1.0] - 2026-11-08
 
 First release of `socketio-next`, the successor of the s00d/rust-socketio fork of

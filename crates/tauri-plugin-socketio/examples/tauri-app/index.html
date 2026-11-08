@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>tauri-plugin-socketio example</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; margin: 16px; }
+      pre { background: #f4f4f4; padding: 8px; height: 40vh; overflow: auto; }
+    </style>
+  </head>
+  <body>
+    <h3>core (registered by Rust, read-only here)</h3>
+    <pre id="core"></pre>
+    <h3>chat (connected from JS)</h3>
+    <button id="send">emit echo</button>
+    <pre id="chat"></pre>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

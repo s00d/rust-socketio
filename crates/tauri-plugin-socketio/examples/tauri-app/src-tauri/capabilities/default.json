@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The main window: observe any client, drive its own",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "socketio:allow-read",
+    "socketio:allow-connect",
+    "socketio:allow-emit",
+    "socketio:allow-emit-with-ack",
+    "socketio:allow-ack",
+    "socketio:allow-disconnect"
+  ]
+}

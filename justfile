@@ -8,13 +8,15 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 ci_flags := "--profile ci --locked"
 crate := "socketio-next"
+plugin := "tauri-plugin-socketio"
+plugin_dir := "crates/tauri-plugin-socketio"
 
 [private]
 default:
     @just --list
 
 # Everything CI runs (the servers must be up: `just servers`)
-ci: fmt lint test docs deny package
+ci: fmt lint test docs deny package plugin
 
 # rustfmt check
 fmt:
@@ -25,13 +27,31 @@ lint:
     cargo shear
     cargo clippy --workspace --all-targets --all-features {{ ci_flags }} -- -D warnings
     cargo hack clippy -p {{ crate }} --feature-powerset --all-targets {{ ci_flags }} -- -D warnings
+    cargo hack clippy -p {{ plugin }} --each-feature --all-targets {{ ci_flags }} -- -D warnings
 
-# All tests and doctests, then the crate per feature set (no TLS, rustls, native-tls, blocking);
-# needs the Node servers (`just servers`)
+# The Tauri plugin is tested by `just plugin`.
+# All tests and doctests, then the crate per feature set (no TLS, rustls, native-tls, blocking); needs `just servers`
 test:
-    cargo test --workspace --all-targets --all-features {{ ci_flags }}
-    cargo test --workspace --doc --all-features {{ ci_flags }}
+    cargo test --workspace --exclude {{ plugin }} --all-targets --all-features {{ ci_flags }}
+    cargo test --workspace --exclude {{ plugin }} --doc --all-features {{ ci_flags }}
     cargo hack test -p {{ crate }} --each-feature --all-targets {{ ci_flags }}
+
+# Tauri plugin: Rust tests (mock IPC, Node servers) and guest-js (typecheck, vitest, build, publint, attw)
+plugin: plugin-rust plugin-js
+
+# Tauri plugin: Rust tests and doctests; needs `just servers`
+plugin-rust:
+    cargo test -p {{ plugin }} --all-targets {{ ci_flags }}
+    cargo test -p {{ plugin }} --doc {{ ci_flags }}
+
+# Tauri plugin: guest-js typecheck, vitest, build + publint/attw/dist smoke; needs pnpm
+plugin-js:
+    cd {{ plugin_dir }} && pnpm install --frozen-lockfile && pnpm typecheck && pnpm test && pnpm build
+
+# The example Tauri app: frontend build (type-checks against the built guest-js) and cargo check
+plugin-example: plugin-js
+    cd {{ plugin_dir }}/examples/tauri-app && pnpm install --frozen-lockfile && pnpm build
+    cd {{ plugin_dir }}/examples/tauri-app/src-tauri && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/../../../../../target}/example" cargo check
 
 # Tests that need no server: the codecs, backoff, redaction, error texts
 test-offline:
@@ -59,22 +79,25 @@ docs:
 deny:
     cargo deny --workspace --all-features check
 
+# socketio-next's package is built; the plugin's only listed (needs socketio-next on crates.io first)
 # What `cargo publish` would upload, verified by a build; fails when test fixtures slip in
 package *args:
     cargo package -p {{ crate }} --locked {{ args }}
     @if cargo package -p {{ crate }} --list --locked --allow-dirty | grep -E '^(ci|tests|benches|examples)/' ; then echo "test files in the package" >&2; exit 1; fi
+    @if cargo package -p {{ plugin }} --list --locked --allow-dirty | grep -vE '^(src/|permissions/|build.rs|windows-test-manifest.xml|Cargo.toml|Cargo.toml.orig|Cargo.lock|README.md|CHANGELOG.md|LICENSE|.cargo_vcs_info.json)' ; then echo "unexpected files in the plugin package" >&2; exit 1; fi
 
-# The crate on its rust-version with a lockfile resolved for it (MSRV.md; needs that toolchain)
+# The crate and the plugin on their rust-version with a lockfile resolved for it (MSRV.md; needs that toolchain)
 msrv:
     #!/usr/bin/env bash
     set -euo pipefail
     tc="$(cargo metadata --no-deps --format-version 1 --locked | python3 -c 'import json,sys; print(next(p["rust_version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="{{ crate }}"))')"
     dir="$(mktemp -d)"; trap 'rm -rf "${dir}"' EXIT
     mkdir "${dir}/src"; echo 'fn main() {}' > "${dir}/src/main.rs"
-    for features in '"rustls"' '"native-tls", "blocking"'; do
-      printf '[package]\nname = "msrv-probe"\nversion = "0.0.0"\nedition = "2024"\nrust-version = "%s"\npublish = false\n[dependencies]\n{{ crate }} = { path = "%s", default-features = false, features = [%s] }\n[workspace]\n' \
-        "${tc}" "${PWD}/crates/{{ crate }}" "${features}" > "${dir}/Cargo.toml"
-      echo "==> MSRV ${tc}: [${features}]"
+    for spec in '{{ crate }}|"rustls"' '{{ crate }}|"native-tls", "blocking"' '{{ plugin }}|"rustls"'; do
+      name="${spec%%|*}"; features="${spec#*|}"
+      printf '[package]\nname = "msrv-probe"\nversion = "0.0.0"\nedition = "2024"\nrust-version = "%s"\npublish = false\n[dependencies]\n%s = { path = "%s", default-features = false, features = [%s] }\n[workspace]\n' \
+        "${tc}" "${name}" "${PWD}/crates/${name}" "${features}" > "${dir}/Cargo.toml"
+      echo "==> MSRV ${tc}: ${name} [${features}]"
       (cd "${dir}" && rm -f Cargo.lock && cargo generate-lockfile -q \
         && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}/msrv" cargo "+${tc}" check -q --locked)
     done

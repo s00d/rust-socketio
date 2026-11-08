@@ -110,7 +110,7 @@ impl SocketIo {
         // Listeners go on the builder so the events right after CONNECT are not missed.
         let mut pre = None;
         if let Some(args) = sub {
-            let (sub_id, fwd) = self.forwarder(&id, &args);
+            let (sub_id, fwd) = self.forwarder(&id, &args, Access::Full);
             let active = Arc::clone(&fwd.active);
             let a = Arc::clone(&fwd);
             builder = builder
@@ -231,7 +231,7 @@ impl SocketIo {
         let entry = clients
             .get_mut(id)
             .ok_or_else(|| Error::UnknownClient(id.to_owned()))?;
-        let (sub_id, fwd) = self.forwarder(id, &args);
+        let (sub_id, fwd) = self.forwarder(id, &args, entry.access);
         let (a, b) = (Arc::clone(&fwd), Arc::clone(&fwd));
         let listeners = vec![
             entry.client.on_any(move |event: Event, _: Client| {
@@ -346,13 +346,19 @@ impl SocketIo {
         out
     }
 
-    fn forwarder(&self, id: &str, args: &SubscribeArgs) -> (SubscriptionId, Arc<Forwarder>) {
+    fn forwarder(
+        &self,
+        id: &str,
+        args: &SubscribeArgs,
+        access: Access,
+    ) -> (SubscriptionId, Arc<Forwarder>) {
         let sub = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let fwd = Arc::new(Forwarder {
             id: id.to_owned(),
             sub,
             events: args.events.clone().map(|e| e.into_iter().collect()),
             channel: args.channel.clone(),
+            acks: access == Access::Full,
             active: Arc::new(AtomicBool::new(true)),
             registry: Arc::downgrade(&self.inner),
         });
@@ -406,6 +412,8 @@ struct Forwarder {
     sub: SubscriptionId,
     events: Option<HashSet<String>>,
     channel: Channel<Message>,
+    /// Server acks are offered to the webview (not for read-only clients: Rust answers them).
+    acks: bool,
     active: Arc<AtomicBool>,
     registry: Weak<Inner>,
 }
@@ -423,6 +431,7 @@ impl Forwarder {
         let name = event.name().to_owned();
         let ack_id = event
             .ack_sender()
+            .filter(|_| self.acks)
             .and_then(|ack| Some(self.registry.upgrade()?.keep_ack(&self.id, ack)));
         self.send(Message::Event {
             event: name,
