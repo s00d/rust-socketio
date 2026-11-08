@@ -1,8 +1,9 @@
 name: CI
 
 # Every step is a `just` recipe (see justfile), so CI and local runs are the same commands.
-# Runs on pull requests and by hand (Actions -> CI -> Run workflow, or
-# `gh workflow run ci.yml --ref <branch>`). Nothing here publishes anything.
+# Pull requests run the Linux job only (runner minutes). Run by hand (Actions -> CI -> Run
+# workflow, or `gh workflow run ci.yml --ref <branch>`) for Linux, macOS and Windows, e.g.
+# before a release. Nothing here publishes anything.
 
 on:
   pull_request:
@@ -22,86 +23,23 @@ env:
   MSRV_TOOLCHAIN: "1.85"
 
 jobs:
-  check:
-    name: Lint, docs, deny, package, MSRV
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      # tauri (tauri-plugin-socketio) links gtk and webkit2gtk on Linux: clippy, docs, MSRV
-      - name: Linux system deps (webkit for tauri)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: clippy, rustfmt
-      - run: rustup toolchain install "${MSRV_TOOLCHAIN}" --profile minimal
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just,cargo-hack,cargo-deny,cargo-shear
-      - uses: Swatinem/rust-cache@v2
-      # Later steps run even if an earlier one failed, so one run shows every failure.
-      - run: just fmt
-      - if: ${{ !cancelled() }}
-        run: just lint
-      - if: ${{ !cancelled() }}
-        run: just docs
-      - if: ${{ !cancelled() }}
-        run: just deny
-      - if: ${{ !cancelled() }}
-        run: just package
-      - if: ${{ !cancelled() }}
-        run: just msrv
-
-  test:
-    name: Tests on ${{ matrix.os }}
+  # One job per OS: ubuntu on pull requests, all three on workflow_dispatch. Ubuntu also runs
+  # the static checks (fmt, cargo-shear + clippy, docs, cargo-deny, package, MSRV). Every job
+  # runs the core tests, then the Tauri plugin's Rust and guest-js tests, against the Node
+  # servers of ci/.
+  ci:
+    name: CI on ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest", "macos-latest", "windows-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            ci/package-lock.json
-            ci/conformance/package-lock.json
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      # just's GitHub release asset answers 504 on the macOS runners (Nov 2026): Homebrew there
-      - if: runner.os == 'macOS'
-        run: brew install just
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: ${{ runner.os == 'macOS' && 'cargo-hack' || 'just,cargo-hack' }}
-      - uses: Swatinem/rust-cache@v2
-      - run: just servers-setup
-      # The servers run in the background of this step; the tests trust ci/cert/ca.crt in-process.
-      - run: just servers && just test
-      - name: Server logs
-        if: ${{ failure() }}
-        run: for f in ci/logs/*.log; do echo "== ${f}"; cat "${f}"; done
-
-  plugin:
-    name: Tauri plugin on ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v5
+      # tauri (tauri-plugin-socketio) links gtk and webkit2gtk on Linux
       - name: Linux system deps (webkit for tauri)
         if: runner.os == 'Linux'
         run: |
@@ -121,15 +59,35 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+      - if: runner.os == 'Linux'
+        run: rustup toolchain install "${MSRV_TOOLCHAIN}" --profile minimal
+      # just's GitHub release asset answered 504 on the macOS runners (Nov 2026): Homebrew there
       - if: runner.os == 'macOS'
         run: brew install just
-      - if: runner.os != 'macOS'
-        uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2
         with:
-          tool: just
+          tool: ${{ runner.os == 'Linux' && 'just,cargo-hack,cargo-deny,cargo-shear' || runner.os == 'macOS' && 'cargo-hack' || 'just,cargo-hack' }}
       - uses: Swatinem/rust-cache@v2
-      - run: just servers-setup
-      - run: just servers && just plugin
+      # Static checks (Linux). Later steps run even if an earlier one failed, so one run shows
+      # every failure.
+      - if: runner.os == 'Linux'
+        run: just fmt
+      - if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: just lint
+      - if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: just docs
+      - if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: just deny
+      - if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: just package
+      - if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: just msrv
+      - if: ${{ !cancelled() }}
+        run: just servers-setup
+      # The servers run in the background of this step; the tests trust ci/cert/ca.crt in-process.
+      - if: ${{ !cancelled() }}
+        run: just servers && just test && just plugin
       - name: Server logs
         if: ${{ failure() }}
         run: for f in ci/logs/*.log; do echo "== ${f}"; cat "${f}"; done

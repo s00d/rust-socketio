@@ -334,8 +334,10 @@ impl SocketIo {
             .get(id)
             .ok_or_else(|| Error::UnknownClient(id.to_owned()))?;
         let sub_id = self.next_sub();
-        lock(&entry.hub.state).subs.insert(sub_id, args.into_sub());
-        let state = entry.hub.snapshot_to(sub_id, &entry.client);
+        let client = &entry.client;
+        let state = entry
+            .hub
+            .attach(sub_id, args.into_sub(), || State::from(&client.state()));
         Ok((sub_id, state))
     }
 
@@ -596,7 +598,22 @@ impl Hub {
     }
 
     fn snapshot_or(&self, sub: SubscriptionId, fallback: impl FnOnce() -> State) -> State {
+        Self::snapshot_locked(&mut lock(&self.state), sub, fallback)
+    }
+
+    /// Adds `sub` and sends its snapshot in one critical section: the snapshot is its very
+    /// first message.
+    fn attach(&self, id: SubscriptionId, sub: Sub, fallback: impl FnOnce() -> State) -> State {
         let mut st = lock(&self.state);
+        st.subs.insert(id, sub);
+        Self::snapshot_locked(&mut st, id, fallback)
+    }
+
+    fn snapshot_locked(
+        st: &mut HubState,
+        sub: SubscriptionId,
+        fallback: impl FnOnce() -> State,
+    ) -> State {
         let state = st.last.clone().unwrap_or_else(fallback);
         if let Some(s) = st.subs.get(&sub) {
             let message = Message::State {
@@ -852,10 +869,9 @@ mod tests {
         let mut seqs = Vec::new();
         for n in 0..20u64 {
             let (ch, rx) = channel();
-            lock(&hub.state)
-                .subs
-                .insert(100 + n, sub(ch, "w").into_sub());
-            let snapshot = hub.snapshot_or(100 + n, || State::Connecting { attempt: 0 });
+            let snapshot = hub.attach(100 + n, sub(ch, "w").into_sub(), || State::Connecting {
+                attempt: 0,
+            });
             seqs.push((snapshot, rx));
         }
         writer.join().unwrap();
