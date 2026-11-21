@@ -3150,8 +3150,13 @@ dependencies = [
 name = "socketio-next-testing"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "futures-util",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
+ "url",
 ]
 
 [[package]]

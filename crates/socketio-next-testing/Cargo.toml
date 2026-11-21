@@ -6,11 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Test support for socketio-next: Node test-server URLs, TLS roots, the differential harness"
+description = "Test support for socketio-next: in-process fake servers, Node test-server URLs, TLS roots, the differential harness"
 
 [lints]
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "sync", "time", "process"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "sync", "time", "process"] }
+tokio-tungstenite = { workspace = true }
+url = { workspace = true }
