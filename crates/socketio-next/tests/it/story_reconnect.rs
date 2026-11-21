@@ -380,3 +380,74 @@ async fn connect_headers_are_recomputed_per_attempt() {
     );
     client.disconnect().await.unwrap();
 }
+
+/// Given `buffer_while_disconnected` and a lost link, when an acked emit times out while it
+/// waits in the buffer, then it fails with `AckTimeout` and is never sent after the reconnect
+/// (socket.io-client drops it; socket.io-client-java
+/// `shouldTimeoutAfterTheGivenDelayWhenSocketIsNotConnected`).
+#[tokio::test]
+async fn a_buffered_emit_whose_ack_timed_out_is_never_sent() {
+    let proxy = Proxy::start(&host_port(&server())).await;
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (builder, mut events) = collect(
+        ClientBuilder::new(proxy.url())
+            .transport_type(TransportType::Websocket)
+            .buffer_while_disconnected(true)
+            .reconnection_delay(Duration::from_millis(50))
+            .inspect_packets({
+                let sent = Arc::clone(&sent);
+                move |dir, packet| {
+                    if dir == socketio_next::Direction::Outgoing {
+                        sent.lock()
+                            .unwrap()
+                            .push(packet.data.clone().unwrap_or_default());
+                    }
+                }
+            }),
+    );
+    let client = connect(builder).await;
+    proxy.refuse(true);
+    proxy.cut();
+    client.wait_for(|s| !s.is_connected()).await;
+    let stale = client
+        .emit_with_ack("echo", "stale", Duration::from_millis(50))
+        .await;
+    assert!(matches!(stale, Err(Error::AckTimeout(_))), "{stale:?}");
+    assert_eq!(client.link_info().buffered_emits, 0);
+    proxy.refuse(false);
+    client.wait_for(ConnectionState::is_connected).await;
+    client.emit("echo", "fresh").unwrap();
+    let echo = next_named(&mut events, "echo-back").await;
+    assert_eq!(echo.arg::<String>(0).unwrap(), "fresh");
+    assert!(
+        !sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|data| data.contains("stale")),
+        "the timed-out emit went out"
+    );
+    client.disconnect().await.unwrap();
+}
+
+/// Given a closed client of a namespace that answers CONNECT late, when `reconnect()` and
+/// `disconnect()` are called together (in that order), then the attempt ends with `Closed`,
+/// the client stays closed, and exactly one `Closed` state is reported for the disconnect
+/// (socket.io-client-java `doesNotFireConnectErrorIfWeForceDisconnectInOpeningState`).
+#[tokio::test(flavor = "multi_thread")]
+async fn disconnect_during_a_reconnect_attempt_wins() {
+    let (builder, mut states) = states(ClientBuilder::new(format!("{}/slow", server())));
+    let client = connect(builder).await;
+    client.disconnect().await.unwrap();
+    next_state(&mut states, ConnectionState::is_closed).await;
+    let (reconnected, disconnected) = tokio::join!(client.reconnect(), client.disconnect());
+    assert!(matches!(reconnected, Err(Error::Closed)), "{reconnected:?}");
+    disconnected.unwrap();
+    assert!(client.state().is_closed() && !client.connected());
+    // the fence of disconnect() follows every state it caused: what came is all there is
+    let mut closed = 0;
+    while let Ok(state) = states.try_recv() {
+        closed += usize::from(state.is_closed());
+    }
+    assert_eq!(closed, 1);
+}

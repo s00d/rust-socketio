@@ -211,3 +211,24 @@ async fn reconnect_after_closed_keeps_the_handlers() {
     );
     client.disconnect().await.unwrap();
 }
+
+/// Given a runtime, when a client connects, works and is dropped, then every task it started
+/// ends (socket.io-client-java `ExecutionTest`: the process can exit).
+#[tokio::test(flavor = "multi_thread")]
+async fn no_task_outlives_the_client() {
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let before = metrics.num_alive_tasks();
+    for transport in [TransportType::Polling, TransportType::Websocket] {
+        let client = connect(ClientBuilder::new(server()).transport_type(transport)).await;
+        client.emit_with_ack("echo", 1, WAIT).await.unwrap();
+        client.disconnect().await.unwrap();
+        client.reconnect().await.unwrap();
+        drop(client);
+    }
+    // tasks end asynchronously once their channels close: no event to wait for
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while metrics.num_alive_tasks() > before && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(metrics.num_alive_tasks(), before);
+}

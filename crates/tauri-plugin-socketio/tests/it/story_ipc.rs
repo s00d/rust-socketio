@@ -348,8 +348,10 @@ fn bad_options_are_refused_before_connecting() {
     assert_eq!(err["kind"], "InvalidOptions");
     assert!(err.to_string().contains("reconection"), "{err}");
     for (field, bad) in [
-        ("timeout", json!(1.5)),
+        // milliseconds are read like emitWithAck's timeout: a fraction is cut, a negative is
+        // refused
         ("reconnectionDelay", json!(-1)),
+        ("timeout", json!(-0.5)),
         ("timeout", json!("s3cr3t")),
     ] {
         let err = h

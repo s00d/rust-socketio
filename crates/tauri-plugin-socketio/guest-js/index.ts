@@ -169,6 +169,38 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
   }
 }
 
+/** Calls `listener`; an exception does not stop the other listeners or later messages, it is
+ * rethrown on its own (like Tauri's `Channel` does), so it still shows up as an error. */
+function guarded(listener: () => void): void {
+  try {
+    listener()
+  } catch (e) {
+    queueMicrotask(() => {
+      throw e
+    })
+  }
+}
+
+const hasBlob = typeof Blob !== 'undefined'
+
+/** `args` with every `Blob` / `File` anywhere in them read into a `Uint8Array` (socket.io-client
+ * sends them as binary). */
+async function readBlobs(args: unknown[]): Promise<unknown[]> {
+  if (!hasBlob) return args
+  const walk = async (value: unknown): Promise<unknown> => {
+    if (value instanceof Blob) return new Uint8Array(await value.arrayBuffer())
+    if (bytesOf(value)) return value
+    if (Array.isArray(value)) return Promise.all(value.map(walk))
+    if (value !== null && typeof value === 'object' && !(value instanceof Date)) {
+      if (typeof (value as { toJSON?: unknown }).toJSON === 'function') return value
+      const entries = await Promise.all(Object.entries(value).map(async ([k, v]) => [k, await walk(v)] as const))
+      return Object.fromEntries(entries)
+    }
+    return value
+  }
+  return Promise.all(args.map(walk))
+}
+
 function bytesOf(value: unknown): Uint8Array | undefined {
   if (value instanceof Uint8Array) return value
   if (value instanceof ArrayBuffer) return new Uint8Array(value)
@@ -177,10 +209,14 @@ function bytesOf(value: unknown): Uint8Array | undefined {
 }
 
 /** Binary values (`Uint8Array`, `ArrayBuffer`, typed arrays, `DataView`) anywhere in `args`
- * become placeholders plus attachments, as socket.io-parser encodes them. */
+ * become placeholders plus attachments, as socket.io-parser encodes them. A `Blob` must be
+ * read first (`emit` and friends do that); here it is an `InvalidOptions` error, never `{}`. */
 export function encodeArgs(args: unknown[]): WireArgs {
   const binary: number[][] = []
   const walk = (value: unknown): unknown => {
+    if (hasBlob && value instanceof Blob) {
+      throw new SocketIoError('InvalidOptions', 'a Blob must be read before encoding (emit does that)')
+    }
     const bytes = bytesOf(value)
     if (bytes) {
       binary.push(Array.from(bytes))
@@ -231,9 +267,13 @@ function transportsOption(t: SocketOptions['transports']): string | undefined {
  * sense. Events and state transitions arrive in order over a channel.
  *
  * When {@link connect} / {@link attach} resolve, the socket already has the current state
- * (`connected`, `id`). Messages that arrived before are held until the next task, so handlers
- * added right after the `await` see the first events; held states older than that snapshot
- * are dropped.
+ * (`connected`, `id`). Messages are held until both the call resolved and the subscription's
+ * snapshot (its first state message) arrived, then dispatched in the next task, so handlers
+ * added right after the `await` see the first events; held states older than the snapshot are
+ * dropped.
+ *
+ * Besides the server's events, `connect`, `disconnect` (with the reason) and `connect_error`
+ * (with a {@link SocketIoError}) are emitted from the state transitions, as in socket.io-client.
  */
 export class Socket {
   /** The registry id. */
@@ -244,6 +284,9 @@ export class Socket {
   private readonly stateListeners = new Set<StateListener>()
   private current: ConnectionState = { status: 'connecting', attempt: 0 }
   private held: Message[] | null = []
+  /** The call resolved / the snapshot arrived: both are needed before the held messages go. */
+  private started = false
+  private snapshotSeen = false
   private closed = false
   /** @internal */
   readonly channel = new Channel<Message>()
@@ -251,13 +294,29 @@ export class Socket {
   /** @internal use {@link connect} or {@link attach} */
   constructor(clientId: string) {
     this.clientId = clientId
-    this.channel.onmessage = (m) => (this.held ? this.held.push(m) : this.dispatch(m))
+    this.channel.onmessage = (m) => {
+      if (!this.held) return this.dispatch(m)
+      this.held.push(m)
+      if (m.type === 'state' && m.snapshot) {
+        this.snapshotSeen = true
+        this.flushHeld()
+      }
+    }
   }
 
   /** @internal */
   start({ subscription, state }: Subscribed): this {
     this.subscription = subscription
     this.current = state
+    this.started = true
+    this.flushHeld()
+    return this
+  }
+
+  /** Once the call resolved and the snapshot arrived (in either order; a large message ahead
+   * of the snapshot can delay it past the call), dispatches what was held, in the next task. */
+  private flushHeld(): void {
+    if (!this.started || !this.snapshotSeen) return
     setTimeout(() => {
       const held = this.held ?? []
       this.held = null
@@ -268,7 +327,6 @@ export class Socket {
         this.dispatch(m)
       })
     }, 0)
-    return this
   }
 
   /** The last state this webview saw. */
@@ -290,13 +348,14 @@ export class Socket {
    * `NotConnected` while disconnected (unless `bufferWhileDisconnected`), `AccessDenied` for a
    * read-only client. */
   async emit(event: string, ...args: unknown[]): Promise<void> {
-    await call('emit', { id: this.clientId, event, args: encodeArgs(args) })
+    await call('emit', { id: this.clientId, event, args: encodeArgs(await readBlobs(args)) })
   }
 
   /** Sends `event` and resolves with the server's ack arguments (rejects with `AckTimeout`
    * after `timeout` ms, default 10000). */
   async emitWithAck(event: string, args: unknown[] = [], { timeout = 10000 }: { timeout?: number } = {}): Promise<unknown[]> {
-    const reply = await call<WireArgs>('emit_with_ack', { id: this.clientId, event, args: encodeArgs(args), timeout })
+    const encoded = encodeArgs(await readBlobs(args))
+    const reply = await call<WireArgs>('emit_with_ack', { id: this.clientId, event, args: encoded, timeout })
     return decodeArgs(reply)
   }
 
@@ -311,17 +370,24 @@ export class Socket {
 
   /** Handles the next `event` only. */
   once(event: string, listener: Listener): this {
-    const wrapper: Listener = (...args) => {
+    const wrapper: Listener & { fn?: Listener } = (...args) => {
       this.off(event, wrapper)
       listener(...args)
     }
+    wrapper.fn = listener
     return this.on(event, wrapper)
   }
 
-  /** Removes `listener`, or every listener of `event`. */
+  /** Removes `listener` (also one added with `once`), or every listener of `event`. */
   off(event: string, listener?: Listener): this {
-    if (listener) this.listeners.get(event)?.delete(listener)
-    else this.listeners.delete(event)
+    if (!listener) {
+      this.listeners.delete(event)
+      return this
+    }
+    const set = this.listeners.get(event)
+    for (const l of [...(set ?? [])]) {
+      if (l === listener || (l as { fn?: Listener }).fn === listener) set!.delete(l)
+    }
     return this
   }
 
@@ -377,6 +443,10 @@ export class Socket {
    * webview and Rust). Rejects with `AccessDenied` for a read-only client. */
   async disconnect(): Promise<void> {
     await call('disconnect', { id: this.clientId })
+    // the final state message may still be on its way: this webview knows the outcome now
+    if (!this.closed && this.current.status !== 'closed') {
+      this.dispatch({ type: 'state', state: { status: 'closed', reason: 'io client disconnect' } })
+    }
     this.detach()
   }
 
@@ -398,22 +468,47 @@ export class Socket {
   private dispatch(m: Message): void {
     if (this.closed) return
     if (m.type === 'state') {
+      const before = this.current
       this.current = m.state
-      for (const l of [...this.stateListeners]) l(m.state)
+      for (const l of [...this.stateListeners]) guarded(() => l(m.state))
+      this.emitReserved(before, m.state)
       return
     }
     const args = decodeArgs(m)
     if (m.ackId !== undefined) args.push(this.acker(m.ackId))
-    for (const l of [...this.anyListeners]) l(m.event, ...args)
-    for (const l of [...(this.listeners.get(m.event) ?? [])]) l(...args)
+    for (const l of [...this.anyListeners]) guarded(() => l(m.event, ...args))
+    for (const l of [...(this.listeners.get(m.event) ?? [])]) guarded(() => l(...args))
   }
 
+  /** socket.io-client's `connect` / `disconnect` / `connect_error`, from a state transition. */
+  private emitReserved(before: ConnectionState, now: ConnectionState): void {
+    const fire = (event: string, ...args: unknown[]) => {
+      for (const l of [...(this.listeners.get(event) ?? [])]) guarded(() => l(...args))
+    }
+    if (now.status === 'connected' && before.status !== 'connected') {
+      fire('connect')
+    } else if (before.status === 'connected' && (now.status === 'disconnected' || now.status === 'closed')) {
+      fire('disconnect', now.reason)
+    } else if (now.status === 'closed' && now.error) {
+      fire('connect_error', SocketIoError.from(now.error))
+    } else if (now.status === 'reconnecting' && now.error) {
+      fire('connect_error', SocketIoError.from(now.error))
+    }
+  }
+
+  /** The function a server ack is answered with. Calling it again does nothing; a failed
+   * answer (the ack expired or another socket of this webview answered it) is logged, never
+   * an unhandled rejection. */
   private acker(ackId: number): (...args: unknown[]) => Promise<void> {
     let sent = false
     return async (...args: unknown[]) => {
       if (sent) return
       sent = true
-      await call('ack', { id: this.clientId, ackId, args: encodeArgs(args) })
+      try {
+        await call('ack', { id: this.clientId, ackId, args: encodeArgs(await readBlobs(args)) })
+      } catch (e) {
+        console.warn(`socket.io ack ${ackId} of ${this.clientId} not sent:`, e)
+      }
     }
   }
 }

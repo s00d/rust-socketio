@@ -280,3 +280,56 @@ async fn binary_in_every_position() {
         client.disconnect().await.unwrap();
     }
 }
+
+/// Given a connected client, when 32 tasks each send 20 acked emits at once (half of them to
+/// `ack_late` with a short timeout), then every reply reaches its own caller (no ack id mix-up)
+/// and every late one times out alone. Like socket.io-client-csharp
+/// `EmitAsyncAck_ConcurrentEmit_PacketIdAndAckHandlerCountAreCorrect`.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_acks_reach_their_own_callers() {
+    let client = connect(ClientBuilder::new(server())).await;
+    // collected: a lazy iterator would spawn each task only when the previous one ended
+    let tasks: Vec<_> = (0..32)
+        .map(|task| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                for i in 0..20 {
+                    if i % 2 == 0 {
+                        let sent = json!({ "task": task, "i": i });
+                        let reply = client.emit_with_ack("echo", sent.clone(), WAIT).await;
+                        assert_eq!(reply.unwrap(), Payload::Text(vec![sent]));
+                    } else {
+                        let late = client
+                            .emit_with_ack("ack_late", (), Duration::from_millis(50))
+                            .await;
+                        assert!(matches!(late, Err(Error::AckTimeout(_))), "{late:?}");
+                    }
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    client.disconnect().await.unwrap();
+}
+
+/// Given a connected client, when it sends 900 KiB of text and 600 KiB of binary (800 KiB as
+/// base64 over polling) over polling and over the websocket, then the echo comes back
+/// unchanged (one polling request each, under the server's 1 MB maxPayload).
+#[tokio::test]
+async fn large_payloads_in_both_transports() {
+    for transport in [TransportType::Polling, TransportType::Websocket] {
+        let client = connect(ClientBuilder::new(server()).transport_type(transport)).await;
+        let text = Payload::Text(vec![json!("é".repeat(450 * 1024))]);
+        let binary = Payload::Binary(Bytes::from(vec![7u8; 600 * 1024]));
+        for sent in [text, binary] {
+            let reply = client.emit_with_ack("echo", sent.clone(), WAIT).await;
+            match reply {
+                Ok(reply) => assert!(reply == sent, "{transport:?}: the echo differs"),
+                Err(e) => panic!("{transport:?}: {e}"),
+            }
+        }
+        client.disconnect().await.unwrap();
+    }
+}

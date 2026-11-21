@@ -51,16 +51,31 @@ pub(crate) struct ConnectOptions {
     pub auth: Option<Value>,
     #[serde(default)]
     pub transports: Transports,
+    #[serde(default, deserialize_with = "opt_millis")]
     pub timeout: Option<u64>,
     pub reconnection: Option<bool>,
     pub reconnection_attempts: Option<u32>,
+    #[serde(default, deserialize_with = "opt_millis")]
     pub reconnection_delay: Option<u64>,
+    #[serde(default, deserialize_with = "opt_millis")]
     pub reconnection_delay_max: Option<u64>,
     pub randomization_factor: Option<f64>,
     pub reconnect_on_disconnect: Option<bool>,
     pub buffer_while_disconnected: Option<bool>,
     /// PEM certificates to trust instead of the default roots (a private CA).
     pub ca: Option<String>,
+}
+
+/// A duration option in ms, read like `emitWithAck`'s timeout: any finite number ≥ 0 (a
+/// fraction is cut); absent or `null` (what `Infinity` becomes in JSON) is the default.
+fn opt_millis<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    match Option::<f64>::deserialize(d)? {
+        None => Ok(None),
+        Some(v) if v.is_finite() && v >= 0.0 => Ok(Some(v as u64)),
+        Some(_) => Err(serde::de::Error::custom(
+            "expected a finite number of milliseconds >= 0",
+        )),
+    }
 }
 
 /// Query, header and auth values are secrets as often as not: only their keys are shown.
@@ -573,8 +588,13 @@ mod tests {
         let crate::Error::InvalidOptions(text) = &err else {
             panic!("{err:?}")
         };
-        assert!(!text.contains("s3cr3t") && text.contains("u64"), "{text}");
-        assert!(ConnectOptions::parse(json!({ "url": "http://x", "timeout": 1.5 })).is_err());
+        assert!(!text.contains("s3cr3t") && text.contains("f64"), "{text}");
+        // like emitWithAck's timeout: a fraction is cut, a negative is refused
+        let opts = ConnectOptions::parse(json!({ "url": "http://x", "timeout": 1.5 })).unwrap();
+        assert_eq!(opts.timeout, Some(1));
+        assert!(
+            ConnectOptions::parse(json!({ "url": "http://x", "reconnectionDelay": -1 })).is_err()
+        );
         let opts = ConnectOptions::parse(json!({
             "url": "http://x?token=q", "auth": { "token": "a" }, "query": { "k": "qv" }, "headers": { "h": "hv" }
         }))

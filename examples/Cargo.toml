@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 socketio-next = { workspace = true, features = ["rustls", "blocking"] }
 bytes = { workspace = true }
+futures-util = { workspace = true }
+socketio-next-testing = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing-subscriber = { workspace = true }

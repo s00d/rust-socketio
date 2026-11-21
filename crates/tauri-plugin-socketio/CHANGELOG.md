@@ -24,11 +24,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `reconnect` racing a `disconnect` revived a client that was already unregistered; the
   revived connection is closed again and the id reported unknown.
 
+### Fixed (guest-js)
+
+- `connect()` / `attach()`: the messages that came before the call resolved are held until the
+  subscription's snapshot arrived, not for one fixed tick; a large event ahead of the snapshot
+  (Tauri sends it by `fetch`) made stale `connecting` / `connected` states fire again.
+- A throwing listener no longer stops the other listeners or the later messages; the error is
+  rethrown on its own.
+- `off(event, fn)` removes a listener added with `once(event, fn)`.
+- `Blob` / `File` arguments are read and sent as binary (they went out as `{}`).
+- After `disconnect()` the socket reports `closed` (`io client disconnect`) right away.
+- A failed ack answer (expired, or answered by another socket of the webview) is logged instead
+  of an unhandled promise rejection.
+
+### Added (guest-js)
+
+- `connect`, `disconnect` (with the reason) and `connect_error` events from the state
+  transitions, as socket.io-client emits them.
+
 ### Changed
 
 - Documentation at <https://s00d.github.io/rust-socketio/tauri/setup>; the README is short
   and links to it.
 - guest-js exports the `WireArgs` type (the return type of `encodeArgs`).
+- guest-js needs `@tauri-apps/api` 2.12.3 or newer (earlier versions stop a channel after a
+  throwing callback and leak channel callbacks).
+- Connect options in milliseconds (`timeout`, `reconnectionDelay`, `reconnectionDelayMax`) are
+  read like `emitWithAck`'s timeout: a fraction is cut (it was refused), a negative is refused.
 
 ## [0.1.0] - 2026-11-08
 

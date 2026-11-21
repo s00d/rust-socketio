@@ -114,6 +114,18 @@ docs-dev:
 docs-build:
     cd docs && pnpm install --frozen-lockfile && NUXT_APP_BASE_URL="${NUXT_APP_BASE_URL:-/rust-socketio/}" pnpm generate
 
+# Load run against a plain socket.io 4.8 server (ci/load-server.js), then the in-process fake;
+# every reply is checked (`just servers-setup` first)
+load clients="50" events="200" transport="any":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p ci/logs
+    PORT=4220 node ci/load-server.js > ci/logs/load-server.log 2>&1 &
+    pid=$!; trap 'kill "${pid}" 2>/dev/null || true' EXIT
+    node ci/wait-ports.js 4220
+    cargo run -p examples --bin load {{ ci_flags }} -- http://127.0.0.1:4220 {{ clients }} {{ events }} {{ transport }}
+    cargo run -p examples --bin load {{ ci_flags }} -- fake {{ clients }} {{ events }} {{ transport }}
+
 # Run the examples against a local server (see examples/README)
 example name *args:
     cargo run -p examples --bin {{ name }} {{ ci_flags }} -- {{ args }}

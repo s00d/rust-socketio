@@ -175,6 +175,18 @@ proptest! {
         prop_assert_eq!(decoded.ack_payload().unwrap(), payload);
     }
 
+    /// Hostile headers are errors, never panics or overflows: an ack id past u64, an
+    /// attachment count with many digits (python-socketio `test_decode_id_too_long`,
+    /// `test_decode_attachment_count_too_long`).
+    #[test]
+    fn oversized_numbers_are_refused(digits in 20usize..120) {
+        let big = "9".repeat(digits);
+        let id = Packet::try_from(Bytes::from(format!("2{big}[\"x\"]")));
+        let count = Packet::try_from(Bytes::from(format!("5{big}-[\"x\"]")));
+        prop_assert!(id.is_err(), "ack id accepted");
+        prop_assert!(count.is_err(), "attachment count accepted");
+    }
+
     /// Text that is not a valid packet is an error, never a panic.
     #[test]
     fn any_text_decodes_or_errs(text in "\\PC{0,40}") {
