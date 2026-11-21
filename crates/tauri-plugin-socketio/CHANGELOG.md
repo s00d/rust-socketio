@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-21
+
 ### Security
 
 - A webview may not set the `Origin`, `Forwarded`, `X-Forwarded-*` and `X-Real-IP` headers
