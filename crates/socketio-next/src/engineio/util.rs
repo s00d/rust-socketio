@@ -63,7 +63,6 @@ mod tests {
             t.bytes()
                 .all(|b| b.is_ascii_alphanumeric() && !b.is_ascii_uppercase())
         );
-        assert_ne!(timestamp_param(), timestamp_param() + "x");
     }
 
     #[test]

@@ -238,7 +238,7 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<Dispatch>, inner: Weak<Inner>)
                     if client.inner.shared.muted.load(Ordering::Acquire) {
                         break;
                     }
-                    run(handler(event.clone(), client.clone())).await;
+                    run(|| handler(event.clone(), client.clone())).await;
                 }
             }
             Dispatch::State(state) => {
@@ -247,20 +247,21 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<Dispatch>, inner: Weak<Inner>)
                     if client.inner.shared.muted.load(Ordering::Acquire) {
                         break;
                     }
-                    run(handler(state.clone(), client.clone())).await;
+                    run(|| handler(state.clone(), client.clone())).await;
                 }
             }
         }
     }
 }
 
-/// One handler call; a panic is logged and does not stop the event task.
-async fn run(fut: futures_util::future::BoxFuture<'static, ()>) {
-    if IN_HANDLER_TASK
-        .scope((), AssertUnwindSafe(fut).catch_unwind())
-        .await
-        .is_err()
-    {
+/// One handler call; a panic is logged and does not stop the event task. The call itself is
+/// inside the guard too: an async handler's closure body runs while its future is built.
+async fn run(call: impl FnOnce() -> futures_util::future::BoxFuture<'static, ()>) {
+    let guarded = async move {
+        let fut = std::panic::catch_unwind(AssertUnwindSafe(call)).map_err(|_| ())?;
+        AssertUnwindSafe(fut).catch_unwind().await.map_err(|_| ())
+    };
+    if IN_HANDLER_TASK.scope((), guarded).await.is_err() {
         tracing::error!("an event handler panicked");
     }
 }
@@ -302,13 +303,15 @@ impl Client {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(dispatcher) = dispatcher {
-            if tokio::time::timeout(HANDLER_DRAIN, &mut Box::pin(dispatcher))
+        if let Some(mut dispatcher) = dispatcher {
+            if tokio::time::timeout(HANDLER_DRAIN, &mut dispatcher)
                 .await
                 .is_err()
             {
+                // stopped like disconnect() does: two event tasks would break the order
+                dispatcher.abort();
                 tracing::warn!(
-                    "handlers still running after {HANDLER_DRAIN:?}; reconnecting anyway"
+                    "handlers still running after {HANDLER_DRAIN:?}; stopped them, reconnecting"
                 );
             }
         }

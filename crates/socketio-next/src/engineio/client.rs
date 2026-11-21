@@ -123,10 +123,6 @@ mod test {
     use http::HeaderMap;
     use url::Url;
 
-    /// The purpose of this test is to check whether the Client is properly cloneable or not.
-    /// As the documentation of the engine.io client states, the object needs to maintain it's internal
-    /// state when cloned and the cloned object should reflect the same state throughout the lifetime
-    /// of both objects (initial and cloned).
     /// Reads until `deadline`; `Some(err)` for an error, `None` when it stayed healthy.
     async fn watch(
         socket: &mut Client,

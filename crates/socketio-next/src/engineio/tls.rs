@@ -213,16 +213,48 @@ pub(crate) fn ws_connector(config: Option<&TlsConfig>) -> Option<tokio_tungsteni
     #[allow(unreachable_patterns, unused_variables)]
     match effective(config)? {
         #[cfg(feature = "rustls")]
-        TlsConfig::Rustls(config) => Some(tokio_tungstenite::Connector::Rustls(config)),
+        TlsConfig::Rustls(config) => Some(tokio_tungstenite::Connector::Rustls(http1_only(config))),
         #[cfg(feature = "native-tls")]
         TlsConfig::NativeTls(connector) => Some(tokio_tungstenite::Connector::NativeTls(connector)),
         _ => None,
     }
 }
 
+/// The websocket handshake is HTTP/1.1: a config shared with an HTTP/2 client (ALPN `h2`)
+/// would let the server pick h2 and fail the upgrade.
+#[cfg(feature = "rustls")]
+fn http1_only(
+    config: std::sync::Arc<rustls::ClientConfig>,
+) -> std::sync::Arc<rustls::ClientConfig> {
+    if config.alpn_protocols.is_empty() || config.alpn_protocols == [b"http/1.1".to_vec()] {
+        return config;
+    }
+    let mut config = (*config).clone();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    std::sync::Arc::new(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ALPN through the public TlsConfig cannot be observed without an h2 server; the
+    /// connector is internal, so this stays a unit check.
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn the_websocket_connector_offers_http1_only() {
+        let roots = rustls::RootCertStore::empty();
+        let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let fixed = http1_only(std::sync::Arc::new(config));
+        assert_eq!(fixed.alpn_protocols, [b"http/1.1".to_vec()]);
+    }
 
     // reqwest's own builder with rustls compiled in and no provider installed: what a downstream
     // build gets when another crate enables `rustls-no-provider` (nothing here installs a default).

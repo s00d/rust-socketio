@@ -779,10 +779,14 @@ async fn attempt_connect(
     let attempt = async move {
         let auth = match &config.auth_fn {
             Some(auth_fn) => {
-                let auth = std::panic::AssertUnwindSafe(auth_fn())
+                // the call is guarded too: a closure may panic before it returns its future
+                let panicked = |_| Error::InvalidAuth("the auth_with function panicked");
+                let fut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| auth_fn()))
+                    .map_err(panicked)?;
+                let auth = std::panic::AssertUnwindSafe(fut)
                     .catch_unwind()
                     .await
-                    .map_err(|_| Error::InvalidAuth("the auth_with function panicked"))?;
+                    .map_err(panicked)?;
                 Some(auth)
             }
             None => config.auth.clone(),
@@ -795,12 +799,14 @@ async fn attempt_connect(
         let auth = connect_payload(auth, pid.as_deref(), offset.as_deref());
         let (url, headers) = match &config.params_fn {
             Some(params_fn) => {
-                let params = std::panic::AssertUnwindSafe(params_fn())
+                let panicked =
+                    |_| Error::InvalidHeader("the connect_params_with function panicked".into());
+                let fut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| params_fn()))
+                    .map_err(panicked)?;
+                let params = std::panic::AssertUnwindSafe(fut)
                     .catch_unwind()
                     .await
-                    .map_err(|_| {
-                        Error::InvalidHeader("the connect_params_with function panicked".into())
-                    })?;
+                    .map_err(panicked)?;
                 apply_params(url, &config.headers, params)?
             }
             None => (url, config.headers.clone()),

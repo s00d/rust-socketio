@@ -1,7 +1,6 @@
 //! Ports of engine.io-client 6.6 tests (`test/connection.js`, `test/binary-fallback.js`) against
 //! the ci/ servers. Browser-only cases (workers, beforeunload, Blob), transport options without a
-//! Rust counterpart (agent, perMessageDeflate, rememberUpgrade, cookies) and client-side
-//! batching by `maxPayload` (this client sends one request per packet) are not ported.
+//! Rust counterpart (agent, perMessageDeflate, rememberUpgrade, cookies) are not ported.
 use std::time::Duration;
 
 use bytes::Bytes;

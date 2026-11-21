@@ -140,9 +140,12 @@ impl ClientBuilder {
         let inner = self.inner.auth_with(move || {
             let auth = Arc::clone(&auth);
             async move {
-                tokio::task::spawn_blocking(move || auth())
-                    .await
-                    .unwrap_or(Value::Null)
+                // a panic stays a panic: the attempt fails with "auth_with panicked"
+                match tokio::task::spawn_blocking(move || auth()).await {
+                    Ok(value) => value,
+                    Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                    Err(_) => std::panic::resume_unwind(Box::new("auth_with was cancelled")),
+                }
             }
         });
         ClientBuilder { inner, ..self }

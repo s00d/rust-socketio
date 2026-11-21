@@ -192,6 +192,12 @@ async fn answers_server_acks() {
         let builder = builder.on("question", |event: Event, _: Client| async move {
             assert!(event.wants_ack());
             let q: String = event.arg(0).unwrap();
+            // an ack that cannot be encoded (11 attachments) is not counted as sent
+            let too_many = Payload::Mixed {
+                args: (0..11).map(Payload::placeholder).collect(),
+                attachments: vec![Bytes::from_static(b"x"); 11],
+            };
+            assert!(event.ack(too_many).is_err());
             event
                 .ack(vec![json!(format!("re: {q}")), json!(42)])
                 .unwrap();
@@ -335,7 +341,12 @@ async fn query_is_encoded() {
             ClientBuilder::new(server())
                 .query("key1", "1")
                 .query("key2", "a&b=c")
-                .query("key3", "Б"),
+                .query("key3", "Б")
+                // engine.io's own parameters stay the client's (a caller cannot hijack a
+                // session with `sid` or change the protocol with `EIO`)
+                .query("EIO", "3")
+                .query("sid", "someone-else")
+                .query("transport", "websocket"),
         )
         .await;
         let query = client
@@ -346,6 +357,8 @@ async fn query_is_encoded() {
         assert_eq!(query["key1"], "1");
         assert_eq!(query["key2"], "a&b=c");
         assert_eq!(query["key3"], "Б");
+        assert_eq!(query["EIO"], "4");
+        assert!(query.get("sid").is_none(), "{query}");
         client.disconnect().await.unwrap();
     })
     .await
@@ -926,9 +939,16 @@ async fn handlers_run_in_order() {
 async fn panicking_handler_is_contained() {
     tokio::time::timeout(std::time::Duration::from_secs(90), async move {
         let (builder, mut events) = collect(ClientBuilder::new(server()));
-        let builder = builder.on("echo-back", |_: Event, _: Client| async move {
-            panic!("handler bug");
-        });
+        let builder = builder
+            .on("echo-back", |_: Event, _: Client| async move {
+                panic!("handler bug");
+            })
+            // a panic in the closure body, before it returns its future
+            .on("echo-back", |event: Event, _: Client| {
+                let n: i64 = event.arg(0).unwrap();
+                assert!(n != 1, "sync handler bug");
+                async move {}
+            });
         let client = connect(builder).await;
         client.emit("echo", 1).unwrap();
         client.emit("echo", 2).unwrap();
@@ -1053,7 +1073,7 @@ async fn headers_reach_the_server() {
 async fn reconnects_after_a_server_restart() {
     tokio::time::timeout(std::time::Duration::from_secs(90), async move {
         let (builder, mut events) = collect(
-            ClientBuilder::new(socket_io_restart_server())
+            ClientBuilder::new(new_socket_io_restart_server())
                 .reconnection_delay(Duration::from_millis(200))
                 .reconnection_delay_max(Duration::from_millis(500)),
         );
@@ -1383,6 +1403,19 @@ async fn a_panicking_params_function_fails_the_attempt() {
             .connect()
             .await;
         assert!(matches!(result, Err(Error::InvalidHeader(_))), "{result:?}");
+        // a panic before the future is returned fails the attempt the same way
+        #[allow(unreachable_code)]
+        let result = ClientBuilder::new(server())
+            .connect_params_with(|| -> std::future::Ready<ConnectParams> { panic!("boom") })
+            .connect()
+            .await;
+        assert!(matches!(result, Err(Error::InvalidHeader(_))), "{result:?}");
+        #[allow(unreachable_code)]
+        let result = ClientBuilder::new(server())
+            .auth_with(|| -> std::future::Ready<Value> { panic!("boom") })
+            .connect()
+            .await;
+        assert!(matches!(result, Err(Error::InvalidAuth(_))), "{result:?}");
     })
     .await
     .expect("test `a_panicking_params_function_fails_the_attempt` timed out")

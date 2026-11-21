@@ -89,10 +89,11 @@ impl AckSender {
     /// Sends the ack (ACK, or BINARY_ACK when `data` has binary parts). Only the first call
     /// sends.
     pub fn send(&self, data: impl Into<Payload>) -> Result<()> {
+        // encoded first: an invalid payload leaves the ack unsent, a valid retry still sends
+        let packet = Packet::new_ack(data.into(), &self.nsp, self.id)?;
         if self.sent.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let packet = Packet::new_ack(data.into(), &self.nsp, self.id)?;
         self.cmd
             .send(Command::Send { packet })
             .map_err(|_| Error::Closed)

@@ -54,11 +54,23 @@ impl std::fmt::Debug for ClientBuilder {
     }
 }
 
+/// Query keys engine.io itself sets.
+const RESERVED_QUERY: [&str; 5] = ["EIO", "transport", "sid", "t", "b64"];
+
 impl ClientBuilder {
     /// A builder for `url`. `EIO=4` is added to the query; an empty path becomes `/engine.io/`.
+    /// The engine.io parameters (`EIO`, `transport`, `sid`, `t`, `b64`) are the client's own: a
+    /// caller's values for them are dropped, as engine.io-client overrides them.
     pub fn new(url: Url) -> Self {
         let mut url = url;
+        let user: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| !RESERVED_QUERY.contains(&k.as_ref()))
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        url.set_query(None);
         url.query_pairs_mut()
+            .extend_pairs(user)
             .append_pair("EIO", &ENGINE_IO_VERSION.to_string());
         if url.path() == "/" {
             url.set_path("/engine.io/");
@@ -210,14 +222,20 @@ impl ClientBuilder {
         self.handshake_with_transport(&mut transport).await
     }
 
-    /// Polling handshake, then a websocket upgrade when the server offers one.
+    /// Polling handshake, then a websocket upgrade when the server offers one; when the upgrade
+    /// fails (a proxy that drops `Upgrade:`), the session stays on polling, like
+    /// engine.io-client.
     pub async fn build(mut self) -> Result<Client> {
         self.handshake().await?;
         if self.websocket_upgrade() {
-            self.build_websocket_with_upgrade().await
-        } else {
-            self.build_polling().await
+            match self.clone().build_websocket_with_upgrade().await {
+                Ok(client) => return Ok(client),
+                Err(err) => {
+                    tracing::debug!(error = %err, "websocket upgrade failed, staying on polling");
+                }
+            }
         }
+        self.build_polling().await
     }
 
     /// Polling only.

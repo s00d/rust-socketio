@@ -1,7 +1,6 @@
 use std::fmt::Debug;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use crate::protocol::engineio::Batch;
@@ -9,26 +8,45 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use tokio::time::Instant;
 
-use crate::engineio::callback::Callbacks;
+use crate::engineio::callback::{Callbacks, Dispatcher, Event};
 use crate::engineio::error::Result;
 use crate::engineio::generator::end_after_error;
 use crate::engineio::transport::{Frame, Transport};
 use crate::engineio::{Error, HandshakePacket, Packet, PacketId};
 
-/// The engine.io session: transport, heartbeat state and callbacks. Clones share all state.
-#[derive(Clone)]
-pub(crate) struct Socket {
-    /// Serialises writes (one polling POST or websocket frame at a time).
-    writer: Arc<tokio::sync::Mutex<()>>,
-    transport: Transport,
-    callbacks: Callbacks,
-    connected: Arc<AtomicBool>,
+/// Where the session is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Built, `connect()` not called yet.
+    Idle,
+    Open,
+    /// `disconnect()` is sending the close: no other write may go out after it.
+    Closing,
+    Closed,
+}
+
+/// The session state, owned by one struct behind one lock: the phase and the heartbeat. Only
+/// [`Socket`]'s transitions below change it.
+#[derive(Debug)]
+struct SessionState {
+    phase: Phase,
     /// The last ping (or the open), on the monotonic clock and on the wall clock: the
     /// monotonic one stops while the machine sleeps, the wall clock does not.
-    last_ping: Arc<Mutex<(Instant, SystemTime)>>,
+    last_ping: (Instant, SystemTime),
     /// Set when the wall clock says the deadline passed but the monotonic clock does not (a
     /// system sleep, or a clock step): the link must show life before this instant.
-    wake_check: Arc<Mutex<Option<Instant>>>,
+    wake_check: Option<Instant>,
+}
+
+/// The engine.io session: transport, state and callbacks. Clones share all of it.
+#[derive(Clone)]
+pub(crate) struct Socket {
+    /// Serialises writes (one polling POST or websocket frame at a time). I/O order only; the
+    /// session state is in `state`.
+    writer: Arc<tokio::sync::Mutex<()>>,
+    transport: Transport,
+    callbacks: Dispatcher,
+    state: Arc<Mutex<SessionState>>,
     handshake: Arc<HandshakePacket>,
 }
 
@@ -41,12 +59,18 @@ impl Socket {
         Socket {
             writer: Arc::default(),
             transport,
-            callbacks,
-            connected: Arc::new(AtomicBool::default()),
-            last_ping: Arc::new(Mutex::new((Instant::now(), SystemTime::now()))),
-            wake_check: Arc::default(),
+            callbacks: Dispatcher::start(callbacks),
+            state: Arc::new(Mutex::new(SessionState {
+                phase: Phase::Idle,
+                last_ping: (Instant::now(), SystemTime::now()),
+                wake_check: None,
+            })),
             handshake: Arc::new(handshake),
         }
+    }
+
+    fn state(&self) -> MutexGuard<'_, SessionState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn handshake(&self) -> &HandshakePacket {
@@ -60,11 +84,14 @@ impl Socket {
     /// Opens the session. Like engine.io-client nothing is sent: the client answers the server's
     /// pings and never pongs unasked. The heartbeat deadline starts now.
     pub(crate) fn connect(&self) {
-        self.connected.store(true, Ordering::Release);
-        *self
-            .last_ping
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = (Instant::now(), SystemTime::now());
+        {
+            let mut state = self.state();
+            if state.phase != Phase::Idle {
+                return;
+            }
+            state.phase = Phase::Open;
+            state.last_ping = (Instant::now(), SystemTime::now());
+        }
         tracing::debug!(
             sid = %self.handshake.sid,
             transport = self.transport.kind().as_str(),
@@ -72,33 +99,33 @@ impl Socket {
             ping_timeout_ms = self.handshake.ping_timeout,
             "engine.io open"
         );
-        Callbacks::fire(&self.callbacks.on_open, ());
+        self.callbacks.fire(Event::Open);
     }
 
     /// Reacts to one received packet: pong for ping, close for close, callbacks.
     pub(crate) async fn handle_incoming_packet(&self, packet: Packet) -> Result<()> {
         tracing::trace!(kind = ?packet.packet_id, bytes = packet.data.len(), "engine.io <-");
-        Callbacks::fire(&self.callbacks.on_packet, packet.clone());
+        self.callbacks.fire(Event::Packet(packet.clone()));
         match packet.packet_id {
             PacketId::Message | PacketId::MessageBinary => {
-                Callbacks::fire(&self.callbacks.on_data, packet.data);
+                self.callbacks.fire(Event::Data(packet.data));
             }
             PacketId::Close => {
                 tracing::debug!(sid = %self.handshake.sid, "engine.io closed by the server");
-                self.handle_close();
+                self.close_once();
             }
             // Already checked during the handshake.
             PacketId::Upgrade | PacketId::Noop => {}
             PacketId::Ping => {
-                *self
-                    .last_ping
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = (Instant::now(), SystemTime::now());
+                self.state().last_ping = (Instant::now(), SystemTime::now());
                 // Answered off the read path: a write stuck on a dead link (holding the writer
                 // lock) must not keep the stream, and so the heartbeat check, from running.
                 let socket = self.clone();
                 tokio::spawn(async move {
-                    let _ = socket.emit(Packet::new(PacketId::Pong, Bytes::new())).await;
+                    // a disconnect() before this task ran: nothing to answer, no error event
+                    if socket.is_connected() {
+                        let _ = socket.emit(Packet::new(PacketId::Pong, Bytes::new())).await;
+                    }
                 });
             }
             PacketId::Pong => {
@@ -144,34 +171,58 @@ impl Socket {
     }
 
     /// Sends a close packet (best effort) and marks the session closed. The session is closed
-    /// even when the packet cannot be sent: emits would otherwise keep going to a dead transport.
+    /// even when the packet cannot be sent. Only the first caller sends it; from its start no
+    /// other write goes out, so nothing follows the close packet.
     pub(crate) async fn disconnect(&self) -> Result<()> {
-        if !self.connected.load(Ordering::Acquire) {
-            return Ok(());
+        {
+            let mut state = self.state();
+            if state.phase != Phase::Open {
+                return Ok(());
+            }
+            state.phase = Phase::Closing;
         }
-        Callbacks::fire(&self.callbacks.on_close, ());
         // Like engine.io-client: a close packet over polling, a close frame over websocket.
-        let result = match &self.transport {
-            Transport::Polling(_) => self.emit(Packet::new(PacketId::Close, Bytes::new())).await,
-            Transport::Websocket(ws) => {
-                let _guard = self.writer.lock().await;
-                ws.close().await
+        let result = {
+            let _guard = self.writer.lock().await;
+            match &self.transport {
+                Transport::Polling(_) => {
+                    let close: Bytes = Packet::new(PacketId::Close, Bytes::new()).into();
+                    self.transport.emit(close, false).await
+                }
+                Transport::Websocket(ws) => ws.close().await,
             }
         };
-        self.connected.store(false, Ordering::Release);
+        self.close_once();
         tracing::debug!(sid = %self.handshake.sid, "engine.io closed by the client");
         result
     }
 
-    /// Sends one packet.
-    pub(crate) async fn emit(&self, packet: Packet) -> Result<()> {
-        if !self.connected.load(Ordering::Acquire) {
-            let error = Error::NotConnected;
-            Callbacks::fire(&self.callbacks.on_error, error.to_string());
+    /// `Err(NotConnected)` (reported to `on_error`) unless the session is open.
+    fn check_open(&self) -> Result<()> {
+        if self.state().phase == Phase::Open {
+            return Ok(());
+        }
+        let error = Error::NotConnected;
+        self.callbacks.fire(Event::Error(error.to_string()));
+        Err(error)
+    }
+
+    /// Writes `data` under the writer lock, if the session is still open once the lock is
+    /// held (a disconnect may have begun while this write waited).
+    async fn write(&self, data: Bytes, is_binary: bool) -> Result<()> {
+        let _guard = self.writer.lock().await;
+        self.check_open()?;
+        if let Err(error) = self.transport.emit(data, is_binary).await {
+            self.callbacks.fire(Event::Error(error.to_string()));
             return Err(error);
         }
-        tracing::trace!(kind = ?packet.packet_id, bytes = packet.data.len(), "engine.io ->");
+        Ok(())
+    }
 
+    /// Sends one packet.
+    pub(crate) async fn emit(&self, packet: Packet) -> Result<()> {
+        self.check_open()?;
+        tracing::trace!(kind = ?packet.packet_id, bytes = packet.data.len(), "engine.io ->");
         // A binary message goes out as raw bytes (websocket frame or base64 `b` polling packet).
         let is_binary = packet.packet_id == PacketId::MessageBinary;
         let data: Bytes = if is_binary {
@@ -179,13 +230,7 @@ impl Socket {
         } else {
             packet.into()
         };
-
-        let _guard = self.writer.lock().await;
-        if let Err(error) = self.transport.emit(data, is_binary).await {
-            Callbacks::fire(&self.callbacks.on_error, error.to_string());
-            return Err(error);
-        }
-        Ok(())
+        self.write(data, is_binary).await
     }
 
     /// Sends several packets: one POST per `maxPayload`-sized batch over polling (like
@@ -197,33 +242,22 @@ impl Socket {
             }
             return Ok(());
         }
-        if !self.connected.load(Ordering::Acquire) {
-            let error = Error::NotConnected;
-            Callbacks::fire(&self.callbacks.on_error, error.to_string());
-            return Err(error);
-        }
+        self.check_open()?;
         let max = self.handshake.max_payload.unwrap_or(1_000_000) as usize;
         for chunk in split_by_payload(packets, max) {
             let body = Bytes::try_from(Batch(chunk))?;
             tracing::trace!(bytes = body.len(), "engine.io -> batch");
-            let _guard = self.writer.lock().await;
-            if let Err(error) = self.transport.emit(body, false).await {
-                Callbacks::fire(&self.callbacks.on_error, error.to_string());
-                return Err(error);
-            }
+            self.write(body, false).await?;
         }
         Ok(())
     }
 
     pub(crate) fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Acquire)
+        self.state().phase == Phase::Open
     }
 
     pub(crate) fn last_ping(&self) -> Instant {
-        self.last_ping
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .0
+        self.state().last_ping.0
     }
 
     fn deadline(&self) -> Duration {
@@ -234,47 +268,37 @@ impl Socket {
         )
     }
 
-    /// engine.io-client `_hasPingExpired`: the wall clock says the deadline passed (after a
-    /// system sleep, when the monotonic timer has not caught up).
-    fn wall_clock_expired(&self) -> bool {
-        let wall = self
-            .last_ping
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .1;
-        wall.elapsed().is_ok_and(|gap| gap > self.deadline())
-    }
-
     /// The link showed life (a packet, a probe answer): the wall clock counts from now and a
     /// pending wake check is over.
     fn alive(&self) {
-        self.last_ping
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .1 = SystemTime::now();
-        *self
-            .wake_check
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
+        let mut state = self.state();
+        state.last_ping.1 = SystemTime::now();
+        state.wake_check = None;
     }
 
     /// The pending wake check, or a new one (pingTimeout from now, with a probe) when the wall
-    /// clock jumped past the deadline. `Some(instant)`: the link must show life before it.
+    /// clock jumped past the deadline (engine.io-client `_hasPingExpired`: after a system sleep
+    /// the monotonic timer has not caught up). `Some(instant)`: the link must show life before
+    /// it.
     fn wake_deadline(&self) -> Option<Instant> {
-        let mut check = self
-            .wake_check
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if check.is_none() && self.wall_clock_expired() {
-            let grace = Duration::from_millis(self.handshake.ping_timeout);
-            *check = Some(Instant::now() + grace);
-            tracing::debug!(sid = %self.handshake.sid, "wall clock past the ping deadline; probing the link");
-            let socket = self.clone();
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(grace, socket.probe()).await;
-            });
-        }
-        *check
+        let deadline = self.deadline();
+        let grace = Duration::from_millis(self.handshake.ping_timeout);
+        let armed = {
+            let mut state = self.state();
+            let expired = state.last_ping.1.elapsed().is_ok_and(|gap| gap > deadline);
+            if state.wake_check.is_some() || !expired {
+                return state.wake_check;
+            }
+            let at = Instant::now() + grace;
+            state.wake_check = Some(at);
+            at
+        };
+        tracing::debug!(sid = %self.handshake.sid, "wall clock past the ping deadline; probing the link");
+        let socket = self.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(grace, socket.probe()).await;
+        });
+        Some(armed)
     }
 
     /// A liveness probe. Polling: a noop through the normal, locked write path (two POSTs at
@@ -298,14 +322,11 @@ impl Socket {
     /// step) or ahead (a backward step), as the system would.
     #[cfg(test)]
     pub(crate) fn shift_wall_clock(&self, gap: Duration, forward: bool) {
-        let mut last = self
-            .last_ping
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state();
         if forward {
-            last.1 -= gap;
+            state.last_ping.1 -= gap;
         } else {
-            last.1 += gap;
+            state.last_ping.1 += gap;
         }
     }
 
@@ -315,9 +336,13 @@ impl Socket {
         self.deadline().saturating_sub(self.last_ping().elapsed())
     }
 
-    fn handle_close(&self) {
-        Callbacks::fire(&self.callbacks.on_close, ());
-        self.connected.store(false, Ordering::Release);
+    /// Marks the session closed; `on_close` fires once, for whichever way the session ends (a
+    /// disconnect, a server close packet, a transport that failed or ended, a ping timeout).
+    fn close_once(&self) {
+        let was = std::mem::replace(&mut self.state().phase, Phase::Closed);
+        if matches!(was, Phase::Open | Phase::Closing) {
+            self.callbacks.fire(Event::Close);
+        }
     }
 
     /// The packet stream with the heartbeat check: it ends when the socket closes and fails with
@@ -362,14 +387,24 @@ impl Socket {
                     }
                 };
                 match outcome {
-                    Some(result) => result.map(|result| (result, (stream, socket))),
+                    // a transport error or the end of the transport closes the session too
+                    // (a websocket closed without a close packet, `Session ID unknown`)
+                    Some(Some(Err(error))) => {
+                        socket.close_once();
+                        Some((Err(error), (stream, socket)))
+                    }
+                    Some(None) => {
+                        socket.close_once();
+                        None
+                    }
+                    Some(Some(Ok(packet))) => Some((Ok(packet), (stream, socket))),
                     // No ping in time: the link is dead. Be nice and disconnect properly; the
                     // reason stays the timeout even when the close packet cannot be sent.
                     None => {
                         tracing::warn!(sid = %socket.handshake.sid, "engine.io ping timeout");
                         let _ =
                             tokio::time::timeout(Duration::from_secs(1), socket.disconnect()).await;
-                        socket.connected.store(false, Ordering::Release);
+                        socket.close_once();
                         Some((Err(Error::PingTimeout), (stream, socket)))
                     }
                 }
@@ -416,7 +451,7 @@ impl Debug for Socket {
         f.debug_struct("Socket")
             .field("transport", &self.transport)
             .field("callbacks", &self.callbacks)
-            .field("connected", &self.connected)
+            .field("phase", &self.state().phase)
             .field("handshake", &self.handshake)
             .finish()
     }

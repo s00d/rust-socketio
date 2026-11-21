@@ -8,7 +8,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, Stream, StreamExt, ready};
 use http::HeaderMap;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -29,8 +29,7 @@ pub struct WebsocketTransport {
     /// A std mutex held only for one synchronous poll: a tokio lock future polled once per
     /// `poll_next` and dropped while Pending would lose its waker (the reader would hang).
     receiver: Arc<StdMutex<SplitStream<WsStream>>>,
-    base_url: Arc<RwLock<Url>>,
-    secure: bool,
+    base_url: Arc<Url>,
 }
 
 fn ws_scheme(secure: bool) -> &'static str {
@@ -98,8 +97,7 @@ impl WebsocketTransport {
         Ok(WebsocketTransport {
             sender: Arc::new(Mutex::new(sender)),
             receiver: Arc::new(StdMutex::new(receiver)),
-            base_url: Arc::new(RwLock::new(url)),
-            secure,
+            base_url: Arc::new(url),
         })
     }
 
@@ -183,21 +181,7 @@ impl WebsocketTransport {
     }
 
     pub async fn base_url(&self) -> Result<Url> {
-        Ok(self.base_url.read().await.clone())
-    }
-
-    pub async fn set_base_url(&self, base_url: Url) -> Result<()> {
-        let mut url = base_url;
-        if !url
-            .query_pairs()
-            .any(|(k, v)| k == "transport" && v == "websocket")
-        {
-            url.query_pairs_mut().append_pair("transport", "websocket");
-        }
-        url.set_scheme(ws_scheme(self.secure))
-            .map_err(|()| Error::InvalidUrlScheme(url.scheme().to_owned()))?;
-        *self.base_url.write().await = url;
-        Ok(())
+        Ok(Url::clone(&self.base_url))
     }
 }
 
@@ -243,15 +227,7 @@ impl Stream for WebsocketTransport {
 impl Debug for WebsocketTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncWebsocketTransport")
-            .field(
-                "base_url",
-                &self
-                    .base_url
-                    .try_read()
-                    .map_or("Currently not available".to_owned(), |url| {
-                        crate::redact::url(&url, true)
-                    }),
-            )
+            .field("base_url", &crate::redact::url(&self.base_url, true))
             .finish()
     }
 }
@@ -423,20 +399,6 @@ mod test {
                 .append_pair("transport", "websocket");
             url.set_scheme("ws").unwrap();
             assert_eq!(transport.base_url().await?.to_string(), url.to_string());
-            transport
-                .set_base_url(Url::parse("https://127.0.0.1")?)
-                .await?;
-            assert_eq!(
-                transport.base_url().await?.to_string(),
-                "ws://127.0.0.1/?transport=websocket"
-            );
-            transport
-                .set_base_url(Url::parse("http://127.0.0.1/?transport=websocket")?)
-                .await?;
-            assert_eq!(
-                transport.base_url().await?.to_string(),
-                "ws://127.0.0.1/?transport=websocket"
-            );
             Ok(())
         })
         .await
@@ -480,13 +442,6 @@ mod test {
             .await?;
             let base = transport.base_url().await?;
             assert_eq!(base.scheme(), "wss");
-            transport
-                .set_base_url(Url::parse("http://127.0.0.1/?transport=websocket")?)
-                .await?;
-            assert_eq!(
-                transport.base_url().await?.to_string(),
-                "wss://127.0.0.1/?transport=websocket"
-            );
             assert!(
                 matches!(transport.next().await.unwrap()?, Frame::Text(t) if t.starts_with(b"0{"))
             );
