@@ -1,8 +1,9 @@
 name: docs
 
 # Builds the documentation site (docs/, Nuxt) and publishes it to GitHub Pages
-# (https://s00d.github.io/rust-socketio/, branch gh-pages). Manual only: Actions -> docs ->
-# Run workflow, or `gh workflow run docs.yml`. Never runs on push or pull requests.
+# (https://s00d.github.io/rust-socketio/, branch gh-pages). Started by the CI `release` job
+# after a release, or by hand: Actions -> docs -> Run workflow (`gh workflow run docs.yml`).
+# Never runs on push or pull requests.
 
 on:
   workflow_dispatch:
@@ -21,13 +22,13 @@ jobs:
       run:
         working-directory: docs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: docs/package.json
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm
