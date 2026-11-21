@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-21
+
 ### Added
 
 - `socketio-next-testing` is published: in-process Socket.IO v4 / Engine.IO v4 servers for

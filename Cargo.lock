@@ -3234,7 +3234,7 @@ dependencies = [
 
 [[package]]
 name = "socketio-next"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3262,7 +3262,7 @@ dependencies = [
 
 [[package]]
 name = "socketio-next-testing"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3557,7 +3557,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-socketio"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "futures-util",
  "serde",

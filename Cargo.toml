@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -21,7 +21,7 @@ authors = ["Pavel Kuzmin", "Bastian Kersting <bastian@cmbt.de>"]
 
 [workspace.dependencies]
 # Internal crates
-socketio-next = { path = "crates/socketio-next", version = "0.2.0", default-features = false }
+socketio-next = { path = "crates/socketio-next", version = "0.2.1", default-features = false }
 socketio-next-testing = { path = "crates/socketio-next-testing" }
 
 # Shared external
