@@ -23,8 +23,7 @@ published from a laptop and no crates.io or npm token is stored anywhere.
    - publishes `socketio-next`, then `tauri-plugin-socketio`, with crates.io trusted publishing,
      and `tauri-plugin-socketio-api` with npm trusted publishing;
    - creates a GitHub release per tag from its changelog section (`just release-notes`);
-   - then the `docs` workflow (it runs after a successful manual CI run) rebuilds
-     https://s00d.github.io/rust-socketio/.
+   - starts the `docs` workflow, which rebuilds https://s00d.github.io/rust-socketio/.
 
    If it fails after tagging (network, crates.io, npm), run it again with the same version: it
    publishes only what is missing and creates the GitHub releases that are missing.
