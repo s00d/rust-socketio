@@ -1,11 +1,15 @@
 name: docs
 
 # Builds the documentation site (docs/, Nuxt) and publishes it to GitHub Pages
-# (https://s00d.github.io/rust-socketio/, branch gh-pages). Started by the CI `release` job
-# after a release, or by hand: Actions -> docs -> Run workflow (`gh workflow run docs.yml`).
+# (https://s00d.github.io/rust-socketio/, branch gh-pages). Runs after a successful manual CI
+# run (a release: Run workflow with a version; the tags the release job pushes with
+# GITHUB_TOKEN start no workflow themselves), or by hand: Actions -> docs -> Run workflow.
 # Never runs on push or pull requests.
 
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -17,6 +21,12 @@ concurrency:
 
 jobs:
   deploy:
+    # by hand, or after a CI run started by hand (a release) that passed; push / PR CI runs do
+    # not rebuild the site
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'workflow_dispatch' &&
+       github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     defaults:
       run:
