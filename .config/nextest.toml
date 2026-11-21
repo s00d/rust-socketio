@@ -1,0 +1,10 @@
+# Per-test timeouts live here, not in the tests (TESTING.md): a test slower than `period` is
+# reported as slow, one past `terminate-after` periods is killed and fails.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 3 }
+fail-fast = false
+
+[profile.ci]
+slow-timeout = { period = "30s", terminate-after = 3 }
+fail-fast = false
+failure-output = "immediate-final"

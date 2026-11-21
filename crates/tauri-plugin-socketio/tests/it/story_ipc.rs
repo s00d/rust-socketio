@@ -1,7 +1,7 @@
-//! The plugin through the IPC, as the webview uses it: a mock Tauri app with the plugin, its
+//! Stories: the plugin through the IPC, as the webview uses it: a mock Tauri app with the plugin, its
 //! commands invoked by name (`plugin:socketio|<cmd>`) through an ACL resolved from the
 //! plugin's real permission files, channel messages captured by a channel interceptor.
-//! Against the Node test servers in `ci/` (`just servers`).
+//! Against the in-process fake servers (and the Node conformance server, `just servers`).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc;

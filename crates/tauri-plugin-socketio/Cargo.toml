@@ -55,8 +55,8 @@ tauri-plugin = { version = "2", features = ["build"] }
 socketio-next-testing = { workspace = true }
 tauri = { version = "2", default-features = false, features = ["test"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-# parses the permission files to resolve a real ACL in tests/ipc.rs
+# parses the permission files to resolve a real ACL in tests/it/story_ipc.rs
 toml = "1"
-# a websocket server that closes with a code (tests/ipc.rs)
+# a websocket server that closes with a code (tests/it/story_ipc.rs)
 futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }

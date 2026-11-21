@@ -77,7 +77,7 @@ jobs:
         run: brew install just
       - uses: taiki-e/install-action@v2
         with:
-          tool: ${{ runner.os == 'Linux' && 'just,cargo-hack,cargo-shear' || runner.os == 'macOS' && 'cargo-hack' || 'just,cargo-hack' }}
+          tool: ${{ runner.os == 'Linux' && 'just,cargo-hack,cargo-nextest,cargo-shear' || runner.os == 'macOS' && 'cargo-hack,cargo-nextest' || 'just,cargo-hack,cargo-nextest' }}
       - uses: Swatinem/rust-cache@v2
       - run: just servers-setup
       # Later steps run even if an earlier one failed, so one run shows every failure.

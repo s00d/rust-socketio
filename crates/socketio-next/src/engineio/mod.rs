@@ -33,9 +33,6 @@ mod transport;
 pub mod transports;
 mod util;
 
-#[cfg(test)]
-mod js_parity;
-
 pub use crate::protocol::engineio::{HandshakePacket, Packet, PacketId};
 pub use builder::ClientBuilder;
 pub use client::Client;

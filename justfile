@@ -1,12 +1,14 @@
 # Development and CI tasks. `just` lists them; `just ci` is what the CI workflow runs.
-# Tools: `cargo install just cargo-hack cargo-deny cargo-shear cargo-sweep`; Node 20+ for the
-# test servers (`just servers`).
+# Tools: `cargo install just cargo-hack cargo-nextest cargo-deny cargo-shear cargo-sweep`; Node 20+
+# for the Node test servers (`just servers`).
 #
 # Builds use the `ci` profile (no debuginfo, output in target/ci). Every build is `--locked`.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 ci_flags := "--profile ci --locked"
+# nextest names the cargo profile `--cargo-profile`; `-P ci` is its own profile (.config/nextest.toml)
+nextest_flags := "--cargo-profile ci --locked -P ci"
 crate := "socketio-next"
 plugin := "tauri-plugin-socketio"
 plugin_dir := "crates/tauri-plugin-socketio"
@@ -32,18 +34,18 @@ lint:
 # The Tauri plugin is tested by `just plugin`.
 # All tests and doctests, then the crate per feature set (no TLS, rustls, native-tls, blocking); needs `just servers`
 test:
-    cargo test --workspace --exclude {{ plugin }} --all-targets --all-features {{ ci_flags }}
+    cargo nextest run --workspace --exclude {{ plugin }} --all-targets --all-features {{ nextest_flags }}
     cargo test --workspace --exclude {{ plugin }} --doc --all-features {{ ci_flags }}
-    cargo hack test -p {{ crate }} --each-feature --all-targets {{ ci_flags }}
+    cargo hack nextest run -p {{ crate }} --each-feature --all-targets {{ nextest_flags }}
 
 # Tauri plugin: Rust tests (mock IPC, Node servers) and guest-js (typecheck, vitest, build, publint, attw)
 plugin: plugin-rust plugin-js
 
 # Tauri plugin: Rust tests and doctests (rustls, then native-tls); needs `just servers`
 plugin-rust:
-    cargo test -p {{ plugin }} --all-targets {{ ci_flags }}
+    cargo nextest run -p {{ plugin }} --all-targets {{ nextest_flags }}
     cargo test -p {{ plugin }} --doc {{ ci_flags }}
-    cargo test -p {{ plugin }} --no-default-features --features native-tls --all-targets {{ ci_flags }}
+    cargo nextest run -p {{ plugin }} --no-default-features --features native-tls --all-targets {{ nextest_flags }}
 
 # Tauri plugin: guest-js typecheck, vitest, build + publint/attw/dist smoke; needs pnpm
 plugin-js:
@@ -54,9 +56,10 @@ plugin-example: plugin-js
     cd {{ plugin_dir }}/examples/tauri-app && pnpm install --frozen-lockfile && pnpm build
     cd {{ plugin_dir }}/examples/tauri-app/src-tauri && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/../../../../../target}/example" cargo check
 
-# Tests that need no server: the codecs, backoff, redaction, error texts
+# Tests that need no server: the codec models, backoff, redaction, error texts
 test-offline:
-    cargo test -p {{ crate }} --lib {{ ci_flags }} -- protocol:: backoff:: redact:: util:: tls:: actor::tests
+    cargo nextest run -p {{ crate }} --all-features {{ nextest_flags }} -E 'test(/^model_/)'
+    cargo test -p {{ crate }} --lib {{ ci_flags }} -- protocol:: backoff:: redact:: util:: tls::
 
 # Install the Node test servers' packages and generate the test certificates
 servers-setup:
