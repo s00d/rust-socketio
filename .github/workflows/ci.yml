@@ -162,7 +162,8 @@ jobs:
   #    `tauri-plugin-socketio-vX.Y.Z`;
   # 4. publishes socketio-next, then tauri-plugin-socketio, with crates.io trusted publishing,
   #    and tauri-plugin-socketio-api with npm trusted publishing (no stored tokens);
-  # 5. creates a GitHub release per tag from its changelog section.
+  # 5. creates a GitHub release per tag from its changelog section;
+  # 6. starts the `docs` workflow: the site shows the new version and changelog.
   # Re-running with the same version resumes once the tags exist: it publishes only what is
   # not on crates.io / npm yet and creates the GitHub releases that are missing.
   release:
@@ -174,6 +175,8 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      # starts the docs workflow (a workflow_dispatch from GITHUB_TOKEN does run)
+      actions: write
     env:
       VERSION: ${{ inputs.release }}
     steps:
@@ -280,3 +283,7 @@ jobs:
           }
           release "tauri-plugin-socketio-v${VERSION}" crates/tauri-plugin-socketio/CHANGELOG.md --latest=false
           release "socketio-next-v${VERSION}" CHANGELOG.md --latest
+      - name: Rebuild the documentation site
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run docs.yml --ref main
