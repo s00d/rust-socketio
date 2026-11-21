@@ -185,7 +185,8 @@ impl ConnectOptions {
 }
 
 /// Headers a webview may not set: they belong to the HTTP / websocket machinery or to the
-/// proxy, and cookies come from the jar. Rust's own clients are not limited.
+/// proxy, cookies come from the jar, and the origin / forwarding headers would let a page
+/// pose as another origin or client address to the server. Rust's own clients are not limited.
 const FORBIDDEN_HEADERS: &[&str] = &[
     "host",
     "connection",
@@ -193,6 +194,9 @@ const FORBIDDEN_HEADERS: &[&str] = &[
     "content-length",
     "transfer-encoding",
     "cookie",
+    "origin",
+    "forwarded",
+    "x-real-ip",
 ];
 
 /// `InvalidOptions` naming the first forbidden header (never its value).
@@ -202,6 +206,7 @@ pub(crate) fn check_headers(headers: &BTreeMap<String, String>) -> crate::Result
         if FORBIDDEN_HEADERS.contains(&lower.as_str())
             || lower.starts_with("sec-websocket-")
             || lower.starts_with("proxy-")
+            || lower.starts_with("x-forwarded-")
         {
             return Err(crate::Error::InvalidOptions(format!(
                 "the header `{name}` may not be set from the webview"
@@ -588,6 +593,10 @@ mod tests {
             "Sec-WebSocket-Key",
             "Proxy-Authorization",
             "Upgrade",
+            "Origin",
+            "Forwarded",
+            "X-Forwarded-For",
+            "X-Real-IP",
         ] {
             let err =
                 ConnectOptions::parse(json!({ "url": "http://x", "headers": { name: "s3cr3t" } }))

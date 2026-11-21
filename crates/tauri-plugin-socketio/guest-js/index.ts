@@ -23,7 +23,8 @@ export type DisconnectReason =
 /** An error as the plugin sends it. */
 export interface ErrorData {
   /** The variant name: `ConnectRejected`, `NotConnected`, `AckTimeout`, `AccessDenied`,
-   * `Reserved`, `UrlNotAllowed`, `TooManySubscriptions`, `InvalidOptions`, `NotConfigurable`,
+   * `Reserved`, `UrlNotAllowed`, `TooManySubscriptions`, `TooManyClients`, `InvalidOptions`,
+   * `NotConfigurable`,
    * `WebsocketClosed`, `HttpStatus`, `ProxyFailed`, ... */
   kind: string
   message: string
@@ -140,13 +141,13 @@ export interface ClientInfo {
   state: ConnectionState
 }
 
-/** Event arguments on the IPC: JSON plus the attachments that `{_placeholder, num}` stand for. */
 interface Subscribed {
   subscription: number
   state: ConnectionState
 }
 
-interface WireArgs {
+/** Event arguments on the IPC: JSON plus the attachments that `{_placeholder, num}` stand for. */
+export interface WireArgs {
   args: unknown[]
   binary?: number[][]
 }

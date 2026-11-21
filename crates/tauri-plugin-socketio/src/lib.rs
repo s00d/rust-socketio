@@ -44,7 +44,8 @@ mod registry;
 pub use error::{Error, ErrorPayload, Result};
 pub use models::{Access, Args, ClientInfo, Link, Message, State};
 pub use registry::{
-    ACK_TTL, MAX_PENDING_ACKS_PER_WEBVIEW, MAX_SUBSCRIPTIONS_PER_WEBVIEW, SocketIo, SubscriptionId,
+    ACK_TTL, MAX_CLIENTS_PER_WEBVIEW, MAX_PENDING_ACKS_PER_WEBVIEW, MAX_SUBSCRIPTIONS_PER_WEBVIEW,
+    SocketIo, SubscriptionId,
 };
 /// The client crate, re-exported.
 pub use socketio_next;
@@ -141,7 +142,7 @@ fn page_load<R: Runtime>(webview: &Webview<R>, event: PageLoadEvent) {
     }
 }
 
-/// A window is destroyed: its webview's subscriptions and acks go.
+/// A window is destroyed: its webview's subscriptions, acks and the clients it connected go.
 fn run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
     if let RunEvent::WindowEvent {
         label,
@@ -156,6 +157,10 @@ fn run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
 fn window_destroyed<R: Runtime>(app: &AppHandle<R>, label: &str) {
     if let Some(io) = app.try_state::<SocketIo>() {
         io.drop_webview(label);
+        // the clients it connected go with it (a reload keeps them: they survive page loads)
+        let io = SocketIo::clone(&io);
+        let label = label.to_owned();
+        tauri::async_runtime::spawn(async move { io.disconnect_owned(&label).await });
     }
 }
 

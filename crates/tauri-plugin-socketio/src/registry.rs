@@ -30,6 +30,10 @@ pub const ACK_TTL: Duration = Duration::from_secs(120);
 pub const MAX_PENDING_ACKS_PER_WEBVIEW: usize = 256;
 /// At most this many subscriptions per webview (over all clients).
 pub const MAX_SUBSCRIPTIONS_PER_WEBVIEW: usize = 64;
+
+/// Clients one webview may have connected (and not disconnected) at once; they are
+/// disconnected when its window is destroyed.
+pub const MAX_CLIENTS_PER_WEBVIEW: usize = 64;
 /// How long a JS `connect` waits for the client's event task to forward the connected state.
 const SETTLE: Duration = Duration::from_secs(2);
 
@@ -69,6 +73,8 @@ struct Entry {
     listeners: Vec<ListenerId>,
     /// Auth, headers and query a webview may replace (clients a webview connected).
     dynamic: Option<Arc<Mutex<Dynamic>>>,
+    /// The webview that connected it; it is disconnected when that window is destroyed.
+    owner: Option<String>,
 }
 
 /// Fans one client out to its subscriptions; keeps the acks offered to webviews.
@@ -245,6 +251,7 @@ impl SocketIo {
                     access: Access::Full,
                     hub: Arc::clone(&hub),
                     listeners: Vec::new(),
+                    owner: dynamic.as_ref().and(webview.clone()),
                     dynamic,
                 },
             );
@@ -298,6 +305,7 @@ impl SocketIo {
                 hub,
                 listeners,
                 dynamic: None,
+                owner: None,
             },
         );
         Ok(())
@@ -403,6 +411,24 @@ impl SocketIo {
         }
     }
 
+    /// Disconnects and unregisters every client webview `label` connected (its window is gone).
+    pub(crate) async fn disconnect_owned(&self, label: &str) {
+        let owned: Vec<Entry> = {
+            let mut clients = lock(&self.inner.clients);
+            let ids: Vec<String> = clients
+                .iter()
+                .filter(|(_, e)| e.owner.as_deref() == Some(label))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| clients.remove(id)).collect()
+        };
+        for entry in owned {
+            entry.hub.stop_acks();
+            let _ = entry.client.disconnect().await;
+            entry.release();
+        }
+    }
+
     fn generation(&self, label: &str) -> u64 {
         lock(&self.inner.generations)
             .get(label)
@@ -504,9 +530,26 @@ impl SocketIo {
         Ok(())
     }
 
+    /// Reconnects a client a webview connected. A `disconnect` racing it may unregister the
+    /// client meanwhile: then the revived connection is closed again (nothing could see or
+    /// close it any more) and the id is reported unknown.
+    pub(crate) async fn reconnect(&self, id: &str) -> Result<Client> {
+        let (client, hub) = self.webview_client(id)?;
+        let result = client.reconnect().await;
+        let still_registered = lock(&self.inner.clients)
+            .get(id)
+            .is_some_and(|e| Arc::ptr_eq(&e.hub, &hub));
+        if !still_registered {
+            let _ = client.disconnect().await;
+            return Err(Error::UnknownClient(id.to_owned()));
+        }
+        result?;
+        Ok(client)
+    }
+
     /// A client a webview connected ([`Access::Full`], not registered from Rust): what
-    /// `reconnect` may restart.
-    pub(crate) fn webview_client(&self, id: &str) -> Result<Client> {
+    /// `reconnect` may restart, with its hub (the entry's identity).
+    fn webview_client(&self, id: &str) -> Result<(Client, Arc<Hub>)> {
         let clients = lock(&self.inner.clients);
         let entry = clients
             .get(id)
@@ -517,7 +560,7 @@ impl SocketIo {
         if entry.dynamic.is_none() {
             return Err(Error::NotConfigurable(id.to_owned()));
         }
-        Ok(entry.client.clone())
+        Ok((entry.client.clone(), Arc::clone(&entry.hub)))
     }
 
     /// Answers server ack `ack_id` of client `id`, offered to `webview`.
@@ -586,10 +629,18 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
+/// A connect by webview `label` (holding `held` connects in flight) fits under both caps.
 fn check_cap(clients: &HashMap<String, Entry>, label: &str, held: usize) -> Result<()> {
     let count: usize = clients.values().map(|e| e.hub.count(label)).sum::<usize>() + held;
     if count >= MAX_SUBSCRIPTIONS_PER_WEBVIEW {
         return Err(Error::TooManySubscriptions(MAX_SUBSCRIPTIONS_PER_WEBVIEW));
+    }
+    let owned = clients
+        .values()
+        .filter(|e| e.owner.as_deref() == Some(label))
+        .count();
+    if owned + held >= MAX_CLIENTS_PER_WEBVIEW {
+        return Err(Error::TooManyClients(MAX_CLIENTS_PER_WEBVIEW));
     }
     Ok(())
 }

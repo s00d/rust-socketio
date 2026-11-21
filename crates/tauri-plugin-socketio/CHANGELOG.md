@@ -8,10 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- A webview may not set the `Origin`, `Forwarded`, `X-Forwarded-*` and `X-Real-IP` headers
+  (a page could pose as another origin or client address to the server).
+- A webview's query can no longer override engine.io's own parameters (`sid`, `EIO`,
+  `transport`, `t`, `b64`): with a read-only client's engine sid from `linkInfo`, a page could
+  disturb that client's polling session (socketio-next drops those keys now).
+
+### Fixed
+
+- The clients a webview connected are disconnected when its window is destroyed (a reload keeps
+  them), and one webview may have at most `MAX_CLIENTS_PER_WEBVIEW` (64) at once
+  (`TooManyClients`); before, a loop of connect + close left every client connected.
+- A `reconnect` racing a `disconnect` revived a client that was already unregistered; the
+  revived connection is closed again and the id reported unknown.
+
 ### Changed
 
 - Documentation at <https://s00d.github.io/rust-socketio/tauri/setup>; the README is short
   and links to it.
+- guest-js exports the `WireArgs` type (the return type of `encodeArgs`).
 
 ## [0.1.0] - 2026-11-08
 
