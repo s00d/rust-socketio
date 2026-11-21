@@ -52,18 +52,19 @@ where
 {
     fn into_boxed(self) -> BoxHandler<A> {
         let f = Arc::new(self);
-        Arc::new(move |arg, client| {
+        Arc::new(move |arg, client: Client| {
             let f = Arc::clone(&f);
             async move {
+                let key = client.key();
                 let result = tokio::task::spawn_blocking(move || {
-                    /// Clears the flag even when the handler panics.
+                    /// Clears the marker even when the handler panics.
                     struct Reset;
                     impl Drop for Reset {
                         fn drop(&mut self) {
-                            crate::client::IN_HANDLER_THREAD.with(|flag| flag.set(false));
+                            crate::client::IN_HANDLER_THREAD.with(|k| k.set(0));
                         }
                     }
-                    crate::client::IN_HANDLER_THREAD.with(|flag| flag.set(true));
+                    crate::client::IN_HANDLER_THREAD.with(|k| k.set(key));
                     let _reset = Reset;
                     f(arg, client);
                 })

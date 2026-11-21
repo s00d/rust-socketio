@@ -111,6 +111,8 @@ impl fmt::Debug for Callbacks {
 
 impl fmt::Debug for Dispatcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Dispatcher").field(&self.0.is_some()).finish()
+        f.debug_tuple("Dispatcher")
+            .field(&self.0.is_some())
+            .finish()
     }
 }

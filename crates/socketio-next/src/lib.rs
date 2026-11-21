@@ -56,7 +56,7 @@ mod state;
 mod transport_type;
 
 pub use builder::{ClientBuilder, ConnectParams, Direction};
-pub use client::Client;
+pub use client::{Client, WeakClient};
 pub use engineio::{TlsConfig, TransportKind};
 pub use error::{Error, Result};
 pub use event::{AckSender, Event};

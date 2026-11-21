@@ -788,15 +788,22 @@ async fn pending_ack_fails_when_the_link_drops() {
     .expect("test `pending_ack_fails_when_the_link_drops` timed out")
 }
 
-/// Dropping every handle closes the connection.
+/// Dropping every handle closes the connection, also when a handler holds a `WeakClient`.
 #[tokio::test]
 async fn drop_closes_the_connection() {
     tokio::time::timeout(std::time::Duration::from_secs(90), async move {
         let proxy = Proxy::start(&host_port(&server())).await;
         let client =
             connect(ClientBuilder::new(proxy.url()).transport_type(TransportType::Websocket)).await;
+        let weak = client.downgrade();
+        client.on("never", move |_: Event, _: Client| {
+            let _ = weak.upgrade();
+        });
+        let weak = client.downgrade();
+        assert!(weak.upgrade().is_some());
         assert!(proxy.wait_open(1, WAIT).await);
         drop(client);
+        assert!(weak.upgrade().is_none());
         assert!(
             proxy.wait_open(0, WAIT).await,
             "connection still open after drop"

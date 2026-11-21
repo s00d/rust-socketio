@@ -48,6 +48,8 @@ pub(crate) struct Socket {
     callbacks: Dispatcher,
     state: Arc<Mutex<SessionState>>,
     handshake: Arc<HandshakePacket>,
+    /// Packets that came with the handshake, handed out before the transport's.
+    pending: Arc<[Packet]>,
 }
 
 impl Socket {
@@ -55,6 +57,7 @@ impl Socket {
         transport: Transport,
         handshake: HandshakePacket,
         callbacks: Callbacks,
+        pending: Vec<Packet>,
     ) -> Self {
         Socket {
             writer: Arc::default(),
@@ -66,6 +69,7 @@ impl Socket {
                 wake_check: None,
             })),
             handshake: Arc::new(handshake),
+            pending: pending.into(),
         }
     }
 
@@ -348,68 +352,66 @@ impl Socket {
     /// The packet stream with the heartbeat check: it ends when the socket closes and fails with
     /// [`Error::PingTimeout`] when no ping arrives within pingInterval + pingTimeout.
     pub(crate) fn as_stream(&self) -> Pin<Box<dyn Stream<Item = Result<Packet>> + Send + 'static>> {
-        stream::unfold(
-            (Self::stream(self.transport.clone()), self.clone()),
-            |(mut stream, socket)| async move {
-                // A closed socket (disconnect() or a server Close packet) yields nothing more.
-                if !socket.is_connected() {
-                    return None;
-                }
-                // Waits in slices so the wall clock is checked now and then: tokio's timer
-                // does not count the time the machine slept. A wall-clock jump alone does not
-                // close the link (an NTP step looks the same): it arms a probe and a short
-                // deadline, and any packet before it proves the link alive.
-                let outcome = {
-                    let next = stream.next();
-                    tokio::pin!(next);
-                    loop {
-                        let mut slice = socket.time_to_next_ping().min(WALL_CHECK);
-                        if let Some(at) = socket.wake_deadline() {
-                            slice = slice.min(at.saturating_duration_since(Instant::now()));
-                        }
-                        match tokio::time::timeout(slice, &mut next).await {
-                            Ok(result) => {
-                                if matches!(result, Some(Ok(_))) {
-                                    socket.alive();
-                                }
-                                break Some(result);
+        let pending = stream::iter(self.pending.iter().cloned().map(Ok).collect::<Vec<_>>());
+        let packets = pending.chain(Self::stream(self.transport.clone())).boxed();
+        stream::unfold((packets, self.clone()), |(mut stream, socket)| async move {
+            // A closed socket (disconnect() or a server Close packet) yields nothing more.
+            if !socket.is_connected() {
+                return None;
+            }
+            // Waits in slices so the wall clock is checked now and then: tokio's timer
+            // does not count the time the machine slept. A wall-clock jump alone does not
+            // close the link (an NTP step looks the same): it arms a probe and a short
+            // deadline, and any packet before it proves the link alive.
+            let outcome = {
+                let next = stream.next();
+                tokio::pin!(next);
+                loop {
+                    let mut slice = socket.time_to_next_ping().min(WALL_CHECK);
+                    if let Some(at) = socket.wake_deadline() {
+                        slice = slice.min(at.saturating_duration_since(Instant::now()));
+                    }
+                    match tokio::time::timeout(slice, &mut next).await {
+                        Ok(result) => {
+                            if matches!(result, Some(Ok(_))) {
+                                socket.alive();
                             }
-                            Err(_) if socket.time_to_next_ping().is_zero() => break None,
-                            Err(_) => {
-                                if socket
-                                    .wake_deadline()
-                                    .is_some_and(|at| Instant::now() >= at)
-                                {
-                                    break None;
-                                }
+                            break Some(result);
+                        }
+                        Err(_) if socket.time_to_next_ping().is_zero() => break None,
+                        Err(_) => {
+                            if socket
+                                .wake_deadline()
+                                .is_some_and(|at| Instant::now() >= at)
+                            {
+                                break None;
                             }
                         }
-                    }
-                };
-                match outcome {
-                    // a transport error or the end of the transport closes the session too
-                    // (a websocket closed without a close packet, `Session ID unknown`)
-                    Some(Some(Err(error))) => {
-                        socket.close_once();
-                        Some((Err(error), (stream, socket)))
-                    }
-                    Some(None) => {
-                        socket.close_once();
-                        None
-                    }
-                    Some(Some(Ok(packet))) => Some((Ok(packet), (stream, socket))),
-                    // No ping in time: the link is dead. Be nice and disconnect properly; the
-                    // reason stays the timeout even when the close packet cannot be sent.
-                    None => {
-                        tracing::warn!(sid = %socket.handshake.sid, "engine.io ping timeout");
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(1), socket.disconnect()).await;
-                        socket.close_once();
-                        Some((Err(Error::PingTimeout), (stream, socket)))
                     }
                 }
-            },
-        )
+            };
+            match outcome {
+                // a transport error or the end of the transport closes the session too
+                // (a websocket closed without a close packet, `Session ID unknown`)
+                Some(Some(Err(error))) => {
+                    socket.close_once();
+                    Some((Err(error), (stream, socket)))
+                }
+                Some(None) => {
+                    socket.close_once();
+                    None
+                }
+                Some(Some(Ok(packet))) => Some((Ok(packet), (stream, socket))),
+                // No ping in time: the link is dead. Be nice and disconnect properly; the
+                // reason stays the timeout even when the close packet cannot be sent.
+                None => {
+                    tracing::warn!(sid = %socket.handshake.sid, "engine.io ping timeout");
+                    let _ = tokio::time::timeout(Duration::from_secs(1), socket.disconnect()).await;
+                    socket.close_once();
+                    Some((Err(Error::PingTimeout), (stream, socket)))
+                }
+            }
+        })
         .boxed()
     }
 }

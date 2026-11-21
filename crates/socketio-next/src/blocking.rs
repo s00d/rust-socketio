@@ -120,6 +120,38 @@ impl ClientBuilder {
         fn buffer_while_disconnected(buffer: bool);
         /// See [`crate::ClientBuilder::redact_query`].
         fn redact_query(redact: bool);
+        /// See [`crate::ClientBuilder::proxy`].
+        fn proxy(proxy: impl Into<String>);
+        /// See [`crate::ClientBuilder::no_proxy`].
+        fn no_proxy();
+    }
+
+    /// See [`crate::ClientBuilder::engine_url`].
+    pub fn engine_url(&self) -> Result<url::Url> {
+        self.inner.engine_url()
+    }
+
+    /// See [`crate::ClientBuilder::connect_params_with`]; `params` runs on a blocking thread
+    /// before every connect attempt.
+    pub fn connect_params_with<F>(self, params: F) -> Self
+    where
+        F: Fn() -> crate::ConnectParams + Send + Sync + 'static,
+    {
+        let params = Arc::new(params);
+        let inner = self.inner.connect_params_with(move || {
+            let params = Arc::clone(&params);
+            async move {
+                // a panic stays a panic: the attempt fails with "connect_params_with panicked"
+                match tokio::task::spawn_blocking(move || params()).await {
+                    Ok(value) => value,
+                    Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                    Err(_) => {
+                        std::panic::resume_unwind(Box::new("connect_params_with was cancelled"))
+                    }
+                }
+            }
+        });
+        ClientBuilder { inner, ..self }
     }
 
     /// See [`crate::ClientBuilder::tls_config`].
@@ -319,9 +351,31 @@ impl Client {
         self.inner.once(event, wrap(self.handle.clone(), handler))
     }
 
+    /// Adds a handler for every event.
+    pub fn on_any<F>(&self, handler: F) -> ListenerId
+    where
+        F: Fn(Event, Client) + Send + Sync + 'static,
+    {
+        self.inner.on_any(wrap(self.handle.clone(), handler))
+    }
+
+    /// Adds a handler for every state transition.
+    pub fn on_state_change<F>(&self, handler: F) -> ListenerId
+    where
+        F: Fn(ConnectionState, Client) + Send + Sync + 'static,
+    {
+        self.inner
+            .on_state_change(wrap(self.handle.clone(), handler))
+    }
+
     /// Removes every handler of `event`.
     pub fn off(&self, event: &str) -> usize {
         self.inner.off(event)
+    }
+
+    /// Removes every catch-all handler.
+    pub fn off_any(&self) -> usize {
+        self.inner.off_any()
     }
 
     /// Removes one handler.
@@ -361,6 +415,11 @@ impl Client {
     /// The socket id while connected.
     pub fn id(&self) -> Option<String> {
         self.inner.id()
+    }
+
+    /// The last connect restored the session (connection state recovery).
+    pub fn recovered(&self) -> bool {
+        self.inner.recovered()
     }
 
     /// The namespace.

@@ -13,8 +13,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the POSTs but not the long-poll GETs, on websocket it changed nothing. The transport URL is
   fixed at construction.
 
+### Added
+
+- `WeakClient` (`Client::downgrade`): a handle that does not keep the connection open, for
+  handlers and other things the client owns (a handler holding a `Client` kept it alive forever).
+- The blocking API has the async client's `proxy`, `no_proxy`, `connect_params_with`,
+  `engine_url`, `on_any`, `on_state_change`, `off_any` and `recovered`.
+
 ### Changed
 
+- One connection task owns the client's whole life across `reconnect()`: one command channel
+  and one event task for the client's lifetime. `reconnect()` and `disconnect()` take effect in
+  the order they are called; `connected()`, `id()` and the emit checks follow the published
+  state, and a loss is published before the (bounded) engine teardown.
+- `disconnect()` from a handler: the `Closed` state still reaches `on_state_change` (it was
+  dropped), events received after it start no handler. "Inside a handler" is per client: a
+  handler of client A that disconnects client B waits for B's handlers as from outside.
+- engine.io callbacks (`on_open`, `on_data`, `on_packet`, `on_error`, `on_close`) run one at a
+  time in the order of the events (they were each a task of their own).
+- A polling handshake body with packets after the open packet (python-engineio sends what the
+  connect handler emitted) is accepted; those packets come first on the stream.
 - Documentation site at <https://s00d.github.io/rust-socketio/>; the README is short and links
   to it.
 - Polling POSTs are bounded like the long-poll GET (pingInterval + pingTimeout): a POST stuck
