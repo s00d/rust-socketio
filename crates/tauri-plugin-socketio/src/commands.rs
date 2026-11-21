@@ -175,7 +175,6 @@ pub(crate) fn set_query(
 /// not change it). Rust's clients: `NotConfigurable`.
 #[tauri::command]
 pub(crate) async fn reconnect(io: State<'_, SocketIo>, id: String) -> Result<ConnState> {
-    let client = io.webview_client(&id)?;
-    client.reconnect().await?;
+    let client = io.reconnect(&id).await?;
     Ok(ConnState::from(&client.state()))
 }

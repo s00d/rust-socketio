@@ -33,9 +33,6 @@ mod transport;
 pub mod transports;
 mod util;
 
-#[cfg(test)]
-mod js_parity;
-
 pub use crate::protocol::engineio::{HandshakePacket, Packet, PacketId};
 pub use builder::ClientBuilder;
 pub use client::Client;
@@ -72,14 +69,17 @@ pub(crate) mod test {
         )?)
     }
 
-    /// The `engine.io` server for testing runs on port 4201
+    /// The engine.io echo server (`ci/engine-io.js`; in-process fake unless `ENGINE_IO_SERVER`)
     pub(crate) fn engine_io_server() -> Result<Url> {
-        url("ENGINE_IO_SERVER", "http://localhost:4201")
+        Ok(Url::parse(&socketio_next_testing::engine_io_server())?)
     }
 
-    /// The `engine.io` server that refuses upgrades runs on port 4203
+    /// The engine.io server that refuses upgrades (`ci/engine-io-polling.js`; in-process fake
+    /// unless `ENGINE_IO_POLLING_SERVER`)
     pub(crate) fn engine_io_polling_server() -> Result<Url> {
-        url("ENGINE_IO_POLLING_SERVER", "http://localhost:4203")
+        Ok(Url::parse(
+            &socketio_next_testing::engine_io_polling_server(),
+        )?)
     }
 
     #[allow(dead_code)]

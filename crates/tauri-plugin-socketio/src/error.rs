@@ -34,6 +34,10 @@ pub enum Error {
     /// subscriptions already.
     #[error("too many socket.io subscriptions for this webview (at most {0})")]
     TooManySubscriptions(usize),
+    /// The webview has [`MAX_CLIENTS_PER_WEBVIEW`](crate::MAX_CLIENTS_PER_WEBVIEW) clients it
+    /// connected already.
+    #[error("too many socket.io clients connected by this webview (at most {0})")]
+    TooManyClients(usize),
     /// `setAuth` / `setHeaders` / `setQuery` on a client the webview did not connect (Rust
     /// built it; Rust decides what it sends).
     #[error("socket.io client `{0}` was registered from Rust: its connect values are Rust's")]
@@ -137,6 +141,7 @@ impl From<&Error> for ErrorPayload {
             Error::Reserved(_) => "Reserved",
             Error::UrlNotAllowed => "UrlNotAllowed",
             Error::TooManySubscriptions(_) => "TooManySubscriptions",
+            Error::TooManyClients(_) => "TooManyClients",
             Error::InvalidOptions(_) => "InvalidOptions",
             Error::NotConfigurable(_) => "NotConfigurable",
         };

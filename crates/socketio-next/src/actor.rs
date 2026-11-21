@@ -1,11 +1,13 @@
-//! The connection task: owns the engine.io connection, the acks, the reconnect loop and the
-//! state. Handles talk to it through a command channel; events go to the dispatcher task.
+//! The connection task: owns the client's whole life: the engine.io connection, the acks, the
+//! reconnect loop, the state, and the restart after a close (`reconnect()`). Handles talk to it
+//! through one command channel that lives as long as the client; events go to the dispatcher
+//! task.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::pin;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -19,11 +21,12 @@ use url::Url;
 
 use crate::backoff::Backoff;
 use crate::builder::{Config, Direction};
-use crate::client::Shared;
 use crate::engineio::{self, PacketId as EnginePacketId};
 use crate::event::AckSender;
 use crate::protocol::socketio::{Packet, PacketId};
-use crate::{ConnectionState, DisconnectReason, Error, Event, Payload, Result, TransportType};
+use crate::{
+    ConnectionState, DisconnectReason, Error, Event, LinkInfo, Payload, Result, TransportType,
+};
 
 /// Bound for the goodbye packets (DISCONNECT, engine.io close) on a possibly dead link.
 const GOODBYE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -39,14 +42,40 @@ pub(crate) enum Command {
     },
     /// An ack reply to the server; dropped when not connected.
     Send { packet: Packet },
-    /// Leave the namespace and stop.
-    Disconnect { done: oneshot::Sender<()> },
+    /// Leave the namespace and close; `done` gets a fence that resolves once the dispatcher
+    /// has handled everything queued before it (the `Closed` state included).
+    Disconnect { done: oneshot::Sender<Fence> },
+    /// Connect again after a close; a no-op (`Ok`) while not closed.
+    Reconnect { ready: oneshot::Sender<Result<()>> },
 }
+
+/// Resolves when the dispatcher reached it.
+pub(crate) type Fence = oneshot::Receiver<()>;
 
 /// From the actor to the dispatcher.
 pub(crate) enum Dispatch {
-    Event(Event),
+    /// An event of connected session `session` (see [`Cut`]).
+    Event {
+        session: u64,
+        event: Event,
+    },
     State(ConnectionState),
+    Fence(oneshot::Sender<()>),
+}
+
+/// Events of sessions below this number are not dispatched any more: `disconnect()` raises it
+/// past the current session (socket.io-client stops emitting events once disconnected). The
+/// connection task writes it, the dispatcher reads it.
+pub(crate) type Cut = Arc<AtomicU64>;
+
+/// The link snapshot: written by the connection task only, read by the handles.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Link(Arc<Mutex<LinkInfo>>);
+
+impl Link {
+    pub(crate) fn get(&self) -> MutexGuard<'_, LinkInfo> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 struct PendingAck {
@@ -74,13 +103,13 @@ impl Drop for Conn {
 /// How `serve` ended.
 enum Outcome {
     Lost(DisconnectReason, Option<Error>),
-    Exit(DisconnectReason, Option<oneshot::Sender<()>>),
+    Exit(DisconnectReason, Option<oneshot::Sender<Fence>>),
 }
 
 /// How an offline wait ended.
 enum Step<T> {
     Done(T),
-    Exit(DisconnectReason, Option<oneshot::Sender<()>>),
+    Exit(DisconnectReason, Option<oneshot::Sender<Fence>>),
 }
 
 pub(crate) struct Actor {
@@ -91,9 +120,14 @@ pub(crate) struct Actor {
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     cmd_tx: mpsc::UnboundedSender<Command>,
     shutdown: oneshot::Receiver<()>,
+    /// Every handle is gone (`shutdown` fired or the command channel closed).
+    gone: bool,
     state: watch::Sender<ConnectionState>,
     dispatch: mpsc::UnboundedSender<Dispatch>,
-    shared: Arc<Shared>,
+    link: Link,
+    cut: Cut,
+    /// Connected sessions so far (numbers the events for the [`Cut`]).
+    session: u64,
     acks: HashMap<u64, PendingAck>,
     next_ack_id: u64,
     buffer: VecDeque<Packet>,
@@ -113,7 +147,8 @@ impl Actor {
         shutdown: oneshot::Receiver<()>,
         state: watch::Sender<ConnectionState>,
         dispatch: mpsc::UnboundedSender<Dispatch>,
-        shared: Arc<Shared>,
+        link: Link,
+        cut: Cut,
     ) -> Self {
         let log_url = crate::redact::url(&url, config.redact_query);
         Actor {
@@ -124,9 +159,12 @@ impl Actor {
             cmd_rx,
             cmd_tx,
             shutdown,
+            gone: false,
             state,
             dispatch,
-            shared,
+            link,
+            cut,
+            session: 0,
             acks: HashMap::new(),
             next_ack_id: 0,
             buffer: VecDeque::new(),
@@ -135,16 +173,54 @@ impl Actor {
         }
     }
 
+    /// The client's life: a session, then (closed) waiting for `reconnect()` and another
+    /// session, until every handle is gone.
     pub(crate) async fn run(mut self, ready: oneshot::Sender<Result<()>>) {
         let span = tracing::info_span!("socketio", nsp = %self.nsp, url = %self.log_url);
         async move {
+            let mut ready = Some(ready);
+            while let Some(reply) = ready.take() {
+                self.session(reply).await;
+                ready = self.idle().await;
+            }
+        }
+        .instrument(span)
+        .await;
+    }
+
+    /// Closed: commands are answered until `reconnect()` (its reply) or the end of the client.
+    async fn idle(&mut self) -> Option<oneshot::Sender<Result<()>>> {
+        while !self.gone {
+            tokio::select! {
+                _ = &mut self.shutdown => self.gone = true,
+                cmd = self.cmd_rx.recv() => match cmd {
+                    None => self.gone = true,
+                    Some(Command::Reconnect { ready }) => return Some(ready),
+                    Some(Command::Disconnect { done }) => self.finish(Some(done)),
+                    Some(Command::Emit { ack: Some((reply, _)), .. }) => {
+                        let _ = reply.send(Err(Error::Closed));
+                    }
+                    Some(Command::Emit { ack: None, .. } | Command::Send { .. }) => {}
+                },
+            }
+        }
+        None
+    }
+
+    /// One life of the connection: connect, serve, reconnect after losses, until it closes.
+    async fn session(&mut self, ready: oneshot::Sender<Result<()>>) {
+        // what one session left behind does not carry over to the next
+        self.acks.clear();
+        self.buffer.clear();
+        self.next_ack_id = 0;
+        self.pid = None;
+        self.offset = None;
+        {
             let mut conn = match self.connect_attempt(0).await {
                 Step::Done(Ok(conn)) => {
                     // connected, sid and the Connected state are set before connect() returns
                     self.on_connected(&conn);
                     let _ = ready.send(Ok(()));
-                    #[cfg(test)]
-                    tests::after_ready().await;
                     conn
                 }
                 Step::Done(Err(err)) => {
@@ -157,7 +233,7 @@ impl Actor {
                 Step::Exit(reason, done) => {
                     self.close(reason, None);
                     let _ = ready.send(Err(Error::Closed));
-                    finish(done);
+                    self.finish(done);
                     return;
                 }
             };
@@ -168,7 +244,7 @@ impl Actor {
                         self.goodbye(conn, reason == DisconnectReason::IoClientDisconnect)
                             .await;
                         self.close(reason, None);
-                        finish(done);
+                        self.finish(done);
                         return;
                     }
                     Outcome::Lost(reason, error) => {
@@ -176,7 +252,7 @@ impl Actor {
                             Some(err) => tracing::warn!(%reason, error = %err, "disconnected"),
                             None => tracing::warn!(%reason, "disconnected"),
                         }
-                        self.teardown(conn).await;
+                        // the handles see the loss before the (bounded) teardown
                         self.lost();
                         let reconnect = match reason {
                             DisconnectReason::IoServerDisconnect => {
@@ -186,10 +262,12 @@ impl Actor {
                             _ => self.config.reconnection,
                         };
                         if !reconnect {
+                            self.teardown(conn).await;
                             self.close(reason, error);
                             return;
                         }
                         self.set_state(ConnectionState::Disconnected { reason, error });
+                        self.teardown(conn).await;
                         match self.reconnect().await {
                             Some(new_conn) => {
                                 self.on_connected(&new_conn);
@@ -201,8 +279,6 @@ impl Actor {
                 }
             }
         }
-        .instrument(span)
-        .await;
     }
 
     /// The socket.io-client Manager reconnect loop. `None` when the client closed meanwhile.
@@ -228,7 +304,7 @@ impl Actor {
             }
             let delay = backoff.duration();
             let attempt = backoff.attempts();
-            self.shared.link().reconnect_attempts = attempt;
+            self.link.get().reconnect_attempts = attempt;
             tracing::info!(attempt, delay_ms = delay.as_millis() as u64, "reconnecting");
             self.set_state(ConnectionState::Reconnecting {
                 attempt,
@@ -237,7 +313,7 @@ impl Actor {
             });
             if let Step::Exit(reason, done) = self.offline(sleep(delay)).await {
                 self.close(reason, None);
-                finish(done);
+                self.finish(done);
                 return None;
             }
             match self.connect_attempt(attempt).await {
@@ -257,7 +333,7 @@ impl Actor {
                 }
                 Step::Exit(reason, done) => {
                     self.close(reason, None);
-                    finish(done);
+                    self.finish(done);
                     return None;
                 }
             }
@@ -267,7 +343,7 @@ impl Actor {
     /// One connect attempt while commands keep being served (offline).
     async fn connect_attempt(&mut self, attempt: u32) -> Step<Result<Conn>> {
         self.set_state(ConnectionState::Connecting { attempt });
-        self.shared.link().last_attempt_at = Some(Instant::now());
+        self.link.get().last_attempt_at = Some(Instant::now());
         let fut = attempt_connect(
             Arc::clone(&self.config),
             self.url.clone(),
@@ -285,16 +361,25 @@ impl Actor {
             let ack_deadline = self.next_ack_deadline();
             tokio::select! {
                 out = &mut fut => return Step::Done(out),
-                _ = &mut self.shutdown => return Step::Exit(DisconnectReason::Dropped, None),
+                _ = &mut self.shutdown => {
+                    self.gone = true;
+                    return Step::Exit(DisconnectReason::Dropped, None);
+                }
                 cmd = self.cmd_rx.recv() => match cmd {
                     Some(Command::Emit { packet, ack }) => self.offline_emit(packet, ack),
+                    Some(Command::Reconnect { ready }) => {
+                        let _ = ready.send(Ok(()));
+                    }
                     Some(Command::Send { .. }) => {
                         tracing::debug!("ack reply dropped: not connected");
                     }
                     Some(Command::Disconnect { done }) => {
                         return Step::Exit(DisconnectReason::IoClientDisconnect, Some(done));
                     }
-                    None => return Step::Exit(DisconnectReason::Dropped, None),
+                    None => {
+                        self.gone = true;
+                        return Step::Exit(DisconnectReason::Dropped, None);
+                    }
                 },
                 _ = sleep_until_opt(ack_deadline) => self.expire_acks(),
             }
@@ -307,8 +392,14 @@ impl Actor {
         loop {
             let ack_deadline = self.next_ack_deadline();
             tokio::select! {
-                _ = &mut self.shutdown => return Outcome::Exit(DisconnectReason::Dropped, None),
+                _ = &mut self.shutdown => {
+                    self.gone = true;
+                    return Outcome::Exit(DisconnectReason::Dropped, None);
+                }
                 cmd = self.cmd_rx.recv() => match cmd {
+                    Some(Command::Reconnect { ready }) => {
+                        let _ = ready.send(Ok(()));
+                    }
                     Some(Command::Emit { mut packet, ack }) => {
                         if let Some((reply, timeout)) = ack {
                             packet.id = Some(self.register_ack(reply, timeout));
@@ -319,7 +410,10 @@ impl Actor {
                     Some(Command::Disconnect { done }) => {
                         return Outcome::Exit(DisconnectReason::IoClientDisconnect, Some(done));
                     }
-                    None => return Outcome::Exit(DisconnectReason::Dropped, None),
+                    None => {
+                        self.gone = true;
+                        return Outcome::Exit(DisconnectReason::Dropped, None);
+                    }
                 },
                 err = &mut conn.writer_failed => {
                     let err = err.ok().map(Error::from);
@@ -333,14 +427,14 @@ impl Actor {
                             return Outcome::Lost(lost_reason(&err), Some(err.into()));
                         }
                         Some(Ok(packet)) => {
-                            self.shared.link().last_packet_at = Some(now);
+                            self.link.get().last_packet_at = Some(now);
                             match packet.packet_id {
                                 EnginePacketId::Ping => {
-                                    self.shared.link().last_ping_at = Some(now);
+                                    self.link.get().last_ping_at = Some(now);
                                 }
                                 EnginePacketId::Message | EnginePacketId::MessageBinary => {
                                     {
-                                        let mut link = self.shared.link();
+                                        let mut link = self.link.get();
                                         link.packets_in += 1;
                                         link.bytes_in += packet.data.len() as u64;
                                     }
@@ -371,7 +465,7 @@ impl Actor {
         }
         let handshake = conn.engine.handshake();
         {
-            let mut link = self.shared.link();
+            let mut link = self.link.get();
             link.sid = Some(conn.sid.clone());
             link.engine_sid = Some(handshake.sid.clone());
             link.transport = Some(conn.engine.transport());
@@ -382,7 +476,7 @@ impl Actor {
             link.reconnect_attempts = 0;
             link.sessions += 1;
         }
-        self.shared.connected.store(true, Ordering::Release);
+        self.session += 1;
         tracing::info!(
             sid = %conn.sid,
             transport = %conn.engine.transport(),
@@ -484,9 +578,10 @@ impl Actor {
                 let ack = packet
                     .id
                     .map(|id| AckSender::new(id, Arc::clone(&self.nsp), self.cmd_tx.clone()));
-                let _ = self
-                    .dispatch
-                    .send(Dispatch::Event(Event::new(name, payload, ack)));
+                let _ = self.dispatch.send(Dispatch::Event {
+                    session: self.session,
+                    event: Event::new(name, payload, ack),
+                });
             }
             PacketId::Ack | PacketId::BinaryAck => {
                 if let Some(pending) = packet.id.and_then(|id| self.acks.remove(&id)) {
@@ -566,9 +661,8 @@ impl Actor {
 
     /// The connection is gone: acks of sent packets fail (buffered ones keep waiting).
     fn lost(&mut self) {
-        self.shared.connected.store(false, Ordering::Release);
         {
-            let mut link = self.shared.link();
+            let mut link = self.link.get();
             link.sid = None;
             link.engine_sid = None;
             link.transport = None;
@@ -596,7 +690,6 @@ impl Actor {
         }
         self.buffer.clear();
         self.update_counts();
-        self.shared.closed.store(true, Ordering::Release);
         tracing::info!(%reason, "closed");
         self.set_state(ConnectionState::Closed { reason, error });
     }
@@ -608,7 +701,7 @@ impl Actor {
     }
 
     fn update_counts(&self) {
-        let mut link = self.shared.link();
+        let mut link = self.link.get();
         link.pending_acks = self.acks.len();
         link.buffered_emits = self.buffer.len();
     }
@@ -628,7 +721,7 @@ impl Actor {
         };
         let text = Bytes::from(&packet);
         {
-            let mut link = self.shared.link();
+            let mut link = self.link.get();
             let attachments = packet.attachments.iter().flatten();
             link.packets_out += 1 + attachments.clone().count() as u64;
             link.bytes_out += text.len() as u64 + attachments.map(|a| a.len() as u64).sum::<u64>();
@@ -692,9 +785,16 @@ fn inspect(config: &Config, direction: Direction, packet: &Packet) {
     }
 }
 
-fn finish(done: Option<oneshot::Sender<()>>) {
-    if let Some(done) = done {
-        let _ = done.send(());
+impl Actor {
+    /// Answers a `disconnect()`: no event of the sessions so far is dispatched any more, and
+    /// its fence follows everything queued (the `Closed` state included).
+    fn finish(&self, done: Option<oneshot::Sender<Fence>>) {
+        if let Some(done) = done {
+            self.cut.store(self.session + 1, Ordering::Release);
+            let (tx, rx) = oneshot::channel();
+            let _ = self.dispatch.send(Dispatch::Fence(tx));
+            let _ = done.send(rx);
+        }
     }
 }
 
@@ -779,10 +879,14 @@ async fn attempt_connect(
     let attempt = async move {
         let auth = match &config.auth_fn {
             Some(auth_fn) => {
-                let auth = std::panic::AssertUnwindSafe(auth_fn())
+                // the call is guarded too: a closure may panic before it returns its future
+                let panicked = |_| Error::InvalidAuth("the auth_with function panicked");
+                let fut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| auth_fn()))
+                    .map_err(panicked)?;
+                let auth = std::panic::AssertUnwindSafe(fut)
                     .catch_unwind()
                     .await
-                    .map_err(|_| Error::InvalidAuth("the auth_with function panicked"))?;
+                    .map_err(panicked)?;
                 Some(auth)
             }
             None => config.auth.clone(),
@@ -795,12 +899,14 @@ async fn attempt_connect(
         let auth = connect_payload(auth, pid.as_deref(), offset.as_deref());
         let (url, headers) = match &config.params_fn {
             Some(params_fn) => {
-                let params = std::panic::AssertUnwindSafe(params_fn())
+                let panicked =
+                    |_| Error::InvalidHeader("the connect_params_with function panicked".into());
+                let fut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| params_fn()))
+                    .map_err(panicked)?;
+                let params = std::panic::AssertUnwindSafe(fut)
                     .catch_unwind()
                     .await
-                    .map_err(|_| {
-                        Error::InvalidHeader("the connect_params_with function panicked".into())
-                    })?;
+                    .map_err(panicked)?;
                 apply_params(url, &config.headers, params)?
             }
             None => (url, config.headers.clone()),
@@ -967,12 +1073,6 @@ async fn writer_task(
 mod tests {
     use super::*;
     use serde_json::json;
-
-    /// Test builds pause the connection task right after it signalled `connect()`: whatever
-    /// `connect()` promises must be true by then, not a few polls later.
-    pub(super) async fn after_ready() {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 
     #[test]
     fn params_replace_equal_keys() {

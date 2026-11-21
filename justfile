@@ -1,12 +1,14 @@
 # Development and CI tasks. `just` lists them; `just ci` is what the CI workflow runs.
-# Tools: `cargo install just cargo-hack cargo-deny cargo-shear cargo-sweep`; Node 20+ for the
-# test servers (`just servers`).
+# Tools: `cargo install just cargo-hack cargo-nextest cargo-deny cargo-shear cargo-sweep`; Node 20+
+# for the Node test servers (`just servers`).
 #
 # Builds use the `ci` profile (no debuginfo, output in target/ci). Every build is `--locked`.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 ci_flags := "--profile ci --locked"
+# nextest names the cargo profile `--cargo-profile`; `-P ci` is its own profile (.config/nextest.toml)
+nextest_flags := "--cargo-profile ci --locked -P ci"
 crate := "socketio-next"
 plugin := "tauri-plugin-socketio"
 plugin_dir := "crates/tauri-plugin-socketio"
@@ -32,18 +34,18 @@ lint:
 # The Tauri plugin is tested by `just plugin`.
 # All tests and doctests, then the crate per feature set (no TLS, rustls, native-tls, blocking); needs `just servers`
 test:
-    cargo test --workspace --exclude {{ plugin }} --all-targets --all-features {{ ci_flags }}
+    cargo nextest run --workspace --exclude {{ plugin }} --all-targets --all-features {{ nextest_flags }}
     cargo test --workspace --exclude {{ plugin }} --doc --all-features {{ ci_flags }}
-    cargo hack test -p {{ crate }} --each-feature --all-targets {{ ci_flags }}
+    cargo hack nextest run -p {{ crate }} --each-feature --all-targets {{ nextest_flags }}
 
 # Tauri plugin: Rust tests (mock IPC, Node servers) and guest-js (typecheck, vitest, build, publint, attw)
 plugin: plugin-rust plugin-js
 
 # Tauri plugin: Rust tests and doctests (rustls, then native-tls); needs `just servers`
 plugin-rust:
-    cargo test -p {{ plugin }} --all-targets {{ ci_flags }}
+    cargo nextest run -p {{ plugin }} --all-targets {{ nextest_flags }}
     cargo test -p {{ plugin }} --doc {{ ci_flags }}
-    cargo test -p {{ plugin }} --no-default-features --features native-tls --all-targets {{ ci_flags }}
+    cargo nextest run -p {{ plugin }} --no-default-features --features native-tls --all-targets {{ nextest_flags }}
 
 # Tauri plugin: guest-js typecheck, vitest, build + publint/attw/dist smoke; needs pnpm
 plugin-js:
@@ -54,9 +56,10 @@ plugin-example: plugin-js
     cd {{ plugin_dir }}/examples/tauri-app && pnpm install --frozen-lockfile && pnpm build
     cd {{ plugin_dir }}/examples/tauri-app/src-tauri && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/../../../../../target}/example" cargo check
 
-# Tests that need no server: the codecs, backoff, redaction, error texts
+# Tests that need no server: the codec models, backoff, redaction, error texts
 test-offline:
-    cargo test -p {{ crate }} --lib {{ ci_flags }} -- protocol:: backoff:: redact:: util:: tls:: actor::tests
+    cargo nextest run -p {{ crate }} --all-features {{ nextest_flags }} -E 'test(/^model_/)'
+    cargo test -p {{ crate }} --lib {{ ci_flags }} -- protocol:: backoff:: redact:: util:: tls::
 
 # Install the Node test servers' packages and generate the test certificates
 servers-setup:
@@ -111,6 +114,18 @@ docs-dev:
 docs-build:
     cd docs && pnpm install --frozen-lockfile && NUXT_APP_BASE_URL="${NUXT_APP_BASE_URL:-/rust-socketio/}" pnpm generate
 
+# Load run against a plain socket.io 4.8 server (ci/load-server.js), then the in-process fake;
+# every reply is checked (`just servers-setup` first)
+load clients="50" events="200" transport="any":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p ci/logs
+    PORT=4220 node ci/load-server.js > ci/logs/load-server.log 2>&1 &
+    pid=$!; trap 'kill "${pid}" 2>/dev/null || true' EXIT
+    node ci/wait-ports.js 4220
+    cargo run -p examples --bin load {{ ci_flags }} -- http://127.0.0.1:4220 {{ clients }} {{ events }} {{ transport }}
+    cargo run -p examples --bin load {{ ci_flags }} -- fake {{ clients }} {{ events }} {{ transport }}
+
 # Run the examples against a local server (see examples/README)
 example name *args:
     cargo run -p examples --bin {{ name }} {{ ci_flags }} -- {{ args }}
@@ -123,27 +138,68 @@ trim:
 clean:
     cargo clean
 
-# cargo-release pre-release hook (after the version bump): checks, then
-# [Unreleased] -> [version] in CHANGELOG.md
-[private]
-release-hook version:
-    just fmt lint docs
-    just package --allow-dirty
-    @if [[ "${DRY_RUN:-false}" == "true" ]]; then echo "dry run: CHANGELOG.md unchanged"; else just _changelog {{ version }}; fi
+# Public API changes of the published crates vs crates.io match the version bump
+semver:
+    cargo semver-checks -p {{ crate }} --all-features
+    cargo semver-checks -p {{ plugin }}
 
-[private]
-_changelog version:
+# Run by the CI `release` job. Sets the version of both crates and of the npm package,
+# updates the lockfile and turns [Unreleased] into [X.Y.Z] in both CHANGELOG.md files.
+# Prepare release X.Y.Z
+release-prep version:
     #!/usr/bin/env python3
-    import datetime, re, sys
+    import datetime, json, re, subprocess, sys
     from pathlib import Path
-    path, version = Path("CHANGELOG.md"), "{{ version }}"
-    text = path.read_text()
-    if re.search(rf"^## \[{re.escape(version)}\]", text, re.M):
-        sys.exit(0)
-    m = re.search(r"^## \[Unreleased\][^\n]*\n", text, re.M)
-    rest = text[m.end():] if m else ""
-    nxt = re.search(r"^## \[", rest, re.M)
-    if not m or not rest[: nxt.start() if nxt else None].strip():
-        sys.exit("CHANGELOG.md: write the release notes under '## [Unreleased]' first")
-    path.write_text(text[: m.start()] + f"## [Unreleased]\n\n## [{version}] - {datetime.date.today()}\n" + rest)
-    print(f"CHANGELOG.md: [Unreleased] -> [{version}]")
+    version = "{{ version }}"
+    if not re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?", version):
+        sys.exit(f"'{version}' is not a version like 0.2.0")
+
+    def sub(path, pattern, repl, flags=re.M):
+        p = Path(path)
+        text, n = re.subn(pattern, repl, p.read_text(), count=1, flags=flags)
+        if n != 1:
+            sys.exit(f"{path}: no match for {pattern}")
+        p.write_text(text)
+
+    sub("Cargo.toml", r'(\[workspace\.package\][^\[]*?\nversion = )"[^"]+"', rf'\g<1>"{version}"', re.S)
+    sub("Cargo.toml", r'^(socketio-next = \{ path = "crates/socketio-next", version = )"[^"]+"', rf'\g<1>"{version}"')
+    sub("{{ plugin_dir }}/Cargo.toml", r'^version = "[^"]+"', f'version = "{version}"')
+    pkg = Path("{{ plugin_dir }}/package.json")
+    data = json.loads(pkg.read_text())
+    data["version"] = version
+    pkg.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+    today = datetime.date.today()
+    for path, required in [("CHANGELOG.md", True), ("{{ plugin_dir }}/CHANGELOG.md", False)]:
+        p = Path(path)
+        text = p.read_text()
+        if re.search(rf"^## \[{re.escape(version)}\]", text, re.M):
+            continue
+        m = re.search(r"^## \[Unreleased\][^\n]*\n", text, re.M)
+        if not m:
+            sys.exit(f"{path}: no '## [Unreleased]' section")
+        rest = text[m.end():]
+        nxt = re.search(r"^## \[", rest, re.M)
+        body = rest[: nxt.start() if nxt else None].strip()
+        if not body:
+            if required:
+                sys.exit(f"{path}: write the release notes under '## [Unreleased]' first")
+            body = f"### Changed\n\n- Built on socketio-next {version}."
+            rest = rest[nxt.start():] if nxt else ""
+            rest = f"\n{body}\n\n{rest}"
+        p.write_text(text[: m.start()] + f"## [Unreleased]\n\n## [{version}] - {today}\n" + rest)
+    subprocess.run(["cargo", "update", "--workspace"], check=True)
+    print(f"version {version}: Cargo.toml, {{ plugin_dir }}, Cargo.lock, CHANGELOG.md files")
+
+# `file`: CHANGELOG.md or the plugin's.
+# The changelog section of a released version (a GitHub release body)
+release-notes version file="CHANGELOG.md":
+    #!/usr/bin/env python3
+    import re, sys
+    from pathlib import Path
+    text, version = Path("{{ file }}").read_text(), "{{ version }}"
+    m = re.search(rf"^## \[{re.escape(version)}\][^\n]*\n", text, re.M)
+    if not m:
+        sys.exit(f"{{ file }} has no section for {version}")
+    nxt = re.search(r"^## \[", text[m.end():], re.M)
+    print(text[m.end(): m.end() + nxt.start() if nxt else None].strip())

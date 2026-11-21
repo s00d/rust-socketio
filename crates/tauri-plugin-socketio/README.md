@@ -1,9 +1,12 @@
-# tauri-plugin-socketio
+[![Crates.io](https://img.shields.io/crates/v/tauri-plugin-socketio?style=for-the-badge)](https://crates.io/crates/tauri-plugin-socketio)
+[![npm](https://img.shields.io/npm/v/tauri-plugin-socketio-api?style=for-the-badge)](https://www.npmjs.com/package/tauri-plugin-socketio-api)
+[![docs.rs](https://img.shields.io/badge/docs-docs.rs-blue?style=for-the-badge)](https://docs.rs/tauri-plugin-socketio)
+[![Guide](https://img.shields.io/badge/guide-s00d.github.io-blue?style=for-the-badge)](https://s00d.github.io/rust-socketio/tauri/setup)
+[![CI](https://img.shields.io/github/actions/workflow/status/s00d/rust-socketio/ci.yml?branch=main&label=CI&style=for-the-badge)](https://github.com/s00d/rust-socketio/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](https://github.com/s00d/rust-socketio/blob/main/LICENSE)
+[![Donate](https://img.shields.io/badge/Donate-Donationalerts-ff4081?style=for-the-badge)](https://www.donationalerts.com/r/s00d88)
 
-[![crates.io](https://img.shields.io/crates/v/tauri-plugin-socketio.svg)](https://crates.io/crates/tauri-plugin-socketio)
-[![npm](https://img.shields.io/npm/v/tauri-plugin-socketio-api.svg)](https://www.npmjs.com/package/tauri-plugin-socketio-api)
-[![docs.rs](https://docs.rs/tauri-plugin-socketio/badge.svg)](https://docs.rs/tauri-plugin-socketio)
-[![docs](https://img.shields.io/badge/docs-s00d.github.io%2Frust--socketio-0ea5e9)](https://s00d.github.io/rust-socketio/tauri/setup)
+# tauri-plugin-socketio
 
 A Tauri 2 plugin for Socket.IO v4 on top of [socketio-next](https://crates.io/crates/socketio-next):
 one registry of **named clients** that Rust and the webviews share. Rust connects clients or
@@ -70,6 +73,11 @@ io.insert("core", my_client, Access::ReadOnly)?; // the webview may watch, not e
 Before shipping, read the [security notes](https://s00d.github.io/rust-socketio/tauri/security):
 reserved ids, read-only clients, the URL allow-list (the CSP does not cover these sockets) and
 refused headers.
+
+## Support
+
+If the plugin helps you, you can support it via [DonationAlerts](https://www.donationalerts.com/r/s00d88).
+Bugs and ideas: [issues](https://github.com/s00d/rust-socketio/issues).
 
 ## License
 

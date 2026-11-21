@@ -95,15 +95,6 @@ impl Transport {
         }
     }
 
-    /// Replaces the transport URL.
-    pub async fn set_base_url(&self, url: Url) -> Result<()> {
-        match self {
-            Transport::Polling(t) => t.set_base_url(url).await,
-            Transport::Websocket(t) => t.set_base_url(url).await,
-        }
-    }
-
-    /// Polling or websocket.
     /// A websocket ping (its pong comes back as a noop packet); polling has none.
     pub(crate) async fn ws_ping(&self) -> Result<()> {
         match self {

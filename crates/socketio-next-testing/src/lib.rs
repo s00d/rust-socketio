@@ -1,9 +1,17 @@
-//! Test support for socketio-next (not published): the URLs of the Node test servers in `ci/`,
-//! the test CA, a TCP proxy that can cut connections, and the differential harness that runs a
-//! scenario with the Node client.
+//! Test support for socketio-next (not published): the test servers, the test CA, a TCP proxy
+//! that can cut connections, and the differential harness that runs a scenario with the Node
+//! client.
 //!
-//! Servers: `just servers` (ci/: ports 4200-4206; ci/conformance: 4210-4212). Every URL can
-//! be overridden with an environment variable of the same name in upper case.
+//! Servers:
+//! - in-process fakes (module `fake`) for the fixtures of `ci/*.js`: the socket.io
+//!   servers (`socket_io*_server`, `fast_ping_server`) and the engine.io ones
+//!   (`engine_io*_server`). They start on first use, no Node needed.
+//! - Node (`just servers`) for what only the reference server settles: the differential
+//!   tests, connection state recovery and cookies (ci/conformance: 4210-4213), and the TLS
+//!   server (ci/: 4202).
+//!
+//! Every URL can be overridden with an environment variable of the same name in upper case:
+//! `SOCKET_IO_SERVER=http://localhost:4200` runs the same tests against the Node server.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,8 +22,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
+mod fake;
+
 fn env_or(var: &str, default: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| default.to_owned())
+}
+
+/// The variable `var`, else the fake server's URL.
+fn env_or_fake(var: &str, fake: impl FnOnce(&fake::Urls) -> &String) -> String {
+    std::env::var(var).unwrap_or_else(|_| fake(fake::urls()).clone())
 }
 
 /// The repository root (two levels above this crate).
@@ -27,19 +42,40 @@ pub fn repo_root() -> PathBuf {
         .expect("crate lives in crates/<name>")
 }
 
-/// socket.io 4.x server with the event fixtures (`ci/socket-io.js`).
+/// socket.io server with the event fixtures of `ci/socket-io.js` (in-process fake; Node:
+/// `http://localhost:4200`).
 pub fn socket_io_server() -> String {
-    env_or("SOCKET_IO_SERVER", "http://localhost:4200")
+    env_or_fake("SOCKET_IO_SERVER", |u| &u.socket_io)
 }
 
-/// socket.io server that checks `auth.password` (`ci/socket-io-auth.js`).
+/// socket.io server that checks `auth.password`, `ci/socket-io-auth.js` (in-process fake;
+/// Node: `http://localhost:4204`).
 pub fn socket_io_auth_server() -> String {
-    env_or("SOCKET_IO_AUTH_SERVER", "http://localhost:4204")
+    env_or_fake("SOCKET_IO_AUTH_SERVER", |u| &u.socket_io_auth)
 }
 
-/// socket.io server that restarts on `restart_server` (`ci/socket-io-restart.js`).
+/// socket.io server that echoes the `message_back` header and restarts on `restart_server`,
+/// `ci/socket-io-restart.js` (in-process fake; Node: `http://localhost:4205`).
 pub fn socket_io_restart_server() -> String {
-    env_or("SOCKET_IO_RESTART_SERVER", "http://localhost:4205")
+    env_or_fake("SOCKET_IO_RESTART_SERVER", |u| &u.socket_io_restart)
+}
+
+/// A restart server of its own (no environment override): for a test that restarts it while
+/// other tests use `socket_io_restart_server`.
+pub fn new_socket_io_restart_server() -> String {
+    fake::new_restart_server()
+}
+
+/// engine.io server (path `/engine.io/`) that greets with `hello client` and answers
+/// `respond` / `close`, `ci/engine-io.js` (in-process fake; Node: `http://localhost:4201`).
+pub fn engine_io_server() -> String {
+    env_or_fake("ENGINE_IO_SERVER", |u| &u.engine_io)
+}
+
+/// The same, polling only, without upgrades, `ci/engine-io-polling.js` (in-process fake;
+/// Node: `http://localhost:4203`).
+pub fn engine_io_polling_server() -> String {
+    env_or_fake("ENGINE_IO_POLLING_SERVER", |u| &u.engine_io_polling)
 }
 
 /// socket.io 4.8 conformance server (`ci/conformance/server.js`).
@@ -52,9 +88,10 @@ pub fn recovery_server() -> String {
     env_or("RECOVERY_SERVER", "http://localhost:4211")
 }
 
-/// socket.io 4.8 server with a 300 ms / 200 ms heartbeat (`ci/conformance/server.js`).
+/// socket.io server with a 300 ms / 200 ms heartbeat and the fixtures of `ci/socket-io.js`
+/// (in-process fake; Node: `http://localhost:4212`, the conformance events).
 pub fn fast_ping_server() -> String {
-    env_or("FAST_PING_SERVER", "http://localhost:4212")
+    env_or_fake("FAST_PING_SERVER", |u| &u.fast_ping)
 }
 
 /// The test CA (`ci/cert/ca.crt`, `CA_CERT_PATH` overrides).

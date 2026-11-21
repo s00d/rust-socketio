@@ -1,13 +1,11 @@
-//! Differential tests: the same scenario with socket.io-client 4.8 (Node, `ci/conformance/
+//! Corpus: differential tests: the same scenario with socket.io-client 4.8 (Node, `ci/conformance/
 //! client.js`) and with this client against one recording socket.io 4.8 server
 //! (`ci/conformance/server.js`); the engine.io message packets the server saw must be equal.
 //! Pings, pongs, noops and upgrades are left out of the logs (timing, not client logic).
 
-mod common;
-
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use common::*;
+use crate::common::*;
 use serde_json::{Value, json};
 use socketio_next::{Client, ClientBuilder, Event, Payload, TransportType};
 
@@ -72,20 +70,12 @@ async fn compare(scenario: &str, rust_tag: &str, polling: bool) {
 
 #[tokio::test]
 async fn basic_matches_socket_io_client() {
-    tokio::time::timeout(std::time::Duration::from_secs(90), async move {
-        basic(false).await;
-    })
-    .await
-    .expect("test `basic_matches_socket_io_client` timed out")
+    basic(false).await;
 }
 
 #[tokio::test]
 async fn basic_over_polling_matches_socket_io_client() {
-    tokio::time::timeout(std::time::Duration::from_secs(90), async move {
-        basic(true).await;
-    })
-    .await
-    .expect("test `basic_over_polling_matches_socket_io_client` timed out")
+    basic(true).await;
 }
 
 async fn basic(polling: bool) {
@@ -131,20 +121,12 @@ async fn basic(polling: bool) {
 
 #[tokio::test]
 async fn received_shapes_match_socket_io_client() {
-    tokio::time::timeout(std::time::Duration::from_secs(90), async move {
-        shapes(false).await;
-    })
-    .await
-    .expect("test `received_shapes_match_socket_io_client` timed out")
+    shapes(false).await;
 }
 
 #[tokio::test]
 async fn received_shapes_over_polling_match_socket_io_client() {
-    tokio::time::timeout(std::time::Duration::from_secs(90), async move {
-        shapes(true).await;
-    })
-    .await
-    .expect("test `received_shapes_over_polling_match_socket_io_client` timed out")
+    shapes(true).await;
 }
 
 async fn shapes(polling: bool) {
@@ -171,7 +153,6 @@ async fn shapes(polling: bool) {
 /// the session; `recovered` is true and the id stays.
 #[tokio::test]
 async fn connection_state_recovery() {
-    tokio::time::timeout(std::time::Duration::from_secs(90), async move {
     let (b, mut events) = collect(
         ClientBuilder::new(recovery_server()).reconnection_delay(Duration::from_millis(50)),
     );
@@ -192,7 +173,4 @@ async fn connection_state_recovery() {
     );
     assert!(client.recovered());
     client.disconnect().await.unwrap();
-})
-    .await
-    .expect("test `connection_state_recovery` timed out")
 }

@@ -49,7 +49,7 @@
     "check:dist": "publint --strict && attw --pack . --profile node16 && node scripts/check-dist.mjs"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.0.0"
+    "@tauri-apps/api": "^2.12.3"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.5",

@@ -16,6 +16,7 @@ use crate::engineio::transports::{PollingTransport, WebsocketTransport};
 use crate::engineio::{
     Client, DEFAULT_TIMEOUT, ENGINE_IO_VERSION, Error, HandshakePacket, Packet, PacketId,
 };
+use crate::protocol::engineio::Batch;
 
 /// Configures and opens an engine.io [`Client`].
 ///
@@ -27,6 +28,9 @@ pub struct ClientBuilder {
     headers: Option<HeaderMap>,
     timeout: Duration,
     handshake: Option<HandshakePacket>,
+    /// Packets the handshake response carried after the open packet (python-engineio sends
+    /// what the server's connect handler emitted in the same body).
+    pending: Vec<Packet>,
     callbacks: Callbacks,
     /// Shared by every transport this builder opens (built on first use).
     http: Option<Http>,
@@ -54,11 +58,23 @@ impl std::fmt::Debug for ClientBuilder {
     }
 }
 
+/// Query keys engine.io itself sets.
+const RESERVED_QUERY: [&str; 5] = ["EIO", "transport", "sid", "t", "b64"];
+
 impl ClientBuilder {
     /// A builder for `url`. `EIO=4` is added to the query; an empty path becomes `/engine.io/`.
+    /// The engine.io parameters (`EIO`, `transport`, `sid`, `t`, `b64`) are the client's own: a
+    /// caller's values for them are dropped, as engine.io-client overrides them.
     pub fn new(url: Url) -> Self {
         let mut url = url;
+        let user: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| !RESERVED_QUERY.contains(&k.as_ref()))
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        url.set_query(None);
         url.query_pairs_mut()
+            .extend_pairs(user)
             .append_pair("EIO", &ENGINE_IO_VERSION.to_string());
         if url.path() == "/" {
             url.set_path("/engine.io/");
@@ -69,6 +85,7 @@ impl ClientBuilder {
             tls_config: None,
             timeout: DEFAULT_TIMEOUT,
             handshake: None,
+            pending: Vec::new(),
             callbacks: Callbacks::default(),
             http: None,
         }
@@ -173,7 +190,11 @@ impl ClientBuilder {
             Error::InvalidHandshake("the connection closed before the open packet".into())
         })??;
         let handshake = match first.into() {
-            Frame::Text(bytes) => parse_handshake(bytes)?,
+            Frame::Text(bytes) => {
+                let (handshake, pending) = parse_handshake(bytes)?;
+                self.pending = pending;
+                handshake
+            }
             Frame::Binary(_) => {
                 return Err(Error::InvalidHandshake(
                     "binary frame instead of the open packet".into(),
@@ -210,14 +231,20 @@ impl ClientBuilder {
         self.handshake_with_transport(&mut transport).await
     }
 
-    /// Polling handshake, then a websocket upgrade when the server offers one.
+    /// Polling handshake, then a websocket upgrade when the server offers one; when the upgrade
+    /// fails (a proxy that drops `Upgrade:`), the session stays on polling, like
+    /// engine.io-client.
     pub async fn build(mut self) -> Result<Client> {
         self.handshake().await?;
         if self.websocket_upgrade() {
-            self.build_websocket_with_upgrade().await
-        } else {
-            self.build_polling().await
+            match self.clone().build_websocket_with_upgrade().await {
+                Ok(client) => return Ok(client),
+                Err(err) => {
+                    tracing::debug!(error = %err, "websocket upgrade failed, staying on polling");
+                }
+            }
         }
+        self.build_polling().await
     }
 
     /// Polling only.
@@ -247,6 +274,7 @@ impl ClientBuilder {
             transport.into(),
             handshake,
             self.callbacks,
+            self.pending,
         )))
     }
 
@@ -290,6 +318,7 @@ impl ClientBuilder {
                 transport.into(),
                 handshake,
                 self.callbacks,
+                self.pending,
             )))
         };
         tokio::time::timeout(timeout, connect)
@@ -325,9 +354,14 @@ impl ClientBuilder {
     }
 }
 
-/// The open packet: `0{"sid":..}`. Anything else (an Engine.IO v3 `96:0{..}` length-prefixed
-/// payload, a proxy error page) is an invalid handshake with a hint.
-fn parse_handshake(bytes: Bytes) -> Result<HandshakePacket> {
+/// The open packet: `0{"sid":..}`, and the packets a polling handshake body carried after it
+/// (decoded as a payload, as engine.io-client does). Anything else (an Engine.IO v3
+/// `96:0{..}` length-prefixed payload, a proxy error page) is an invalid handshake with a hint.
+fn parse_handshake(body: Bytes) -> Result<(HandshakePacket, Vec<Packet>)> {
+    let (bytes, rest) = match body.iter().position(|&b| b == Batch::SEPARATOR as u8) {
+        Some(at) => (body.slice(..at), Some(body.slice(at + 1..))),
+        None => (body.clone(), None),
+    };
     let hint = || {
         let head = String::from_utf8_lossy(&bytes[..bytes.len().min(32)]).into_owned();
         let v3 = head
@@ -345,7 +379,13 @@ fn parse_handshake(bytes: Bytes) -> Result<HandshakePacket> {
     if packet.packet_id != PacketId::Open {
         return Err(Error::InvalidHandshake(hint()));
     }
-    HandshakePacket::try_from(packet).map_err(|e| Error::InvalidHandshake(e.to_string()))
+    let handshake =
+        HandshakePacket::try_from(packet).map_err(|e| Error::InvalidHandshake(e.to_string()))?;
+    let pending = match rest {
+        Some(rest) => Batch::try_from(rest)?.into_iter().collect(),
+        None => Vec::new(),
+    };
+    Ok((handshake, pending))
 }
 
 #[cfg(test)]
@@ -362,6 +402,23 @@ mod tests {
             b"0{\"sid\":\"a\",\"upgrades\":[\"websocket\"],\"pingInterval\":25000,\"pingTimeout\":20000,\"maxPayload\":1000000}",
         ))
         .unwrap();
-        assert_eq!((ok.sid.as_str(), ok.max_payload), ("a", Some(1_000_000)));
+        assert_eq!(
+            (ok.0.sid.as_str(), ok.0.max_payload),
+            ("a", Some(1_000_000))
+        );
+        assert!(ok.1.is_empty());
+        // python-engineio: what the connect handler sent comes in the handshake body
+        let (open, rest) = parse_handshake(Bytes::from_static(
+            b"0{\"sid\":\"a\",\"upgrades\":[],\"pingInterval\":25000,\"pingTimeout\":20000}\x1e4hello\x1ebAQI=",
+        ))
+        .unwrap();
+        assert_eq!(open.sid, "a");
+        assert_eq!(
+            rest,
+            [
+                Packet::new(PacketId::Message, Bytes::from_static(b"hello")),
+                Packet::new(PacketId::MessageBinary, Bytes::from_static(&[1, 2])),
+            ]
+        );
     }
 }

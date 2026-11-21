@@ -1,12 +1,10 @@
-//! The blocking client against the ci/ servers (feature `blocking`).
-#![cfg(feature = "blocking")]
-
-mod common;
+//! Stories: the blocking client (feature `blocking`): connect, emit with an ack, handlers on
+//! blocking threads, disconnect.
 
 use std::sync::mpsc;
 use std::time::Duration;
 
-use common::*;
+use crate::common::*;
 use serde_json::json;
 use socketio_next::blocking::{Client, ClientBuilder};
 use socketio_next::{ConnectionState, DisconnectReason, Error, Event, Payload};

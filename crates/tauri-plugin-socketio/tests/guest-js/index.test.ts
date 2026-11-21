@@ -14,11 +14,24 @@ const connected = { status: 'connected', sid: 's0', recovered: false } as const
 let calls: Call[]
 let replies: Record<string, (args: Record<string, unknown>) => unknown>
 
-/** Delivers `message` the way Rust does: through the channel callback, with its index. */
-function send(channel: Channel<Message>, message: Message, index: number): void {
+const nextIndex = new WeakMap<Channel<Message>, number>()
+
+/** Delivers `message` the way Rust does: through the channel callback, with the channel's
+ * next index (Tauri's `Channel` delivers in index order). */
+function send(channel: Channel<Message>, message: Message, _index?: number): void {
+  const index = nextIndex.get(channel) ?? 0
+  nextIndex.set(channel, index + 1)
   const internals = (window as unknown as { __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void } })
     .__TAURI_INTERNALS__
   internals.runCallback(channel.id, { message, index })
+}
+
+/** Rust starts every subscription with a snapshot of the current state. */
+function subscribed(state: Message & { type: 'state' } extends never ? never : any, subscription: number) {
+  return (args: Record<string, unknown>) => {
+    send(args.channel as Channel<Message>, { type: 'state', state, snapshot: true })
+    return { subscription, state }
+  }
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 0))
@@ -31,8 +44,8 @@ function lastChannel(): Channel<Message> {
 beforeEach(() => {
   calls = []
   replies = {
-    'plugin:socketio|connect': () => ({ subscription: 7, state: connected }),
-    'plugin:socketio|subscribe': () => ({ subscription: 9, state: connected }),
+    'plugin:socketio|connect': subscribed(connected, 7),
+    'plugin:socketio|subscribe': subscribed(connected, 9),
     'plugin:socketio|unsubscribe': () => true
   }
   mockIPC((cmd, args) => {
@@ -151,7 +164,7 @@ describe('Socket', () => {
   })
 
   it('attach resolves with the current state', async () => {
-    replies['plugin:socketio|subscribe'] = () => ({ subscription: 3, state: { status: 'reconnecting', attempt: 2, delay: 100 } })
+    replies['plugin:socketio|subscribe'] = subscribed({ status: 'reconnecting', attempt: 2, delay: 100 }, 3)
     const socket = await attach('core')
     expect(socket.lastState).toEqual({ status: 'reconnecting', attempt: 2, delay: 100 })
     expect(socket.connected).toBe(false)
@@ -277,8 +290,115 @@ describe('Socket', () => {
     expect(on).not.toHaveBeenCalled()
 
     const own = await connect('own', { url: 'http://x' })
+    await tick()
+    const reasons: unknown[] = []
+    own.on('disconnect', (reason) => reasons.push(reason))
     await own.disconnect()
     expect(calls.at(-1)).toEqual({ cmd: 'plugin:socketio|disconnect', args: { id: 'own' } })
+    // the outcome is known here even when the final state message is still on its way
+    expect(own.lastState).toEqual({ status: 'closed', reason: 'io client disconnect' })
+    expect(own.connected).toBe(false)
+    expect(reasons).toEqual(['io client disconnect'])
+  })
+
+  it('waits for the snapshot when it arrives after the call resolved', async () => {
+    let channel: Channel<Message> | undefined
+    replies['plugin:socketio|connect'] = (args) => {
+      channel = args.channel as Channel<Message>
+      send(channel, { type: 'state', state: { status: 'connecting', attempt: 0 } })
+      send(channel, { type: 'state', state: connected })
+      return { subscription: 1, state: connected }
+    }
+    const socket = await connect('late', { url: 'http://x' })
+    const states: string[] = []
+    socket.onState((st) => states.push(st.status))
+    const seen = vi.fn()
+    socket.on('big', seen)
+    await tick()
+    // a large event (sent by fetch) and then the snapshot arrive only now
+    send(channel!, { type: 'event', event: 'big', args: ['x'.repeat(10_000)] })
+    expect(seen).not.toHaveBeenCalled()
+    send(channel!, { type: 'state', state: connected, snapshot: true })
+    await tick()
+    expect(states).toEqual(['connected'])
+    expect(seen).toHaveBeenCalledTimes(1)
+  })
+
+  it('a throwing listener stops neither the others nor later messages', async () => {
+    // the error is rethrown on its own microtask: capture it instead of failing the run
+    const rethrown: unknown[] = []
+    const spy = vi.spyOn(globalThis, 'queueMicrotask').mockImplementation((fn) => rethrown.push(fn))
+    try {
+      const socket = await connect('throw', { url: 'http://x' })
+      const channel = lastChannel()
+      await tick()
+      const after = vi.fn()
+      socket.on('e', () => {
+        throw new Error('handler bug')
+      })
+      socket.on('e', after)
+      send(channel, { type: 'event', event: 'e', args: [1] })
+      send(channel, { type: 'event', event: 'e', args: [2] })
+      expect(after.mock.calls).toEqual([[1], [2]])
+      expect(rethrown).toHaveLength(2)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('off removes a once listener; connect / disconnect / connect_error come from states', async () => {
+    const socket = await connect('o', { url: 'http://x' })
+    const channel = lastChannel()
+    await tick()
+    const h = vi.fn()
+    socket.once('x', h).off('x', h)
+    send(channel, { type: 'event', event: 'x', args: [] })
+    expect(h).not.toHaveBeenCalled()
+
+    const events: unknown[] = []
+    socket.on('connect', () => events.push('connect'))
+    socket.on('disconnect', (reason) => events.push(['disconnect', reason]))
+    socket.on('connect_error', (e) => events.push(['connect_error', e.kind]))
+    send(channel, { type: 'state', state: { status: 'disconnected', reason: 'transport close' } })
+    send(channel, {
+      type: 'state',
+      state: { status: 'reconnecting', attempt: 1, delay: 10, error: { kind: 'Engine', message: 'refused' } }
+    })
+    send(channel, { type: 'state', state: { status: 'connected', sid: 's2', recovered: false } })
+    expect(events).toEqual([['disconnect', 'transport close'], ['connect_error', 'Engine'], 'connect'])
+  })
+
+  it('reads Blobs, encodes typed array views at their offset, refuses a raw Blob', async () => {
+    const socket = await connect('b', { url: 'http://x' })
+    const view = new Int16Array([1, 2, 3]).subarray(1)
+    await socket.emit('up', new Blob([new Uint8Array([7, 8])]), { v: view })
+    const emit = calls.find((c) => c.cmd === 'plugin:socketio|emit')!
+    const bytes = Array.from(new Uint8Array(view.buffer, view.byteOffset, view.byteLength))
+    expect(emit.args.args).toEqual({
+      args: [{ _placeholder: true, num: 0 }, { v: { _placeholder: true, num: 1 } }],
+      binary: [[7, 8], bytes]
+    })
+    expect(() => encodeArgs([new Blob([])])).toThrow(SocketIoError)
+  })
+
+  it('a failed ack answer is logged, not an unhandled rejection', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    replies['plugin:socketio|ack'] = () => {
+      throw { kind: 'UnknownAck', message: 'gone' }
+    }
+    const socket = await connect('ack', { url: 'http://x' })
+    const channel = lastChannel()
+    await tick()
+    let cb: ((...a: unknown[]) => Promise<void>) | undefined
+    socket.on('q', (respond) => (cb = respond))
+    send(channel, { type: 'event', event: 'q', args: [], ackId: 5 })
+    await expect(cb!('late')).resolves.toBeUndefined()
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
+  })
+
+  it('transports: [] is refused', async () => {
+    await expect(connect('t', { url: 'http://x', transports: [] })).rejects.toMatchObject({ kind: 'InvalidOptions' })
   })
 })
 

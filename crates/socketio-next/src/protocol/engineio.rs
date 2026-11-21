@@ -169,7 +169,7 @@ pub struct Batch(pub Vec<Packet>);
 
 impl Batch {
     // see https://en.wikipedia.org/wiki/Delimiter#ASCII_delimited_text
-    const SEPARATOR: char = '\x1e';
+    pub(crate) const SEPARATOR: char = '\x1e';
 
     /// Number of packets.
     pub fn len(&self) -> usize {

@@ -7,10 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `engineio::Transport::set_base_url` (and the transports' own) is removed: on polling it moved
+  the POSTs but not the long-poll GETs, on websocket it changed nothing. The transport URL is
+  fixed at construction.
+
+### Added
+
+- `WeakClient` (`Client::downgrade`): a handle that does not keep the connection open, for
+  handlers and other things the client owns (a handler holding a `Client` kept it alive forever).
+- The blocking API has the async client's `proxy`, `no_proxy`, `connect_params_with`,
+  `engine_url`, `on_any`, `on_state_change`, `off_any` and `recovered`.
+
 ### Changed
 
+- One connection task owns the client's whole life across `reconnect()`: one command channel
+  and one event task for the client's lifetime. `reconnect()` and `disconnect()` take effect in
+  the order they are called; `connected()`, `id()` and the emit checks follow the published
+  state, and a loss is published before the (bounded) engine teardown.
+- `disconnect()` from a handler: the `Closed` state still reaches `on_state_change` (it was
+  dropped), events received after it start no handler. "Inside a handler" is per client: a
+  handler of client A that disconnects client B waits for B's handlers as from outside.
+- engine.io callbacks (`on_open`, `on_data`, `on_packet`, `on_error`, `on_close`) run one at a
+  time in the order of the events (they were each a task of their own).
+- A polling handshake body with packets after the open packet (python-engineio sends what the
+  connect handler emitted) is accepted; those packets come first on the stream.
 - Documentation site at <https://s00d.github.io/rust-socketio/>; the README is short and links
   to it.
+- Polling POSTs are bounded like the long-poll GET (pingInterval + pingTimeout): a POST stuck
+  on a half-open connection no longer holds `emit` and `disconnect` until the kernel gives up.
+  `PollingTransport::new` bounds both by 60 s.
+- `engineio::ClientBuilder::build` stays on polling when the websocket upgrade fails (a proxy
+  that drops `Upgrade:`), like engine.io-client.
+- The engine.io query parameters (`EIO`, `transport`, `sid`, `t`, `b64`) are the client's own:
+  a caller's values for them (`query(..)`, `connect_params_with`, the URL) are dropped.
+- The `wss` connection offers only HTTP/1.1 in ALPN, also with a `TlsConfig` shared with an
+  HTTP/2 client.
+
+### Fixed
+
+- A panic in the synchronous part of an async handler (the closure body before its future)
+  stopped the event task for good; it is contained like a panic inside the future.
+- A panic in the synchronous part of `auth_with` / `connect_params_with` ended the connection
+  task instead of failing the attempt. In the blocking API a panicking `auth_with` became a
+  misleading `InvalidAuth("must be a JSON object")`; it is "the auth_with function panicked".
+- `AckSender::send` with a payload that cannot be encoded counted the ack as sent; a valid
+  retry sent nothing.
+- `reconnect()` left the old event task running when a handler was stuck past the drain bound:
+  two event tasks broke the in-order guarantee. It is stopped like `disconnect()` does.
+- `redact_query(false)` showed `user:password@` of the URL in the logs; it is masked always.
+- engine.io: a transport that failed or ended (a websocket closed without a close packet,
+  `Session ID unknown` after a server restart) left the session marked open; `on_close` fires
+  once for any way the session ends.
+- engine.io: a ping answered after `disconnect()` no longer reports an error.
+
+### Testing
+
+- `socketio-next-testing::fake`: in-process Engine.IO v4 / Socket.IO v4 servers with the
+  fixtures of `ci/*.js`, written from the protocol. Most tests need no Node any more; Node stays
+  for the differential tests, connection state recovery, cookies and TLS.
+- CI on Linux, macOS and Windows for every push and pull request; Rust 1.100. Releases run from
+  the CI workflow with crates.io trusted publishing (`PUBLISHING.md`).
 
 ## [0.1.0] - 2026-11-08
 

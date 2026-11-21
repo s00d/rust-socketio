@@ -6,7 +6,6 @@ use reqwest::RequestBuilder;
 use std::fmt::Debug;
 use std::time::Duration;
 use std::{pin::Pin, sync::Arc};
-use tokio::sync::RwLock;
 use url::Url;
 
 use crate::engineio::generator::StreamGenerator;
@@ -23,7 +22,10 @@ const MAX_BODY: usize = 64 << 20;
 pub struct PollingTransport {
     http: Http,
     headers: HeaderMap,
-    base_url: Arc<RwLock<Url>>,
+    base_url: Arc<Url>,
+    /// Bound of every request (pingInterval + pingTimeout): a request still open after it
+    /// belongs to a dead connection, since the server has dropped the session by then.
+    timeout: Option<Duration>,
     generator: StreamGenerator<Bytes>,
 }
 
@@ -34,12 +36,20 @@ impl PollingTransport {
         opening_headers: Option<HeaderMap>,
     ) -> Result<Self> {
         let http = Http::new(tls_config.as_ref(), crate::engineio::http::ProxyMode::Env)?;
-        Self::with_client(base_url, &http, opening_headers.unwrap_or_default(), None)
+        // engine.io's default heartbeat (25 s + 20 s) with slack; the builder uses the
+        // server's own numbers
+        let timeout = Some(Duration::from_secs(60));
+        Self::with_client(
+            base_url,
+            &http,
+            opening_headers.unwrap_or_default(),
+            timeout,
+        )
     }
 
-    /// A transport on the shared `http` client. Each long-poll GET fails after
-    /// `poll_timeout`, so a silent peer or a half-open connection cannot hang it forever;
-    /// POSTs have no total bound (a large upload may take longer than a heartbeat).
+    /// A transport on the shared `http` client. Each request (long-poll GET and POST) fails
+    /// after `poll_timeout`, so a silent peer or a half-open connection cannot hang it (or the
+    /// writer lock a stuck POST holds) forever.
     pub(crate) fn with_client(
         base_url: Url,
         http: &Http,
@@ -57,7 +67,8 @@ impl PollingTransport {
         Ok(PollingTransport {
             http: http.clone(),
             headers,
-            base_url: Arc::new(RwLock::new(url.clone())),
+            base_url: Arc::new(url.clone()),
+            timeout: poll_timeout,
             generator: StreamGenerator::new(Self::stream(url, get)),
         })
     }
@@ -92,7 +103,11 @@ impl PollingTransport {
 
     fn post(&self, url: Url, body: Bytes) -> RequestBuilder {
         let headers = self.http.with_cookies(&self.headers, &url);
-        self.http.client.post(url).headers(headers).body(body)
+        let request = self.http.client.post(url).headers(headers).body(body);
+        match self.timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
     }
 
     pub(crate) async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
@@ -116,19 +131,7 @@ impl PollingTransport {
     }
 
     pub async fn base_url(&self) -> Result<Url> {
-        Ok(self.base_url.read().await.clone())
-    }
-
-    pub async fn set_base_url(&self, base_url: Url) -> Result<()> {
-        let mut url = base_url;
-        if !url
-            .query_pairs()
-            .any(|(k, v)| k == "transport" && v == "polling")
-        {
-            url.query_pairs_mut().append_pair("transport", "polling");
-        }
-        *self.base_url.write().await = url;
-        Ok(())
+        Ok(Url::clone(&self.base_url))
     }
 }
 
@@ -188,10 +191,7 @@ impl Stream for PollingTransport {
 impl Debug for PollingTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The URL carries query tokens and the client its default headers: neither is printed.
-        let url = self.base_url.try_read().map_or_else(
-            |_| "<busy>".to_owned(),
-            |url| crate::redact::url(&url, true),
-        );
+        let url = crate::redact::url(&self.base_url, true);
         f.debug_struct("PollingTransport")
             .field("base_url", &url)
             .finish()
@@ -212,32 +212,15 @@ mod test {
                 transport.base_url().await?.to_string(),
                 url.clone() + "?transport=polling"
             );
-            transport
-                .set_base_url(Url::parse("https://127.0.0.1")?)
-                .await?;
-            assert_eq!(
-                transport.base_url().await?.to_string(),
-                "https://127.0.0.1/?transport=polling"
-            );
-            assert_ne!(transport.base_url().await?.to_string(), url);
-
-            transport
-                .set_base_url(Url::parse("http://127.0.0.1/?transport=polling")?)
-                .await?;
-            assert_eq!(
-                transport.base_url().await?.to_string(),
-                "http://127.0.0.1/?transport=polling"
-            );
-            assert_ne!(transport.base_url().await?.to_string(), url);
             Ok(())
         })
         .await
         .expect("test `polling_transport_base_url` timed out")
     }
 
-    /// Only the long-poll GET is bounded by the heartbeat; a POST (an upload) is not.
+    /// The long-poll GET and the POST are both bounded by the heartbeat.
     #[test]
-    fn only_the_long_poll_has_a_total_timeout() {
+    fn every_request_has_a_total_timeout() {
         let http = Http::new(None, crate::engineio::http::ProxyMode::Env).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-token", "t".parse().unwrap());
@@ -260,7 +243,7 @@ mod test {
             .post(url, Bytes::from_static(b"x"))
             .build()
             .unwrap();
-        assert_eq!(post.timeout(), None);
+        assert_eq!(post.timeout(), Some(&timeout));
         assert_eq!(post.headers()["x-token"], "t");
     }
 

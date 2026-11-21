@@ -51,16 +51,31 @@ pub(crate) struct ConnectOptions {
     pub auth: Option<Value>,
     #[serde(default)]
     pub transports: Transports,
+    #[serde(default, deserialize_with = "opt_millis")]
     pub timeout: Option<u64>,
     pub reconnection: Option<bool>,
     pub reconnection_attempts: Option<u32>,
+    #[serde(default, deserialize_with = "opt_millis")]
     pub reconnection_delay: Option<u64>,
+    #[serde(default, deserialize_with = "opt_millis")]
     pub reconnection_delay_max: Option<u64>,
     pub randomization_factor: Option<f64>,
     pub reconnect_on_disconnect: Option<bool>,
     pub buffer_while_disconnected: Option<bool>,
     /// PEM certificates to trust instead of the default roots (a private CA).
     pub ca: Option<String>,
+}
+
+/// A duration option in ms, read like `emitWithAck`'s timeout: any finite number ≥ 0 (a
+/// fraction is cut); absent or `null` (what `Infinity` becomes in JSON) is the default.
+fn opt_millis<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    match Option::<f64>::deserialize(d)? {
+        None => Ok(None),
+        Some(v) if v.is_finite() && v >= 0.0 => Ok(Some(v as u64)),
+        Some(_) => Err(serde::de::Error::custom(
+            "expected a finite number of milliseconds >= 0",
+        )),
+    }
 }
 
 /// Query, header and auth values are secrets as often as not: only their keys are shown.
@@ -185,7 +200,8 @@ impl ConnectOptions {
 }
 
 /// Headers a webview may not set: they belong to the HTTP / websocket machinery or to the
-/// proxy, and cookies come from the jar. Rust's own clients are not limited.
+/// proxy, cookies come from the jar, and the origin / forwarding headers would let a page
+/// pose as another origin or client address to the server. Rust's own clients are not limited.
 const FORBIDDEN_HEADERS: &[&str] = &[
     "host",
     "connection",
@@ -193,6 +209,9 @@ const FORBIDDEN_HEADERS: &[&str] = &[
     "content-length",
     "transfer-encoding",
     "cookie",
+    "origin",
+    "forwarded",
+    "x-real-ip",
 ];
 
 /// `InvalidOptions` naming the first forbidden header (never its value).
@@ -202,6 +221,7 @@ pub(crate) fn check_headers(headers: &BTreeMap<String, String>) -> crate::Result
         if FORBIDDEN_HEADERS.contains(&lower.as_str())
             || lower.starts_with("sec-websocket-")
             || lower.starts_with("proxy-")
+            || lower.starts_with("x-forwarded-")
         {
             return Err(crate::Error::InvalidOptions(format!(
                 "the header `{name}` may not be set from the webview"
@@ -568,8 +588,13 @@ mod tests {
         let crate::Error::InvalidOptions(text) = &err else {
             panic!("{err:?}")
         };
-        assert!(!text.contains("s3cr3t") && text.contains("u64"), "{text}");
-        assert!(ConnectOptions::parse(json!({ "url": "http://x", "timeout": 1.5 })).is_err());
+        assert!(!text.contains("s3cr3t") && text.contains("f64"), "{text}");
+        // like emitWithAck's timeout: a fraction is cut, a negative is refused
+        let opts = ConnectOptions::parse(json!({ "url": "http://x", "timeout": 1.5 })).unwrap();
+        assert_eq!(opts.timeout, Some(1));
+        assert!(
+            ConnectOptions::parse(json!({ "url": "http://x", "reconnectionDelay": -1 })).is_err()
+        );
         let opts = ConnectOptions::parse(json!({
             "url": "http://x?token=q", "auth": { "token": "a" }, "query": { "k": "qv" }, "headers": { "h": "hv" }
         }))
@@ -588,6 +613,10 @@ mod tests {
             "Sec-WebSocket-Key",
             "Proxy-Authorization",
             "Upgrade",
+            "Origin",
+            "Forwarded",
+            "X-Forwarded-For",
+            "X-Real-IP",
         ] {
             let err =
                 ConnectOptions::parse(json!({ "url": "http://x", "headers": { name: "s3cr3t" } }))
