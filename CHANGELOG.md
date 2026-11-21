@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `socketio-next-testing` is published: in-process Socket.IO v4 / Engine.IO v4 servers for
+  testing socket.io clients, now programmable (`fake::Server::builder()`, namespaces with
+  `on_connect` / `on` / `on_any` handlers acting through a `Socket`: emit, acks both ways,
+  binary, delayed work, raw packets, namespace and transport disconnects, restarts, broadcasts
+  from the handle), plus the ready-made servers socketio-next's tests use and the TCP / HTTP
+  fault-injecting proxies. What needs this repository's `ci/` (the test CA, the Node
+  conformance harness) is behind the feature `repo`.
+
 ## [0.2.0] - 2026-11-21
 
 ### Breaking changes

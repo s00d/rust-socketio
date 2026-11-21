@@ -1,40 +1,16 @@
-//! The socket.io v4 app: packet codec, namespaces, acks, binary attachments, and the fixtures of
-//! `ci/socket-io.js`, `ci/socket-io-auth.js` and `ci/socket-io-restart.js`.
+//! The socket.io v4 app: packet codec, namespaces, acks, binary attachments, and the public
+//! types handlers work with ([`Namespace`], [`Socket`], [`Event`], [`Data`], [`Connect`]).
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{Value, json};
 
-use super::engine::{Action, Ctx, Message};
-
-/// Which `ci/` server the app behaves like.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Fixture {
-    /// `ci/socket-io.js`
-    Main,
-    /// `ci/socket-io-auth.js`
-    Auth,
-    /// `ci/socket-io-restart.js`
-    Restart,
-}
-
-/// Delayed work, fed back by the session.
-#[derive(Debug)]
-pub(super) enum Timer {
-    /// The `/slow` namespace middleware passes.
-    Accept { ns: String },
-    /// The `/reject` namespace middleware fails.
-    Reject { ns: String },
-    /// `ack_late` answers.
-    AckLate { ns: String, id: u64 },
-}
-
-/// The middleware delay of `/slow` and `/reject`.
-const MIDDLEWARE_DELAY: Duration = Duration::from_millis(200);
-const ACK_LATE_DELAY: Duration = Duration::from_millis(500);
+use super::engine::{Action, Ctx, Handshake, Message};
 
 const CONNECT: u8 = 0;
 const DISCONNECT: u8 = 1;
@@ -44,80 +20,121 @@ const CONNECT_ERROR: u8 = 4;
 const BINARY_EVENT: u8 = 5;
 const BINARY_ACK: u8 = 6;
 
-/// Arguments: JSON values where binary stands as a reference into `pool`.
-///
-/// Received placeholders are resolved into references (checked against the attachments, as
-/// socket.io-parser's `reconstructPacket` does); sent packets are deconstructed again with
-/// their own depth-first numbering. So the client's numbering is never echoed back as is, and
-/// attachments no value refers to are not sent.
-#[derive(Debug, Clone, Default)]
-struct Args {
-    values: Vec<Value>,
-    pool: Vec<Bytes>,
+/// Event names socket.io-parser refuses (`RESERVED_EVENTS`).
+const RESERVED: &[&str] = &[
+    "connect",
+    "connect_error",
+    "disconnect",
+    "disconnecting",
+    "newListener",
+    "removeListener",
+];
+
+fn placeholder(num: usize) -> Value {
+    json!({ "_placeholder": true, "num": num })
 }
 
-/// The key of a binary reference (`{BIN: index into the pool}`); not valid in client JSON.
-const BIN: &str = "\u{0}bin";
+fn placeholder_num(value: &Value) -> Option<usize> {
+    let map = value.as_object()?;
+    if map.get("_placeholder") != Some(&Value::Bool(true)) {
+        return None;
+    }
+    map.get("num")?.as_u64().map(|n| n as usize)
+}
 
-impl Args {
-    fn text(values: Vec<Value>) -> Args {
-        Args {
-            values,
-            pool: Vec::new(),
+/// Event or ack arguments: JSON values, where binary stands as socket.io-parser placeholders
+/// (`{"_placeholder":true,"num":n}`) for attachment `n`.
+///
+/// Received data is checked like socket.io-parser's `reconstructPacket` (a placeholder must
+/// point at an attachment). Sent data is renumbered depth-first, and attachments no value
+/// refers to are not sent.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Data {
+    values: Vec<Value>,
+    binary: Vec<Bytes>,
+}
+
+impl Data {
+    /// JSON arguments.
+    pub fn new(values: impl IntoIterator<Item = Value>) -> Data {
+        Data {
+            values: values.into_iter().collect(),
+            binary: Vec::new(),
         }
     }
 
-    /// A binary value to put into `values`.
-    fn bin(&mut self, bytes: &'static [u8]) -> Value {
-        self.pool.push(Bytes::from_static(bytes));
-        json!({ BIN: self.pool.len() - 1 })
+    /// Appends a JSON argument.
+    pub fn arg(mut self, value: impl Into<Value>) -> Data {
+        self.values.push(value.into());
+        self
     }
 
-    /// Resolves placeholders against `attachments`; `None` for an illegal one.
-    fn received(values: Vec<Value>, attachments: Vec<Bytes>) -> Option<Args> {
-        fn resolve(value: Value, count: usize) -> Option<Value> {
-            Some(match value {
-                Value::Object(map) if map.get("_placeholder") == Some(&Value::Bool(true)) => {
-                    let num = map.get("num")?.as_u64()? as usize;
-                    if num >= count {
-                        return None;
-                    }
-                    json!({ BIN: num })
-                }
-                Value::Object(map) => Value::Object(
-                    map.into_iter()
-                        .map(|(k, v)| Some((k, resolve(v, count)?)))
-                        .collect::<Option<_>>()?,
-                ),
-                Value::Array(items) => Value::Array(
-                    items
-                        .into_iter()
-                        .map(|v| resolve(v, count))
-                        .collect::<Option<_>>()?,
-                ),
-                other => other,
-            })
+    /// Appends a binary argument.
+    pub fn binary_arg(mut self, bytes: impl Into<Bytes>) -> Data {
+        let value = self.binary(bytes);
+        self.values.push(value);
+        self
+    }
+
+    /// A placeholder for `bytes`, to put anywhere inside a JSON argument.
+    pub fn binary(&mut self, bytes: impl Into<Bytes>) -> Value {
+        self.binary.push(bytes.into());
+        placeholder(self.binary.len() - 1)
+    }
+
+    /// The JSON arguments, placeholders included.
+    pub fn values(&self) -> &[Value] {
+        &self.values
+    }
+
+    /// The bytes a placeholder value stands for.
+    pub fn bytes_of(&self, value: &Value) -> Option<&Bytes> {
+        self.binary.get(placeholder_num(value)?)
+    }
+
+    /// All attachments.
+    pub fn attachments(&self) -> &[Bytes] {
+        &self.binary
+    }
+
+    /// Only the first argument (with its attachments).
+    pub fn first(&self) -> Data {
+        Data {
+            values: self.values.iter().take(1).cloned().collect(),
+            binary: self.binary.clone(),
         }
-        let count = attachments.len();
-        let values = values
-            .into_iter()
-            .map(|v| resolve(v, count))
-            .collect::<Option<_>>()?;
-        Some(Args {
+    }
+
+    /// Checks received placeholders against `attachments`; `None` for an illegal one.
+    fn received(values: Vec<Value>, attachments: Vec<Bytes>) -> Option<Data> {
+        fn check(value: &Value, count: usize) -> bool {
+            if value.get("_placeholder") == Some(&Value::Bool(true)) {
+                return placeholder_num(value).is_some_and(|n| n < count);
+            }
+            match value {
+                Value::Array(items) => items.iter().all(|v| check(v, count)),
+                Value::Object(map) => map.values().all(|v| check(v, count)),
+                _ => true,
+            }
+        }
+        // without attachments a placeholder lookalike is plain JSON
+        if !attachments.is_empty() && !values.iter().all(|v| check(v, attachments.len())) {
+            return None;
+        }
+        Some(Data {
             values,
-            pool: attachments,
+            binary: attachments,
         })
     }
 
     /// The values with placeholders numbered depth-first, and the attachments in that order.
     fn deconstruct(self) -> (Vec<Value>, Vec<Bytes>) {
         fn walk(value: Value, pool: &[Bytes], out: &mut Vec<Bytes>) -> Value {
+            if let Some(bytes) = placeholder_num(&value).and_then(|n| pool.get(n)) {
+                out.push(bytes.clone());
+                return placeholder(out.len() - 1);
+            }
             match value {
-                Value::Object(map) if map.len() == 1 && map.contains_key(BIN) => {
-                    let index = map[BIN].as_u64().unwrap() as usize;
-                    out.push(pool[index].clone());
-                    json!({ "_placeholder": true, "num": out.len() - 1 })
-                }
                 Value::Object(map) => Value::Object(
                     map.into_iter()
                         .map(|(k, v)| (k, walk(v, pool, out)))
@@ -133,21 +150,322 @@ impl Args {
         let values = self
             .values
             .into_iter()
-            .map(|v| walk(v, &self.pool, &mut out))
+            .map(|v| walk(v, &self.binary, &mut out))
             .collect();
         (values, out)
     }
 }
 
-/// Event names socket.io-parser refuses (`RESERVED_EVENTS`).
-const RESERVED: &[&str] = &[
-    "connect",
-    "connect_error",
-    "disconnect",
-    "disconnecting",
-    "newListener",
-    "removeListener",
-];
+/// An event a client emitted.
+#[derive(Debug, Clone)]
+pub struct Event {
+    name: String,
+    data: Data,
+    ack: Option<u64>,
+}
+
+impl Event {
+    /// The event name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The arguments.
+    pub fn data(&self) -> &Data {
+        &self.data
+    }
+
+    /// The arguments, owned.
+    pub fn into_data(self) -> Data {
+        self.data
+    }
+
+    /// The client waits for an ack ([`Socket::ack`]).
+    pub fn wants_ack(&self) -> bool {
+        self.ack.is_some()
+    }
+}
+
+/// The answer of [`Namespace::on_connect`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum Connect {
+    /// CONNECT is answered with the socket id.
+    Accept,
+    /// CONNECT_ERROR (a failing socket.io middleware: `next(err)`).
+    Reject {
+        /// `err.message`
+        message: String,
+        /// `err.data`
+        data: Option<Value>,
+    },
+}
+
+type ConnectFn = dyn Fn(&mut Socket<'_>) -> Connect + Send + Sync;
+type EventFn = dyn Fn(&mut Socket<'_>, Event) + Send + Sync;
+type DisconnectFn = dyn Fn(&mut Socket<'_>, &str) + Send + Sync;
+type Later = Box<dyn for<'a> FnOnce(&mut Socket<'a>) + Send>;
+type OnReply = Box<dyn for<'a> FnOnce(&mut Socket<'a>, Data) + Send>;
+
+/// The behaviour of one namespace of a fake server. Handlers run on the session's task, one at
+/// a time per client, and act through the [`Socket`] they get. They must not block (every fake
+/// server shares one small runtime): hand work to a channel or use [`Socket::after`]. A
+/// panicking handler closes that client's connection and prints the panic.
+#[derive(Clone, Default)]
+pub struct Namespace {
+    connect: Option<Arc<ConnectFn>>,
+    connect_delay: Duration,
+    events: HashMap<String, Arc<EventFn>>,
+    any: Option<Arc<EventFn>>,
+    disconnect: Option<Arc<DisconnectFn>>,
+}
+
+impl fmt::Debug for Namespace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Namespace")
+            .field("connect_delay", &self.connect_delay)
+            .field("events", &self.events.keys().collect::<Vec<_>>())
+            .field("any", &self.any.is_some())
+            .finish()
+    }
+}
+
+impl Namespace {
+    /// A namespace that accepts every CONNECT and ignores every event.
+    pub fn new() -> Namespace {
+        Namespace::default()
+    }
+
+    /// Decides each CONNECT (the auth is in [`Socket::auth`]). What the handler emits goes out
+    /// after the CONNECT answer when it accepts, and is dropped when it rejects.
+    pub fn on_connect(
+        mut self,
+        f: impl Fn(&mut Socket<'_>) -> Connect + Send + Sync + 'static,
+    ) -> Namespace {
+        self.connect = Some(Arc::new(f));
+        self
+    }
+
+    /// Answers CONNECT only after `delay` (a slow socket.io middleware); a packet for the
+    /// namespace before that closes the connection, as on socket.io.
+    pub fn connect_delay(mut self, delay: Duration) -> Namespace {
+        self.connect_delay = delay;
+        self
+    }
+
+    /// Handles `event`.
+    ///
+    /// # Panics
+    /// For the names socket.io reserves (`connect`, `disconnect`, ...): clients cannot emit
+    /// them; see [`on_connect`](Self::on_connect) and [`on_disconnect`](Self::on_disconnect).
+    pub fn on(
+        mut self,
+        event: impl Into<String>,
+        f: impl Fn(&mut Socket<'_>, Event) + Send + Sync + 'static,
+    ) -> Namespace {
+        let event = event.into();
+        assert!(
+            !RESERVED.contains(&event.as_str()),
+            "`{event}` is a reserved socket.io event name; use on_connect / on_disconnect"
+        );
+        self.events.insert(event, Arc::new(f));
+        self
+    }
+
+    /// Runs when the socket leaves, with socket.io's reason: `client namespace disconnect`,
+    /// `server namespace disconnect` or `transport close`. Nothing can be sent from it any more.
+    pub fn on_disconnect(
+        mut self,
+        f: impl Fn(&mut Socket<'_>, &str) + Send + Sync + 'static,
+    ) -> Namespace {
+        self.disconnect = Some(Arc::new(f));
+        self
+    }
+
+    /// Handles every event without a handler of its own.
+    pub fn on_any(
+        mut self,
+        f: impl Fn(&mut Socket<'_>, Event) + Send + Sync + 'static,
+    ) -> Namespace {
+        self.any = Some(Arc::new(f));
+        self
+    }
+}
+
+/// What a socket handle asked for, applied after the handler returned.
+enum Op {
+    Emit {
+        name: Option<String>,
+        data: Data,
+        reply: Option<OnReply>,
+    },
+    Ack {
+        id: u64,
+        data: Data,
+    },
+    Disconnect,
+    CloseTransport,
+    Raw(String),
+    After(Duration, Later),
+    Restart(Duration),
+}
+
+/// One socket (a client in one namespace), as a handler sees it.
+pub struct Socket<'a> {
+    ns: &'a str,
+    sid: &'a str,
+    handshake: &'a Handshake,
+    auth: Option<&'a Value>,
+    ops: Vec<Op>,
+}
+
+impl fmt::Debug for Socket<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Socket")
+            .field("ns", &self.ns)
+            .field("sid", &self.sid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Socket<'_> {
+    /// The namespace.
+    pub fn namespace(&self) -> &str {
+        self.ns
+    }
+
+    /// The socket id (in `on_connect` too: the id it gets when accepted).
+    pub fn id(&self) -> &str {
+        self.sid
+    }
+
+    /// A query parameter of the client's first request.
+    pub fn query(&self, key: &str) -> Option<&str> {
+        self.handshake
+            .query
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The query of the client's first request.
+    pub fn query_pairs(&self) -> &[(String, String)] {
+        &self.handshake.query
+    }
+
+    /// A header of the client's first request (any case).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.handshake.header(&name.to_ascii_lowercase())
+    }
+
+    /// The CONNECT payload (socket.io `auth`).
+    pub fn auth(&self) -> Option<&Value> {
+        self.auth
+    }
+
+    /// Emits `event` to this socket.
+    pub fn emit(&mut self, event: impl Into<String>, data: Data) {
+        self.ops.push(Op::Emit {
+            name: Some(event.into()),
+            data,
+            reply: None,
+        });
+    }
+
+    /// Emits an event whose arguments start at the name's place: socket.io's `emit(buffer)`,
+    /// which clients receive as an event without a string name.
+    pub fn emit_unnamed(&mut self, data: Data) {
+        self.ops.push(Op::Emit {
+            name: None,
+            data,
+            reply: None,
+        });
+    }
+
+    /// Emits `event` with an ack; `on_reply` runs with the client's answer.
+    pub fn emit_with_ack(
+        &mut self,
+        event: impl Into<String>,
+        data: Data,
+        on_reply: impl for<'b> FnOnce(&mut Socket<'b>, Data) + Send + 'static,
+    ) {
+        self.ops.push(Op::Emit {
+            name: Some(event.into()),
+            data,
+            reply: Some(Box::new(on_reply)),
+        });
+    }
+
+    /// Answers `event`'s ack (nothing when the client did not ask for one; only the first answer
+    /// is sent).
+    pub fn ack(&mut self, event: &Event, data: Data) {
+        if let Some(id) = event.ack {
+            self.ops.push(Op::Ack { id, data });
+        }
+    }
+
+    /// Disconnects the namespace (DISCONNECT); the engine.io connection stays.
+    pub fn disconnect(&mut self) {
+        self.ops.push(Op::Disconnect);
+    }
+
+    /// Closes the engine.io connection (every namespace of the client).
+    pub fn close_transport(&mut self) {
+        self.ops.push(Op::CloseTransport);
+    }
+
+    /// Sends `text` as one engine.io message, as is (a malformed packet, say).
+    pub fn send_raw(&mut self, text: impl Into<String>) {
+        self.ops.push(Op::Raw(text.into()));
+    }
+
+    /// Runs `f` with this socket after `delay`, if this socket (not a later one of the same
+    /// client in the namespace) is still connected then.
+    pub fn after(
+        &mut self,
+        delay: Duration,
+        f: impl for<'b> FnOnce(&mut Socket<'b>) + Send + 'static,
+    ) {
+        self.ops.push(Op::After(delay, Box::new(f)));
+    }
+
+    /// Takes the whole server down for `downtime` (every session closes; new connections are
+    /// accepted and dropped at once), then it serves again on the same port.
+    pub fn restart_server(&mut self, downtime: Duration) {
+        self.ops.push(Op::Restart(downtime));
+    }
+}
+
+/// The socket.io behaviour of one fake server: its namespaces.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Spec {
+    pub namespaces: HashMap<String, Namespace>,
+}
+
+/// Delayed work, fed back by the session.
+pub(super) enum Timer {
+    /// A delayed CONNECT decision.
+    Connect { ns: String, auth: Option<Value> },
+    /// [`Socket::after`] of socket `sid`.
+    Later { ns: String, sid: String, f: Later },
+    /// `Server::broadcast` (`sid: None`) or `Server::emit_to`.
+    Emit {
+        ns: String,
+        sid: Option<String>,
+        event: String,
+        data: Data,
+    },
+}
+
+impl fmt::Debug for Timer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Timer::Connect { ns, .. } => write!(f, "Connect({ns})"),
+            Timer::Later { ns, sid, .. } => write!(f, "Later({ns}, {sid})"),
+            Timer::Emit { ns, event, .. } => write!(f, "Emit({ns}, {event})"),
+        }
+    }
+}
 
 /// One socket.io packet.
 #[derive(Debug)]
@@ -202,7 +520,31 @@ impl Packet {
         })
     }
 
-    /// The engine.io messages of a packet with `data` (attachments after the text).
+    /// socket.io-parser's `isPayloadValid`.
+    fn valid(&self) -> bool {
+        match (self.kind, &self.data) {
+            (CONNECT, None | Some(Value::Object(_))) => true,
+            (DISCONNECT, None) => true,
+            (EVENT | BINARY_EVENT, Some(Value::Array(items))) => match items.first() {
+                Some(Value::Number(_)) => true,
+                Some(Value::String(name)) => !RESERVED.contains(&name.as_str()),
+                _ => false,
+            },
+            (ACK | BINARY_ACK, Some(Value::Array(_))) => true,
+            _ => false,
+        }
+    }
+
+    /// The arguments with binary checked; `None` for an illegal placeholder.
+    fn args(&mut self) -> Option<Data> {
+        let values = match self.data.take() {
+            Some(Value::Array(values)) => values,
+            _ => Vec::new(),
+        };
+        Data::received(values, std::mem::take(&mut self.attachments))
+    }
+
+    /// The engine.io messages of a packet (attachments after the text).
     fn encode(
         kind: u8,
         ns: &str,
@@ -228,58 +570,50 @@ impl Packet {
         out.extend(attachments.into_iter().map(Message::Binary));
         out
     }
-
-    /// socket.io-parser's `isPayloadValid`.
-    fn valid(&self) -> bool {
-        match (self.kind, &self.data) {
-            (CONNECT, None | Some(Value::Object(_))) => true,
-            (DISCONNECT, None) => true,
-            (EVENT | BINARY_EVENT, Some(Value::Array(items))) => match items.first() {
-                Some(Value::Number(_)) => true,
-                Some(Value::String(name)) => !RESERVED.contains(&name.as_str()),
-                _ => false,
-            },
-            (ACK | BINARY_ACK, Some(Value::Array(_))) => true,
-            _ => false,
-        }
-    }
-
-    /// The arguments with binary resolved; `None` for an illegal placeholder.
-    fn args(&mut self) -> Option<Args> {
-        let values = match self.data.take() {
-            Some(Value::Array(values)) => values,
-            _ => Vec::new(),
-        };
-        Args::received(values, std::mem::take(&mut self.attachments))
-    }
 }
 
 static NEXT_SID: AtomicU64 = AtomicU64::new(1);
 
+/// A connected namespace of this session.
+struct Joined {
+    sid: String,
+    auth: Option<Value>,
+    /// Ack ids answered already (socket.io's ack function works once).
+    answered: HashSet<u64>,
+}
+
 /// The socket.io state of one engine.io session.
-#[derive(Debug)]
 pub(super) struct SocketIo {
-    fixture: Fixture,
-    /// Connected namespaces and their socket ids.
-    namespaces: HashMap<String, String>,
-    /// Namespaces whose middleware (`/slow`, `/reject`) has not answered yet.
+    spec: Arc<Spec>,
+    /// Connected namespaces.
+    joined: HashMap<String, Joined>,
+    /// Namespaces whose CONNECT waits for its delay.
     pending: HashSet<String>,
     /// A binary packet waiting for its attachments.
     partial: Option<Packet>,
-    /// Server acks: the next id and the ones awaiting the client's answer (`ask_me`).
+    /// Server acks: the next id and the replies awaited (namespace, id) -> (socket id, reply).
     next_ack: u64,
-    asked: HashSet<(String, u64)>,
+    replies: HashMap<(String, u64), (String, OnReply)>,
+}
+
+impl fmt::Debug for SocketIo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SocketIo")
+            .field("joined", &self.joined.keys().collect::<Vec<_>>())
+            .field("pending", &self.pending)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SocketIo {
-    pub fn new(fixture: Fixture) -> SocketIo {
+    pub fn new(spec: Arc<Spec>) -> SocketIo {
         SocketIo {
-            fixture,
-            namespaces: HashMap::new(),
+            spec,
+            joined: HashMap::new(),
             pending: HashSet::new(),
             partial: None,
             next_ack: 0,
-            asked: HashSet::new(),
+            replies: HashMap::new(),
         }
     }
 
@@ -315,103 +649,95 @@ impl SocketIo {
 
     pub fn on_timer(&mut self, timer: Timer, ctx: &mut Ctx<'_>) {
         match timer {
-            Timer::Accept { ns } => {
+            Timer::Connect { ns, auth } => {
                 if self.pending.remove(&ns) {
-                    self.accept(&ns, None, ctx);
+                    self.decide(&ns, auth, ctx);
                 }
             }
-            Timer::Reject { ns } => {
-                if self.pending.remove(&ns) {
-                    send(
-                        ctx,
-                        Packet::encode(
-                            CONNECT_ERROR,
-                            &ns,
-                            None,
-                            Some(
-                                json!({ "message": "not authorized", "data": { "reason": "test" } }),
-                            ),
-                            Vec::new(),
-                        ),
-                    );
+            Timer::Later { ns, sid, f } => {
+                if self.joined.get(&ns).is_some_and(|j| j.sid == sid) {
+                    self.with_socket(&ns, ctx, f);
                 }
             }
-            Timer::AckLate { ns, id } => {
-                if self.namespaces.contains_key(&ns) {
-                    ack(ctx, &ns, id, Args::text(vec![json!("late")]));
+            Timer::Emit {
+                ns,
+                sid,
+                event,
+                data,
+            } => {
+                let target = self
+                    .joined
+                    .get(&ns)
+                    .is_some_and(|j| sid.as_ref().is_none_or(|sid| *sid == j.sid));
+                if target {
+                    self.with_socket(&ns, ctx, |s| s.emit(event, data));
                 }
             }
         }
     }
 
     /// socket.io's `Client._onpacket`: an invalid payload, or a packet for a namespace that is
-    /// not connected (also one still in its middleware), closes the connection.
+    /// not connected (also one still waiting for its CONNECT answer), closes the connection.
     fn dispatch(&mut self, mut packet: Packet, ctx: &mut Ctx<'_>) {
         let ns = packet.ns.clone();
         if !packet.valid() {
             return ctx.act(Action::Close);
         }
         if packet.kind == CONNECT {
-            if self.pending.contains(&ns) {
+            // socket.io: a CONNECT for a namespace the client joined is an invalid state; one
+            // while the namespace waits for its delay is refused here too (a simplification)
+            if self.pending.contains(&ns) || self.joined.contains_key(&ns) {
                 return ctx.act(Action::Close);
             }
-            return self.connect(&ns, packet.data.take(), ctx);
+            let auth = packet.data.take();
+            return self.connect(&ns, auth, ctx);
         }
-        if !self.namespaces.contains_key(&ns) {
+        if !self.joined.contains_key(&ns) {
             return ctx.act(Action::Close);
         }
         let id = packet.id;
-        let Some(mut args) = packet.args() else {
+        let Some(mut data) = packet.args() else {
             return ctx.act(Action::Close); // illegal attachments
         };
         match packet.kind {
-            DISCONNECT => {
-                self.namespaces.remove(&ns);
-            }
+            DISCONNECT => self.left(&ns, "client namespace disconnect", ctx),
             EVENT | BINARY_EVENT => {
-                let name = args.values.remove(0);
-                let name = match &name {
-                    Value::String(name) => name.clone(),
+                let name = match data.values.remove(0) {
+                    Value::String(name) => name,
                     other => other.to_string(),
                 };
-                self.event(&ns, &name, args, id, ctx);
+                let event = Event {
+                    name,
+                    data,
+                    ack: id,
+                };
+                let handler = self.spec.namespaces.get(&ns).and_then(|namespace| {
+                    namespace
+                        .events
+                        .get(&event.name)
+                        .or(namespace.any.as_ref())
+                        .cloned()
+                });
+                if let Some(handler) = handler {
+                    self.with_socket(&ns, ctx, |s| handler(s, event));
+                }
             }
             _ => {
                 // ACK | BINARY_ACK
-                if id.is_some_and(|id| self.asked.remove(&(ns.clone(), id))) {
-                    emit(ctx, &ns, "answered", args, None);
+                let Some((sid, reply)) = id.and_then(|id| self.replies.remove(&(ns.clone(), id)))
+                else {
+                    return;
+                };
+                if self.joined.get(&ns).is_some_and(|j| j.sid == sid) {
+                    self.with_socket(&ns, ctx, |s| reply(s, data));
                 }
             }
         }
     }
 
     fn connect(&mut self, ns: &str, auth: Option<Value>, ctx: &mut Ctx<'_>) {
-        let known = match self.fixture {
-            Fixture::Main => match ns {
-                "/" | "/admin" => true,
-                "/slow" => {
-                    self.pending.insert(ns.into());
-                    return ctx.act(Action::After(
-                        MIDDLEWARE_DELAY,
-                        Timer::Accept { ns: ns.into() },
-                    ));
-                }
-                "/reject" => {
-                    self.pending.insert(ns.into());
-                    return ctx.act(Action::After(
-                        MIDDLEWARE_DELAY,
-                        Timer::Reject { ns: ns.into() },
-                    ));
-                }
-                _ => false,
-            },
-            Fixture::Auth => matches!(ns, "/" | "/admin"),
-            Fixture::Restart => ns == "/",
-        };
-        if known {
-            self.accept(ns, auth, ctx);
-        } else {
-            send(
+        let Some(namespace) = self.spec.namespaces.get(ns) else {
+            return send(
                 ctx,
                 Packet::encode(
                     CONNECT_ERROR,
@@ -421,198 +747,214 @@ impl SocketIo {
                     Vec::new(),
                 ),
             );
-        }
-    }
-
-    fn accept(&mut self, ns: &str, auth: Option<Value>, ctx: &mut Ctx<'_>) {
-        let sid = format!("fake-sio-{}", NEXT_SID.fetch_add(1, Ordering::Relaxed));
-        send(
-            ctx,
-            Packet::encode(CONNECT, ns, None, Some(json!({ "sid": sid })), Vec::new()),
-        );
-        self.namespaces.insert(ns.to_owned(), sid);
-        match self.fixture {
-            Fixture::Main => {
-                emit(
-                    ctx,
-                    ns,
-                    "Hello from the message event!",
-                    Args::default(),
-                    None,
-                );
-                emit(
-                    ctx,
-                    ns,
-                    "test",
-                    Args::text(vec![json!("Hello from the test event!")]),
-                    None,
-                );
-                // `emit(Buffer)`: the event "name" is the attachment
-                emit_values(ctx, ns, &[], binary(&[4, 5, 6]), None);
-                emit(ctx, ns, "test", binary(&[1, 2, 3]), None);
-                emit(
-                    ctx,
-                    ns,
-                    "This is the first argument",
-                    Args::text(vec![
-                        json!("This is the second argument"),
-                        json!({ "argCount": 3 }),
-                    ]),
-                    None,
-                );
-                emit(
-                    ctx,
-                    ns,
-                    "on_abc_event",
-                    Args::text(vec![json!(""), json!({ "abc": 0, "some_other": "value" })]),
-                    None,
-                );
-            }
-            Fixture::Auth => {
-                let ok = auth.as_ref().and_then(|a| a.get("password")) == Some(&json!("123"));
-                let result = if ok { "success" } else { "failed" };
-                emit(ctx, ns, "auth", Args::text(vec![json!(result)]), None);
-            }
-            Fixture::Restart => {
-                let message = ctx
-                    .handshake
-                    .header("message_back")
-                    .unwrap_or("test")
-                    .to_owned();
-                emit(ctx, ns, "message", Args::text(vec![json!(message)]), None);
-            }
-        }
-    }
-
-    fn event(&mut self, ns: &str, name: &str, mut args: Args, id: Option<u64>, ctx: &mut Ctx<'_>) {
-        if self.fixture == Fixture::Restart {
-            if name == "restart_server" {
-                ctx.act(Action::Restart);
-            }
-            return;
-        }
-        if self.fixture != Fixture::Main {
-            return;
-        }
-        // `client.emit('x-received', data)`: the first argument only
-        let first = |args: &mut Args| {
-            args.values.truncate(1);
-            std::mem::take(args)
         };
-        match name {
-            "test" => {
-                emit(ctx, ns, "test-received", first(&mut args), None);
-                if let Some(id) = id {
-                    ack(ctx, ns, id, Args::text(vec![json!("woot")]));
-                }
-            }
-            "message" => emit(ctx, ns, "message-received", first(&mut args), None),
-            "binary" => {
-                emit(ctx, ns, "binary-received", first(&mut args), None);
-                if let Some(id) = id {
-                    ack(ctx, ns, id, binary(&[1, 2, 3]));
-                }
-            }
-            "close_transport" => ctx.act(Action::Close),
-            "binary_delimiter" => emit(ctx, ns, "binary-delimiter", binary(&[0x1e, 1, 0x1e]), None),
-            "binary_with_args" => {
-                let mut args = Args::text(vec![json!("extra")]);
-                let nine = args.bin(&[9]);
-                args.values.push(nine);
-                emit(ctx, ns, "binary-args", args, None);
-            }
-            "echo" => match id {
-                Some(id) => ack(ctx, ns, id, args),
-                None => emit(ctx, ns, "echo-back", args, None),
+        let delay = namespace.connect_delay;
+        if delay.is_zero() {
+            self.decide(ns, auth, ctx);
+        } else {
+            self.pending.insert(ns.to_owned());
+            ctx.act(Action::After(
+                delay,
+                Timer::Connect {
+                    ns: ns.to_owned(),
+                    auth,
+                },
+            ));
+        }
+    }
+
+    /// Runs the namespace's `on_connect` and answers CONNECT or CONNECT_ERROR.
+    fn decide(&mut self, ns: &str, auth: Option<Value>, ctx: &mut Ctx<'_>) {
+        let spec = Arc::clone(&self.spec);
+        let Some(namespace) = spec.namespaces.get(ns) else {
+            return;
+        };
+        let sid = format!("fake-sio-{}", NEXT_SID.fetch_add(1, Ordering::Relaxed));
+        let mut socket = Socket {
+            ns,
+            sid: &sid,
+            handshake: ctx.handshake,
+            auth: auth.as_ref(),
+            ops: Vec::new(),
+        };
+        let decision = match &namespace.connect {
+            Some(f) => match guarded(ns, || f(&mut socket)) {
+                Some(decision) => decision,
+                None => return ctx.act(Action::Close),
             },
-            "ack_late" => {
-                if let Some(id) = id {
-                    ctx.act(Action::After(
-                        ACK_LATE_DELAY,
-                        Timer::AckLate { ns: ns.into(), id },
-                    ));
+            None => Connect::Accept,
+        };
+        let ops = socket.ops;
+        match decision {
+            Connect::Reject { message, data } => {
+                let mut body = json!({ "message": message });
+                if let Some(data) = data {
+                    body["data"] = data;
                 }
+                send(
+                    ctx,
+                    Packet::encode(CONNECT_ERROR, ns, None, Some(body), Vec::new()),
+                );
             }
-            "handshake_query" => {
-                if let Some(id) = id {
-                    let query: serde_json::Map<String, Value> = ctx
-                        .handshake
-                        .query
-                        .iter()
-                        .map(|(k, v)| (k.clone(), json!(v)))
-                        .collect();
-                    ack(ctx, ns, id, Args::text(vec![Value::Object(query)]));
+            Connect::Accept => {
+                send(
+                    ctx,
+                    Packet::encode(CONNECT, ns, None, Some(json!({ "sid": sid })), Vec::new()),
+                );
+                self.joined.insert(
+                    ns.to_owned(),
+                    Joined {
+                        sid,
+                        auth,
+                        answered: HashSet::new(),
+                    },
+                );
+                self.apply(ns, ops, ctx);
+            }
+        }
+    }
+
+    /// Calls `f` with the socket of `ns` (if it is connected), then applies what it asked for.
+    fn with_socket(&mut self, ns: &str, ctx: &mut Ctx<'_>, f: impl FnOnce(&mut Socket<'_>)) {
+        let Some(joined) = self.joined.get(ns) else {
+            return;
+        };
+        let mut socket = Socket {
+            ns,
+            sid: &joined.sid,
+            handshake: ctx.handshake,
+            auth: joined.auth.as_ref(),
+            ops: Vec::new(),
+        };
+        if guarded(ns, || f(&mut socket)).is_none() {
+            return ctx.act(Action::Close);
+        }
+        let ops = socket.ops;
+        self.apply(ns, ops, ctx);
+    }
+
+    /// The socket of `ns` is gone: `on_disconnect` runs (what it sends is dropped) and its
+    /// pending acks are forgotten.
+    fn left(&mut self, ns: &str, reason: &str, ctx: &mut Ctx<'_>) {
+        let Some(joined) = self.joined.remove(ns) else {
+            return;
+        };
+        self.replies
+            .retain(|(n, _), (sid, _)| !(n == ns && *sid == joined.sid));
+        let handler = self
+            .spec
+            .namespaces
+            .get(ns)
+            .and_then(|n| n.disconnect.clone());
+        if let Some(handler) = handler {
+            let mut socket = Socket {
+                ns,
+                sid: &joined.sid,
+                handshake: ctx.handshake,
+                auth: joined.auth.as_ref(),
+                ops: Vec::new(),
+            };
+            guarded(ns, || handler(&mut socket, reason));
+        }
+    }
+
+    /// The engine.io connection ended: every socket leaves with `transport close`.
+    pub fn on_close(&mut self, ctx: &mut Ctx<'_>) {
+        let namespaces: Vec<String> = self.joined.keys().cloned().collect();
+        for ns in namespaces {
+            self.left(&ns, "transport close", ctx);
+        }
+    }
+
+    fn apply(&mut self, ns: &str, ops: Vec<Op>, ctx: &mut Ctx<'_>) {
+        for op in ops {
+            match op {
+                Op::Emit { name, data, reply } => {
+                    let Some(sid) = self.joined.get(ns).map(|j| j.sid.clone()) else {
+                        continue; // left meanwhile
+                    };
+                    let id = reply.map(|reply| {
+                        let id = self.next_ack;
+                        self.next_ack += 1;
+                        self.replies.insert((ns.to_owned(), id), (sid, reply));
+                        id
+                    });
+                    let (args, attachments) = data.deconstruct();
+                    let mut values: Vec<Value> = name.into_iter().map(Value::String).collect();
+                    values.extend(args);
+                    let kind = if attachments.is_empty() {
+                        EVENT
+                    } else {
+                        BINARY_EVENT
+                    };
+                    send(
+                        ctx,
+                        Packet::encode(kind, ns, id, Some(Value::Array(values)), attachments),
+                    );
                 }
+                Op::Ack { id, data } => {
+                    let first = self
+                        .joined
+                        .get_mut(ns)
+                        .is_some_and(|j| j.answered.insert(id));
+                    if !first {
+                        continue;
+                    }
+                    let (values, attachments) = data.deconstruct();
+                    let kind = if attachments.is_empty() {
+                        ACK
+                    } else {
+                        BINARY_ACK
+                    };
+                    send(
+                        ctx,
+                        Packet::encode(kind, ns, Some(id), Some(Value::Array(values)), attachments),
+                    );
+                }
+                Op::Disconnect => {
+                    if self.joined.contains_key(ns) {
+                        send(ctx, Packet::encode(DISCONNECT, ns, None, None, Vec::new()));
+                        self.left(ns, "server namespace disconnect", ctx);
+                    }
+                }
+                Op::CloseTransport => ctx.act(Action::Close),
+                Op::Raw(text) => ctx.send(Message::Text(text)),
+                Op::After(delay, f) => {
+                    if let Some(joined) = self.joined.get(ns) {
+                        ctx.act(Action::After(
+                            delay,
+                            Timer::Later {
+                                ns: ns.to_owned(),
+                                sid: joined.sid.clone(),
+                                f,
+                            },
+                        ));
+                    }
+                }
+                Op::Restart(downtime) => ctx.act(Action::Restart(downtime)),
             }
-            // a packet socket.io-parser rejects
-            "invalid_packet" => ctx.send(Message::Text(r#"2[true,"foo"]"#.into())),
-            "ask_me" => {
-                let id = self.next_ack;
-                self.next_ack += 1;
-                self.asked.insert((ns.to_owned(), id));
-                emit(ctx, ns, "question", args, Some(id));
-            }
-            "binary_mixed" => {
-                let mut args = Args::default();
-                let (a, b) = (args.bin(&[1]), args.bin(&[2, 3]));
-                args.values = vec![json!({ "a": a, "b": [b] }), json!("tail")];
-                emit(ctx, ns, "binary-mixed", args, None);
-            }
-            // a namespace disconnect; the engine.io connection stays
-            "server_disconnect" => {
-                self.namespaces.remove(ns);
-                send(ctx, Packet::encode(DISCONNECT, ns, None, None, Vec::new()));
-            }
-            _ => {}
         }
     }
 }
 
-/// One binary argument.
-fn binary(bytes: &'static [u8]) -> Args {
-    let mut args = Args::default();
-    let value = args.bin(bytes);
-    args.values.push(value);
-    args
+/// Runs a user handler; a panic is printed (the test sees it on stderr) and gives `None`.
+fn guarded<T>(ns: &str, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => Some(value),
+        Err(panic) => {
+            let text = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            eprintln!("socketio-next-testing: a handler of namespace {ns} panicked: {text}");
+            None
+        }
+    }
 }
 
 fn send(ctx: &mut Ctx<'_>, messages: Vec<Message>) {
     for message in messages {
         ctx.send(message);
     }
-}
-
-/// An event `name` with `args`; with `id` the server waits for the client's ack.
-fn emit(ctx: &mut Ctx<'_>, ns: &str, name: &str, args: Args, id: Option<u64>) {
-    emit_values(ctx, ns, &[name], args, id);
-}
-
-/// An event whose leading values are `names`: none for `emit(Buffer)`, where the attachment
-/// stands in the name's place.
-fn emit_values(ctx: &mut Ctx<'_>, ns: &str, names: &[&str], args: Args, id: Option<u64>) {
-    let (args, attachments) = args.deconstruct();
-    let mut values: Vec<Value> = names.iter().map(|n| json!(n)).collect();
-    values.extend(args);
-    let kind = if attachments.is_empty() {
-        EVENT
-    } else {
-        BINARY_EVENT
-    };
-    send(
-        ctx,
-        Packet::encode(kind, ns, id, Some(Value::Array(values)), attachments),
-    );
-}
-
-fn ack(ctx: &mut Ctx<'_>, ns: &str, id: u64, args: Args) {
-    let (values, attachments) = args.deconstruct();
-    let kind = if attachments.is_empty() {
-        ACK
-    } else {
-        BINARY_ACK
-    };
-    send(
-        ctx,
-        Packet::encode(kind, ns, Some(id), Some(Value::Array(values)), attachments),
-    );
 }

@@ -13,6 +13,7 @@ mod story_connect;
 mod story_cookies;
 mod story_engineio;
 mod story_events_acks;
+mod story_fake_server;
 mod story_handlers;
 mod story_reconnect;
 #[cfg(any(feature = "rustls", feature = "native-tls"))]

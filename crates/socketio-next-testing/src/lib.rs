@@ -1,19 +1,30 @@
-//! Test support for socketio-next (not published): the test servers, the test CA, a TCP proxy
-//! that can cut connections, and the differential harness that runs a scenario with the Node
-//! client.
+//! Test support for socket.io clients (socketio-next and others).
 //!
-//! Servers:
-//! - in-process fakes (module `fake`) for the fixtures of `ci/*.js`: the socket.io
-//!   servers (`socket_io*_server`, `fast_ping_server`) and the engine.io ones
-//!   (`engine_io*_server`). They start on first use, no Node needed.
-//! - Node (`just servers`) for what only the reference server settles: the differential
-//!   tests, connection state recovery and cookies (ci/conformance: 4210-4213), and the TLS
-//!   server (ci/: 4202).
+//! - [`fake`]: in-process Socket.IO v4 / Engine.IO v4 servers you program with handlers
+//!   ([`fake::Server::builder`]), no Node needed.
+//! - Ready-made servers ([`socket_io_server`], [`engine_io_server`], ...): the fixtures of
+//!   socketio-next's own suite, built with [`fake`]; each starts on first use.
+//! - [`Proxy`]: a TCP proxy that can cut, freeze or refuse connections; [`HttpProxy`]: an HTTP
+//!   proxy that records what it forwarded.
 //!
-//! Every URL can be overridden with an environment variable of the same name in upper case:
-//! `SOCKET_IO_SERVER=http://localhost:4200` runs the same tests against the Node server.
+//! ```no_run
+//! use socketio_next_testing::fake::{Data, Namespace, Server};
+//!
+//! # async fn demo() {
+//! let server = Server::builder()
+//!     .namespace("/", Namespace::new().on("ping", |s, e| s.ack(&e, Data::default().arg("pong"))))
+//!     .start();
+//! // put a proxy in between and cut the link under the client
+//! let proxy = socketio_next_testing::Proxy::start(&socketio_next_testing::host_port(server.url())).await;
+//! proxy.cut();
+//! # }
+//! ```
+//!
+//! The feature `repo` is for socketio-next's own repository checkout (it reads its `ci/`
+//! directory): the test CA, the Node conformance servers, the differential harness, and the
+//! environment variables (`SOCKET_IO_SERVER`, ... in upper case) that point the ready-made
+//! servers at the Node ones.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -22,23 +33,30 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
-mod fake;
+pub mod fake;
 
+#[cfg(feature = "repo")]
 fn env_or(var: &str, default: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| default.to_owned())
 }
 
-/// The variable `var`, else the fake server's URL.
+/// The fake server's URL; with the feature `repo`, the variable `var` wins.
 fn env_or_fake(var: &str, fake: impl FnOnce(&fake::Urls) -> &String) -> String {
-    std::env::var(var).unwrap_or_else(|_| fake(fake::urls()).clone())
+    #[cfg(feature = "repo")]
+    if let Ok(url) = std::env::var(var) {
+        return url;
+    }
+    let _ = var;
+    fake(fake::urls()).clone()
 }
 
+#[cfg(feature = "repo")]
 /// The repository root (two levels above this crate).
-pub fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+pub fn repo_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
-        .map(PathBuf::from)
+        .map(std::path::PathBuf::from)
         .expect("crate lives in crates/<name>")
 }
 
@@ -78,11 +96,13 @@ pub fn engine_io_polling_server() -> String {
     env_or_fake("ENGINE_IO_POLLING_SERVER", |u| &u.engine_io_polling)
 }
 
+#[cfg(feature = "repo")]
 /// socket.io 4.8 conformance server (`ci/conformance/server.js`).
 pub fn conformance_server() -> String {
     env_or("CONFORMANCE_SERVER", "http://localhost:4210")
 }
 
+#[cfg(feature = "repo")]
 /// socket.io 4.8 server with connection state recovery (`ci/conformance/server.js`).
 pub fn recovery_server() -> String {
     env_or("RECOVERY_SERVER", "http://localhost:4211")
@@ -94,10 +114,11 @@ pub fn fast_ping_server() -> String {
     env_or_fake("FAST_PING_SERVER", |u| &u.fast_ping)
 }
 
+#[cfg(feature = "repo")]
 /// The test CA (`ci/cert/ca.crt`, `CA_CERT_PATH` overrides).
 pub fn ca_cert_pem() -> Vec<u8> {
     let path = std::env::var("CA_CERT_PATH")
-        .map(PathBuf::from)
+        .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| repo_root().join("ci/cert/ca.crt"));
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
@@ -107,6 +128,7 @@ pub fn ca_cert_pem() -> Vec<u8> {
 pub struct Proxy {
     addr: String,
     state: Arc<ProxyState>,
+    accept: Arc<tokio::task::AbortHandle>,
 }
 
 #[derive(Debug, Default)]
@@ -127,7 +149,7 @@ impl Proxy {
         let state = Arc::new(ProxyState::default());
         let target = target.to_owned();
         let task_state = Arc::clone(&state);
-        tokio::spawn(async move {
+        let accept = tokio::spawn(async move {
             loop {
                 let Ok((mut inbound, _)) = listener.accept().await else {
                     return;
@@ -172,7 +194,17 @@ impl Proxy {
                 });
             }
         });
-        Proxy { addr, state }
+        Proxy {
+            addr,
+            state,
+            accept: Arc::new(accept.abort_handle()),
+        }
+    }
+
+    /// Stops listening and drops every open connection: the port refuses from now on.
+    pub fn stop(&self) {
+        self.accept.abort();
+        self.state.cut.notify_waiters();
     }
 
     /// `http://<proxy addr>`.
@@ -233,6 +265,7 @@ pub fn host_port(url: &str) -> String {
         .to_owned()
 }
 
+#[cfg(feature = "repo")]
 /// Runs `ci/conformance/client.js <scenario> <tag>` (the Node socket.io-client 4.8); returns its
 /// stdout lines. Panics when node or the script fails.
 pub async fn run_node_client(scenario: &str, tag: &str, transports: Option<&str>) -> Vec<String> {
@@ -261,6 +294,7 @@ pub async fn run_node_client(scenario: &str, tag: &str, transports: Option<&str>
         .collect()
 }
 
+#[cfg(feature = "repo")]
 /// The packets the conformance server recorded for `tag` (`GET /log?tag=`): one string per
 /// packet, `<in|out> <engine.io type> <data>`, normalised by the server (sids, timestamps).
 pub async fn recorded_packets(tag: &str) -> Vec<String> {
@@ -283,12 +317,14 @@ pub async fn recorded_packets(tag: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "repo")]
 /// socket.io 4.8 server with engine.io cookies on (`ci/conformance/cookies.js`); `GET
 /// /cookies?sid=<engine sid>` lists the `Cookie` header of every request of that session.
 pub fn cookie_server() -> String {
     env_or("COOKIE_SERVER", "http://localhost:4213")
 }
 
+#[cfg(feature = "repo")]
 /// The `Cookie` headers the cookie server saw for engine.io session `sid`, as
 /// `<transport> <cookie or ->` per request.
 pub async fn cookies_seen(sid: &str) -> Vec<String> {
@@ -316,6 +352,7 @@ pub async fn cookies_seen(sid: &str) -> Vec<String> {
 pub struct HttpProxy {
     addr: String,
     log: Arc<std::sync::Mutex<Vec<String>>>,
+    accept: Arc<tokio::task::AbortHandle>,
 }
 
 impl HttpProxy {
@@ -330,12 +367,21 @@ impl HttpProxy {
         let addr = listener.local_addr().unwrap().to_string();
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let task_log = Arc::clone(&log);
-        tokio::spawn(async move {
+        let accept = tokio::spawn(async move {
             while let Ok((inbound, _)) = listener.accept().await {
                 tokio::spawn(proxy_one(inbound, Arc::clone(&task_log)));
             }
         });
-        HttpProxy { addr, log }
+        HttpProxy {
+            addr,
+            log,
+            accept: Arc::new(accept.abort_handle()),
+        }
+    }
+
+    /// Stops listening (connections already tunnelled keep going until they end).
+    pub fn stop(&self) {
+        self.accept.abort();
     }
 
     /// `http://<addr>` (`[::1]:port` for IPv6).

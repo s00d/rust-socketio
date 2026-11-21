@@ -12,6 +12,7 @@ nextest_flags := "--cargo-profile ci --locked -P ci"
 crate := "socketio-next"
 plugin := "tauri-plugin-socketio"
 plugin_dir := "crates/tauri-plugin-socketio"
+testing := "socketio-next-testing"
 
 [private]
 default:
@@ -88,6 +89,8 @@ deny:
 package *args:
     cargo package -p {{ crate }} --locked {{ args }}
     @if cargo package -p {{ crate }} --list --locked --allow-dirty | grep -E '^(ci|tests|benches|examples)/' ; then echo "test files in the package" >&2; exit 1; fi
+    cargo package -p {{ testing }} --locked {{ args }}
+    @if cargo package -p {{ testing }} --list --locked --allow-dirty | grep -vE '^(src/|Cargo.toml|Cargo.toml.orig|Cargo.lock|README.md|LICENSE|.cargo_vcs_info.json)' ; then echo "unexpected files in the testing package" >&2; exit 1; fi
     @if cargo package -p {{ plugin }} --list --locked --allow-dirty | grep -vE '^(src/|permissions/|build.rs|windows-test-manifest.xml|Cargo.toml|Cargo.toml.orig|Cargo.lock|README.md|CHANGELOG.md|LICENSE|.cargo_vcs_info.json)' ; then echo "unexpected files in the plugin package" >&2; exit 1; fi
 
 # The crate and the plugin on their rust-version with a lockfile resolved for it (MSRV.md; needs that toolchain)
@@ -139,9 +142,19 @@ clean:
     cargo clean
 
 # Public API changes of the published crates vs crates.io match the version bump
+# A crate with no release on crates.io yet (or only a 0.0.0 placeholder) is skipped.
 semver:
-    cargo semver-checks -p {{ crate }} --all-features
-    cargo semver-checks -p {{ plugin }}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for spec in "{{ crate }}|--all-features" "{{ plugin }}|" "{{ testing }}|--all-features"; do
+      c="${spec%%|*}"; flags="${spec#*|}"
+      published="$(cargo info --registry crates-io "${c}" 2>/dev/null | sed -n 's/^version: \([^ ]*\).*/\1/p')"
+      if [[ -z "${published}" || "${published}" == 0.0.0 ]]; then
+        echo "semver: ${c} has no release on crates.io yet (${published:-none}), skipped"
+        continue
+      fi
+      cargo semver-checks -p "${c}" ${flags}
+    done
 
 # Run by the CI `release` job. Sets the version of both crates and of the npm package,
 # updates the lockfile and turns [Unreleased] into [X.Y.Z] in both CHANGELOG.md files.

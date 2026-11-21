@@ -160,7 +160,8 @@ jobs:
   #    [X.Y.Z] in both changelogs (fails when the root [Unreleased] is empty); `just semver`;
   # 3. commits `chore: release vX.Y.Z` to `main`, tags `socketio-next-vX.Y.Z` and
   #    `tauri-plugin-socketio-vX.Y.Z`;
-  # 4. publishes socketio-next, then tauri-plugin-socketio, with crates.io trusted publishing,
+  # 4. publishes socketio-next-testing, socketio-next, then tauri-plugin-socketio, with
+  #    crates.io trusted publishing,
   #    and tauri-plugin-socketio-api with npm trusted publishing (no stored tokens);
   # 5. creates a GitHub release per tag from its changelog section;
   # 6. starts the `docs` workflow: the site shows the new version and changelog.
@@ -252,7 +253,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           # dependency order; a crate already at this version is skipped (resume)
-          for c in socketio-next tauri-plugin-socketio; do
+          for c in socketio-next-testing socketio-next tauri-plugin-socketio; do
             if cargo info --registry crates-io "${c}@${VERSION}" >/dev/null 2>&1; then
               echo "${c} ${VERSION} already on crates.io"
             else

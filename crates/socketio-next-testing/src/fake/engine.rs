@@ -58,7 +58,7 @@ pub(super) enum Action {
     /// ponytail: a concrete type, make it the app's own when a second app needs one.
     After(Duration, socketio::Timer),
     /// Take the whole server down for a while (`restart_server`).
-    Restart,
+    Restart(Duration),
 }
 
 /// The app's view of the session during one callback.
@@ -86,12 +86,12 @@ enum AppState {
 }
 
 impl AppState {
-    fn new(app: App, polling_only: bool) -> AppState {
+    fn new(app: &App, polling_only: bool) -> AppState {
         match app {
             App::EngineEcho => AppState::Echo(echo::Echo { polling_only }),
-            App::SocketIo(fixture) => {
-                AppState::SocketIo(Box::new(socketio::SocketIo::new(fixture)))
-            }
+            App::SocketIo(spec) => AppState::SocketIo(Box::new(socketio::SocketIo::new(
+                std::sync::Arc::clone(spec),
+            ))),
         }
     }
 
@@ -105,6 +105,12 @@ impl AppState {
         match self {
             AppState::SocketIo(app) => app.on_message(message, ctx),
             AppState::Echo(app) => app.on_message(message, ctx),
+        }
+    }
+
+    fn on_close(&mut self, ctx: &mut Ctx<'_>) {
+        if let AppState::SocketIo(app) = self {
+            app.on_close(ctx);
         }
     }
 
@@ -147,6 +153,11 @@ impl SessionHandle {
     /// A websocket that wants to take over this polling session.
     pub fn probe(&self, ws: Ws) {
         let _ = self.0.send(Cmd::Probe(Box::new(ws)));
+    }
+
+    /// Feeds `timer` to the app (a broadcast from the server handle).
+    pub fn timer(&self, timer: socketio::Timer) {
+        let _ = self.0.send(Cmd::Timer(timer));
     }
 
     /// Server-side close.
@@ -252,7 +263,7 @@ pub(super) fn spawn(
 ) -> (String, SessionHandle, String) {
     let sid = format!("fake-eio-{}", NEXT_SID.fetch_add(1, Ordering::Relaxed));
     let (tx, rx) = mpsc::unbounded_channel();
-    let config = server.config;
+    let config = &server.config;
     let upgrades = if ws.is_some() || config.polling_only {
         vec![]
     } else {
@@ -270,7 +281,7 @@ pub(super) fn spawn(
     );
     let mut session = Session {
         sid: sid.clone(),
-        app: AppState::new(config.app, config.polling_only),
+        app: AppState::new(&config.app, config.polling_only),
         server,
         handshake,
         tx: tx.clone(),
@@ -350,6 +361,12 @@ impl Session {
     /// Ends the session; the registry forgets it only afterwards, so polls still reach it while
     /// it lingers for the close packet.
     async fn shutdown(mut self, graceful: bool, mut rx: mpsc::UnboundedReceiver<Cmd>) {
+        // the app learns the end first (socket.io: `disconnect` with `transport close`)
+        let mut ctx = Ctx {
+            handshake: &self.handshake,
+            actions: Vec::new(),
+        };
+        self.app.on_close(&mut ctx);
         if let Some(probe) = self.probe.take() {
             probe.reader.abort();
         }
@@ -572,8 +589,8 @@ impl Session {
                     });
                     Flow::Continue
                 }
-                Action::Restart => {
-                    self.server.restart();
+                Action::Restart(downtime) => {
+                    self.server.restart(downtime);
                     Flow::Continue
                 }
             };

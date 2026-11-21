@@ -16,9 +16,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 
 use super::Config;
 use super::engine::{self, Handshake, Posted, SessionHandle, Ws};
-
-/// How long `restart_server` keeps the server down (`ci/socket-io-restart.js`).
-const RESTART_DOWNTIME: Duration = Duration::from_secs(2);
+use super::socketio::{Data, Timer};
 
 /// engine.io's default `maxHttpBufferSize`, advertised as `maxPayload`.
 pub(super) const MAX_PAYLOAD: usize = 1_000_000;
@@ -69,9 +67,24 @@ impl ServerHandle {
         let _ = self.tx.send(Control::Ended(sid.to_owned()));
     }
 
-    /// Takes the whole server down for [`RESTART_DOWNTIME`] (`restart_server`).
-    pub fn restart(&self) {
-        let _ = self.tx.send(Control::Restart);
+    /// Takes the whole server down for `downtime`.
+    pub fn restart(&self, downtime: Duration) {
+        let _ = self.tx.send(Control::Restart(downtime));
+    }
+
+    /// Emits `event` to every socket of namespace `ns` (`sid: None`) or to socket `sid`.
+    pub fn emit(&self, ns: &str, sid: Option<&str>, event: &str, data: Data) {
+        let _ = self.tx.send(Control::Emit(Timer::Emit {
+            ns: ns.to_owned(),
+            sid: sid.map(str::to_owned),
+            event: event.to_owned(),
+            data,
+        }));
+    }
+
+    /// Closes every session and the listeners; the server is gone for good.
+    pub fn shutdown(&self) {
+        let _ = self.tx.send(Control::Shutdown);
     }
 }
 
@@ -87,11 +100,14 @@ enum Control {
         reply: oneshot::Sender<Option<SessionHandle>>,
     },
     Ended(String),
-    Restart,
+    Restart(Duration),
+    Emit(Timer),
+    Shutdown,
 }
 
-/// Starts a server for `config` on a free port; returns `http://127.0.0.1:<port>`.
-pub(super) async fn start(config: Config) -> String {
+/// Starts a server for `config` on a free port; returns `http://127.0.0.1:<port>` and its
+/// handle.
+pub(super) async fn start(config: Config) -> (String, ServerHandle) {
     let (v4, v6) = bind_pair();
     let port = v4.local_addr().unwrap().port();
     let (tx, rx) = mpsc::unbounded_channel();
@@ -103,7 +119,7 @@ pub(super) async fn start(config: Config) -> String {
         state: State::Up,
     };
     tokio::spawn(server.run(v4, v6, rx));
-    format!("http://127.0.0.1:{port}")
+    (format!("http://127.0.0.1:{port}"), handle)
 }
 
 /// A free port on 127.0.0.1, and on [::1] with the same number where the host has IPv6 (the
@@ -136,10 +152,13 @@ fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
 #[derive(Debug)]
 enum State {
     Up,
-    /// `restart_server`: the sessions are closing; connections are refused.
-    Closing,
+    /// `restart_server`: the sessions are closing; connections are refused. Then down for
+    /// that long.
+    Closing(Duration),
     /// Down until then; connections are refused.
     Down(Instant),
+    /// `shutdown`: the listeners are closed, the actor ends.
+    Gone,
 }
 
 /// The server actor: owns the listeners, the connection tasks and the session registry.
@@ -174,6 +193,9 @@ impl Server {
                 }
             }
             while self.connections.try_join_next().is_some() {}
+            if matches!(self.state, State::Gone) {
+                return; // the listeners close with this task
+            }
         }
     }
 
@@ -208,22 +230,47 @@ impl Server {
                 self.sessions.remove(&sid);
                 self.restart_progress();
             }
-            Control::Restart => {
-                self.state = State::Closing;
+            Control::Restart(downtime) => {
+                self.state = State::Closing(downtime);
                 // close packets reach the pending polls before the connections go
                 for session in self.sessions.values() {
                     session.close();
                 }
                 self.restart_progress();
             }
+            Control::Emit(Timer::Emit {
+                ns,
+                sid,
+                event,
+                data,
+            }) => {
+                for session in self.sessions.values() {
+                    session.timer(Timer::Emit {
+                        ns: ns.clone(),
+                        sid: sid.clone(),
+                        event: event.clone(),
+                        data: data.clone(),
+                    });
+                }
+            }
+            Control::Emit(_) => {}
+            Control::Shutdown => {
+                for session in self.sessions.values() {
+                    session.close();
+                }
+                self.connections.abort_all();
+                self.state = State::Gone;
+            }
         }
     }
 
     /// Once every session closed, drops the connections and stays down for a while.
     fn restart_progress(&mut self) {
-        if matches!(self.state, State::Closing) && self.sessions.is_empty() {
-            self.connections.abort_all();
-            self.state = State::Down(Instant::now() + RESTART_DOWNTIME);
+        if let State::Closing(downtime) = self.state {
+            if self.sessions.is_empty() {
+                self.connections.abort_all();
+                self.state = State::Down(Instant::now() + downtime);
+            }
         }
     }
 }

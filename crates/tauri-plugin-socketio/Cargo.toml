@@ -52,7 +52,7 @@ url = { workspace = true }
 tauri-plugin = { version = "2", features = ["build"] }
 
 [dev-dependencies]
-socketio-next-testing = { workspace = true }
+socketio-next-testing = { workspace = true, features = ["repo"] }
 tauri = { version = "2", default-features = false, features = ["test"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # parses the permission files to resolve a real ACL in tests/it/story_ipc.rs

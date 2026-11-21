@@ -64,7 +64,7 @@ rustls-platform-verifier = { version = "0.7", optional = true }
 base64 = { workspace = true }
 criterion = { version = "0.8", features = ["async_tokio"] }
 proptest = "1"
-socketio-next-testing = { workspace = true }
+socketio-next-testing = { workspace = true, features = ["repo"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "test-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
