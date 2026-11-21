@@ -123,27 +123,68 @@ trim:
 clean:
     cargo clean
 
-# cargo-release pre-release hook (after the version bump): checks, then
-# [Unreleased] -> [version] in CHANGELOG.md
-[private]
-release-hook version:
-    just fmt lint docs
-    just package --allow-dirty
-    @if [[ "${DRY_RUN:-false}" == "true" ]]; then echo "dry run: CHANGELOG.md unchanged"; else just _changelog {{ version }}; fi
+# Public API changes of the published crates vs crates.io match the version bump
+semver:
+    cargo semver-checks -p {{ crate }} --all-features
+    cargo semver-checks -p {{ plugin }}
 
-[private]
-_changelog version:
+# Run by the CI `release` job. Sets the version of both crates and of the npm package,
+# updates the lockfile and turns [Unreleased] into [X.Y.Z] in both CHANGELOG.md files.
+# Prepare release X.Y.Z
+release-prep version:
     #!/usr/bin/env python3
-    import datetime, re, sys
+    import datetime, json, re, subprocess, sys
     from pathlib import Path
-    path, version = Path("CHANGELOG.md"), "{{ version }}"
-    text = path.read_text()
-    if re.search(rf"^## \[{re.escape(version)}\]", text, re.M):
-        sys.exit(0)
-    m = re.search(r"^## \[Unreleased\][^\n]*\n", text, re.M)
-    rest = text[m.end():] if m else ""
-    nxt = re.search(r"^## \[", rest, re.M)
-    if not m or not rest[: nxt.start() if nxt else None].strip():
-        sys.exit("CHANGELOG.md: write the release notes under '## [Unreleased]' first")
-    path.write_text(text[: m.start()] + f"## [Unreleased]\n\n## [{version}] - {datetime.date.today()}\n" + rest)
-    print(f"CHANGELOG.md: [Unreleased] -> [{version}]")
+    version = "{{ version }}"
+    if not re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?", version):
+        sys.exit(f"'{version}' is not a version like 0.2.0")
+
+    def sub(path, pattern, repl, flags=re.M):
+        p = Path(path)
+        text, n = re.subn(pattern, repl, p.read_text(), count=1, flags=flags)
+        if n != 1:
+            sys.exit(f"{path}: no match for {pattern}")
+        p.write_text(text)
+
+    sub("Cargo.toml", r'(\[workspace\.package\][^\[]*?\nversion = )"[^"]+"', rf'\g<1>"{version}"', re.S)
+    sub("Cargo.toml", r'^(socketio-next = \{ path = "crates/socketio-next", version = )"[^"]+"', rf'\g<1>"{version}"')
+    sub("{{ plugin_dir }}/Cargo.toml", r'^version = "[^"]+"', f'version = "{version}"')
+    pkg = Path("{{ plugin_dir }}/package.json")
+    data = json.loads(pkg.read_text())
+    data["version"] = version
+    pkg.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+    today = datetime.date.today()
+    for path, required in [("CHANGELOG.md", True), ("{{ plugin_dir }}/CHANGELOG.md", False)]:
+        p = Path(path)
+        text = p.read_text()
+        if re.search(rf"^## \[{re.escape(version)}\]", text, re.M):
+            continue
+        m = re.search(r"^## \[Unreleased\][^\n]*\n", text, re.M)
+        if not m:
+            sys.exit(f"{path}: no '## [Unreleased]' section")
+        rest = text[m.end():]
+        nxt = re.search(r"^## \[", rest, re.M)
+        body = rest[: nxt.start() if nxt else None].strip()
+        if not body:
+            if required:
+                sys.exit(f"{path}: write the release notes under '## [Unreleased]' first")
+            body = f"### Changed\n\n- Built on socketio-next {version}."
+            rest = rest[nxt.start():] if nxt else ""
+            rest = f"\n{body}\n\n{rest}"
+        p.write_text(text[: m.start()] + f"## [Unreleased]\n\n## [{version}] - {today}\n" + rest)
+    subprocess.run(["cargo", "update", "--workspace"], check=True)
+    print(f"version {version}: Cargo.toml, {{ plugin_dir }}, Cargo.lock, CHANGELOG.md files")
+
+# `file`: CHANGELOG.md or the plugin's.
+# The changelog section of a released version (a GitHub release body)
+release-notes version file="CHANGELOG.md":
+    #!/usr/bin/env python3
+    import re, sys
+    from pathlib import Path
+    text, version = Path("{{ file }}").read_text(), "{{ version }}"
+    m = re.search(rf"^## \[{re.escape(version)}\][^\n]*\n", text, re.M)
+    if not m:
+        sys.exit(f"{{ file }} has no section for {version}")
+    nxt = re.search(r"^## \[", text[m.end():], re.M)
+    print(text[m.end(): m.end() + nxt.start() if nxt else None].strip())
